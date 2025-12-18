@@ -512,14 +512,25 @@ end
 """
     ForLoopPattern
 
-Detected for-loop pattern with bounds and induction variable info.
+Detected for-loop pattern with all information needed to build a ForOp.
+Contains bounds, induction variable info, and pre-extracted carried values.
 """
 struct ForLoopPattern
+    # Induction variable
     lower::IRValue           # Initial value of induction variable
     upper::IRValue           # Upper bound (exclusive)
     step::IRValue            # Step value
     induction_phi_idx::Int   # SSA index of induction variable phi
+    iv_incr_idx::Int         # Statement index of add_int for induction var
+
+    # Loop structure
     header_block::Int        # Block index of loop header
+    loop_blocks::Set{Int}    # All block indices in the loop
+
+    # Carried values (other phi nodes besides induction var)
+    carried_phi_indices::Vector{Int}   # SSA indices of carried phi nodes
+    init_values::Vector{IRValue}       # Initial values (from outside loop)
+    yield_values::Vector{IRValue}      # Yielded values (from inside loop)
 end
 
 """
@@ -529,6 +540,9 @@ Detect if a loop is a simple counted for-loop with pattern:
 - Header has phi for induction var: φ(init, next)
 - Condition is slt_int(iv, upper) or similar
 - Body has iv_next = add_int(iv, step)
+
+Returns a complete ForLoopPattern with all information needed to build a ForOp,
+or nothing if the pattern doesn't match.
 """
 function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo})
     stmts = code.code
@@ -573,19 +587,14 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
 
     # Get all loop blocks from tree
     loop_blocks = get_loop_blocks(tree, blocks)
+    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
 
     # Extract lower bound (init value from outside loop)
-    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
     lower_bound = nothing
-
     for (edge_idx, _) in enumerate(iv_phi_stmt.edges)
         if isassigned(iv_phi_stmt.values, edge_idx)
             val = iv_phi_stmt.values[edge_idx]
-            val_in_loop = false
-            if val isa SSAValue && val.id > 0 && val.id <= length(stmts)
-                val_in_loop = stmt_to_blk[val.id] ∈ loop_blocks
-            end
-            if !val_in_loop
+            if !is_value_in_loop(val, stmts, stmt_to_blk, loop_blocks)
                 lower_bound = convert_phi_value(val)
                 break
             end
@@ -593,8 +602,9 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
     end
     lower_bound === nothing && return nothing
 
-    # Find step by looking for add_int(iv_phi, step) in loop body
+    # Find step and iv_incr_idx by looking for add_int(iv_phi, step) in loop body
     step = nothing
+    iv_incr_idx = 0
     for bi in loop_blocks
         bi < 1 || bi > length(blocks) && continue
         for si in blocks[bi].range
@@ -602,9 +612,9 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
             if stmt isa Expr && stmt.head === :call
                 func = stmt.args[1]
                 if func isa GlobalRef && func.name === :add_int
-                    # Check if it's iv + constant
-                    if stmt.args[2] isa SSAValue && stmt.args[2].id == iv_phi_idx
+                    if length(stmt.args) >= 2 && stmt.args[2] isa SSAValue && stmt.args[2].id == iv_phi_idx
                         step = convert_phi_value(stmt.args[3])
+                        iv_incr_idx = si
                         break
                     end
                 end
@@ -614,7 +624,47 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
     end
     step === nothing && return nothing
 
-    return ForLoopPattern(lower_bound, convert_phi_value(upper_bound), step, iv_phi_idx, header_idx)
+    # Extract carried phi nodes (other phis in header besides induction var)
+    carried_phi_indices = Int[]
+    init_values = IRValue[]
+    yield_values = IRValue[]
+
+    for si in header.range
+        stmt = stmts[si]
+        if stmt isa PhiNode && si != iv_phi_idx
+            push!(carried_phi_indices, si)
+
+            # Extract init value (from outside loop) and yield value (from inside loop)
+            for (edge_idx, _) in enumerate(stmt.edges)
+                if isassigned(stmt.values, edge_idx)
+                    val = stmt.values[edge_idx]
+                    if is_value_in_loop(val, stmts, stmt_to_blk, loop_blocks)
+                        push!(yield_values, convert_phi_value(val))
+                    else
+                        push!(init_values, convert_phi_value(val))
+                    end
+                end
+            end
+        end
+    end
+
+    return ForLoopPattern(
+        lower_bound, convert_phi_value(upper_bound), step,
+        iv_phi_idx, iv_incr_idx, header_idx, loop_blocks,
+        carried_phi_indices, init_values, yield_values
+    )
+end
+
+"""
+    is_value_in_loop(val, stmts, stmt_to_blk, loop_blocks) -> Bool
+
+Check if a value originates from inside the loop.
+"""
+function is_value_in_loop(val, stmts, stmt_to_blk, loop_blocks)
+    if val isa SSAValue && val.id > 0 && val.id <= length(stmts)
+        return stmt_to_blk[val.id] ∈ loop_blocks
+    end
+    return false
 end
 
 """
@@ -637,58 +687,30 @@ end
     build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                  pattern::ForLoopPattern, block_id::Ref{Int}) -> ForOp
 
-Build a ForOp from detected for-loop pattern.
+Build a ForOp from a pre-analyzed ForLoopPattern.
+Uses the pre-computed values from pattern detection to avoid redundant IR traversals.
 """
 function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                       pattern::ForLoopPattern, block_id::Ref{Int})
-    stmts = code.code
-    header_block = blocks[pattern.header_block]
-    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
-    loop_blocks = get_loop_blocks(tree, blocks)
-
-    # Collect block args and init values
+    # Build block args from pattern
     block_args = BlockArg[]
-    init_values = IRValue[]
-    result_vars = SSAValue[]
-    carried_phi_indices = Int[]
 
     # Induction variable is first block arg
     iv_type = code.ssavaluetypes[pattern.induction_phi_idx]
     push!(block_args, BlockArg(1, iv_type))
 
-    # Other phis become carried values
-    for si in header_block.range
-        stmt = stmts[si]
-        if stmt isa PhiNode && si != pattern.induction_phi_idx
-            push!(result_vars, SSAValue(si))
-            push!(carried_phi_indices, si)
-            phi_type = code.ssavaluetypes[si]
-            push!(block_args, BlockArg(length(block_args) + 1, phi_type))
-
-            # Extract init value (from outside loop)
-            for (edge_idx, _) in enumerate(stmt.edges)
-                if isassigned(stmt.values, edge_idx)
-                    val = stmt.values[edge_idx]
-                    val_in_loop = false
-                    if val isa SSAValue && val.id > 0 && val.id <= length(stmts)
-                        val_in_loop = stmt_to_blk[val.id] ∈ loop_blocks
-                    end
-                    if !val_in_loop
-                        push!(init_values, convert_phi_value(val))
-                        break
-                    end
-                end
-            end
-        end
+    # Other carried phis become additional block args
+    result_vars = SSAValue[]
+    for phi_idx in pattern.carried_phi_indices
+        push!(result_vars, SSAValue(phi_idx))
+        phi_type = code.ssavaluetypes[phi_idx]
+        push!(block_args, BlockArg(length(block_args) + 1, phi_type))
     end
 
     # Build body block
     body = Block(block_id[])
     block_id[] += 1
     body.args = block_args
-
-    # Find the induction increment statement to exclude
-    iv_incr_idx = find_induction_increment(stmts, blocks, loop_blocks, pattern.induction_phi_idx)
 
     # Process body using tree structure to handle nested loops
     header_idx = node_index(tree)
@@ -698,63 +720,22 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
 
         child_rtype = region_type(child)
         if child_rtype == REGION_WHILE_LOOP || child_rtype == REGION_NATURAL_LOOP
-            # Nested loop - create nested op
             handle_loop!(body, child, code, blocks, block_id)
         elseif child_rtype == REGION_IF_THEN || child_rtype == REGION_IF_THEN_ELSE
             handle_nested_region!(body, child, code, blocks, block_id)
         elseif child_rtype == REGION_BLOCK
-            # Process block region, which may contain nested loops
-            process_for_body_region!(body, child, code, blocks, block_id, iv_incr_idx)
+            process_for_body_region!(body, child, code, blocks, block_id, pattern.iv_incr_idx)
         else
             handle_nested_region!(body, child, code, blocks, block_id)
         end
     end
 
-    # Find yield values (carried values from inside loop)
-    yield_values = IRValue[]
-    for phi_idx in carried_phi_indices
-        phi = stmts[phi_idx]
-        for (edge_idx, _) in enumerate(phi.edges)
-            if isassigned(phi.values, edge_idx)
-                val = phi.values[edge_idx]
-                val_in_loop = false
-                if val isa SSAValue && val.id > 0 && val.id <= length(stmts)
-                    val_in_loop = stmt_to_blk[val.id] ∈ loop_blocks
-                end
-                if val_in_loop
-                    push!(yield_values, convert_phi_value(val))
-                    break
-                end
-            end
-        end
-    end
-    body.terminator = ContinueOp(yield_values)
+    # Use pre-computed yield values
+    body.terminator = ContinueOp(pattern.yield_values)
 
     iv_ssa = SSAValue(pattern.induction_phi_idx)
-    return ForOp(pattern.lower, pattern.upper, pattern.step, iv_ssa, init_values, body, result_vars)
-end
-
-"""
-    find_induction_increment(stmts, blocks, loop_blocks, iv_phi_idx) -> Union{Int, Nothing}
-
-Find the statement index of the induction variable increment.
-"""
-function find_induction_increment(stmts, blocks::Vector{BlockInfo}, loop_blocks::Set{Int}, iv_phi_idx::Int)
-    for bi in loop_blocks
-        bi < 1 || bi > length(blocks) && continue
-        for si in blocks[bi].range
-            stmt = stmts[si]
-            if stmt isa Expr && stmt.head === :call
-                func = stmt.args[1]
-                if func isa GlobalRef && func.name === :add_int
-                    if length(stmt.args) >= 2 && stmt.args[2] isa SSAValue && stmt.args[2].id == iv_phi_idx
-                        return si
-                    end
-                end
-            end
-        end
-    end
-    return nothing
+    return ForOp(pattern.lower, pattern.upper, pattern.step, iv_ssa,
+                 pattern.init_values, body, result_vars)
 end
 
 """
