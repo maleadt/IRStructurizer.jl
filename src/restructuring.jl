@@ -573,7 +573,7 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
     is_less_than || return nothing
 
     iv_candidate = cond_stmt.args[2]  # induction variable
-    upper_bound = cond_stmt.args[3]   # upper bound
+    upper_bound_raw = cond_stmt.args[3]   # upper bound
 
     # The iv_candidate should be a phi node in the header
     iv_candidate isa SSAValue || return nothing
@@ -603,7 +603,7 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
     lower_bound === nothing && return nothing
 
     # Find step and iv_incr_idx by looking for add_int(iv_phi, step) in loop body
-    step = nothing
+    step_raw = nothing
     iv_incr_idx = 0
     for bi in loop_blocks
         bi < 1 || bi > length(blocks) && continue
@@ -613,16 +613,27 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
                 func = stmt.args[1]
                 if func isa GlobalRef && func.name === :add_int
                     if length(stmt.args) >= 2 && stmt.args[2] isa SSAValue && stmt.args[2].id == iv_phi_idx
-                        step = convert_phi_value(stmt.args[3])
+                        step_raw = stmt.args[3]
                         iv_incr_idx = si
                         break
                     end
                 end
             end
         end
-        step !== nothing && break
+        step_raw !== nothing && break
     end
-    step === nothing && return nothing
+    step_raw === nothing && return nothing
+
+    # Verify step and upper bound are loop-invariant (not modified inside the loop)
+    # A valid for-loop requires: step and upper bound are constants, Arguments, or SSAValues defined outside the loop
+    if is_value_in_loop(step_raw, stmts, stmt_to_blk, loop_blocks)
+        return nothing  # Step changes inside loop, not a valid for-loop
+    end
+    if is_value_in_loop(upper_bound_raw, stmts, stmt_to_blk, loop_blocks)
+        return nothing  # Upper bound changes inside loop, not a valid for-loop
+    end
+    step = convert_phi_value(step_raw)
+    upper_bound = convert_phi_value(upper_bound_raw)
 
     # Extract carried phi nodes (other phis in header besides induction var)
     carried_phi_indices = Int[]
@@ -649,7 +660,7 @@ function detect_for_loop_pattern(tree::ControlTree, code::CodeInfo, blocks::Vect
     end
 
     return ForLoopPattern(
-        lower_bound, convert_phi_value(upper_bound), step,
+        lower_bound, upper_bound, step,
         iv_phi_idx, iv_incr_idx, header_idx, loop_blocks,
         carried_phi_indices, init_values, yield_values
     )
