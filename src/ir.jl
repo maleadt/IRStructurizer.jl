@@ -496,14 +496,125 @@ function defines(block::Block, ssa::SSAValue)
 end
 
 #=============================================================================
- Pretty Printing (Julia CodeInfo-style)
+ Pretty Printing (Julia CodeInfo-style with colors)
 =============================================================================#
+
+"""
+    compute_used_ssas(block::Block) -> BitSet
+
+Compute which SSA values are used anywhere in the structured IR.
+Used for coloring types appropriately (used values get cyan, unused get gray).
+"""
+function compute_used_ssas(block::Block)
+    used = BitSet()
+    _scan_uses!(used, block)
+    return used
+end
+
+function _scan_uses!(used::BitSet, block::Block)
+    for item in block.body
+        if item isa Statement
+            _scan_expr_uses!(used, item.expr)
+        else
+            _scan_control_flow_uses!(used, item)
+        end
+    end
+    if block.terminator !== nothing
+        _scan_terminator_uses!(used, block.terminator)
+    end
+end
+
+function _scan_expr_uses!(used::BitSet, v::SSAValue)
+    push!(used, v.id)
+end
+
+function _scan_expr_uses!(used::BitSet, v::Expr)
+    for arg in v.args
+        _scan_expr_uses!(used, arg)
+    end
+end
+
+function _scan_expr_uses!(used::BitSet, v::PhiNode)
+    for val in v.values
+        _scan_expr_uses!(used, val)
+    end
+end
+
+function _scan_expr_uses!(used::BitSet, v::PiNode)
+    _scan_expr_uses!(used, v.val)
+end
+
+function _scan_expr_uses!(used::BitSet, v::GotoIfNot)
+    _scan_expr_uses!(used, v.cond)
+end
+
+function _scan_expr_uses!(used::BitSet, v)
+    # Other values (constants, GlobalRefs, etc.) don't reference SSA values
+end
+
+function _scan_terminator_uses!(used::BitSet, term::ReturnNode)
+    if isdefined(term, :val)
+        _scan_expr_uses!(used, term.val)
+    end
+end
+
+function _scan_terminator_uses!(used::BitSet, term::YieldOp)
+    for v in term.values
+        _scan_expr_uses!(used, v)
+    end
+end
+
+function _scan_terminator_uses!(used::BitSet, term::ContinueOp)
+    for v in term.values
+        _scan_expr_uses!(used, v)
+    end
+end
+
+function _scan_terminator_uses!(used::BitSet, term::BreakOp)
+    for v in term.values
+        _scan_expr_uses!(used, v)
+    end
+end
+
+function _scan_terminator_uses!(used::BitSet, ::Nothing)
+end
+
+function _scan_control_flow_uses!(used::BitSet, op::IfOp)
+    _scan_expr_uses!(used, op.condition)
+    _scan_uses!(used, op.then_block)
+    _scan_uses!(used, op.else_block)
+end
+
+function _scan_control_flow_uses!(used::BitSet, op::ForOp)
+    _scan_expr_uses!(used, op.lower)
+    _scan_expr_uses!(used, op.upper)
+    _scan_expr_uses!(used, op.step)
+    for v in op.init_values
+        _scan_expr_uses!(used, v)
+    end
+    _scan_uses!(used, op.body)
+end
+
+function _scan_control_flow_uses!(used::BitSet, op::LoopOp)
+    for v in op.init_values
+        _scan_expr_uses!(used, v)
+    end
+    _scan_uses!(used, op.body)
+end
+
+function _scan_control_flow_uses!(used::BitSet, op::WhileOp)
+    _scan_expr_uses!(used, op.condition)
+    for v in op.init_values
+        _scan_expr_uses!(used, v)
+    end
+    _scan_uses!(used, op.body)
+end
 
 """
     IRPrinter
 
 Context for printing structured IR with proper indentation and value formatting.
-Uses Julia's CodeInfo style with box-drawing characters.
+Uses Julia's CodeInfo style with box-drawing characters and colors.
 """
 mutable struct IRPrinter
     io::IO
@@ -511,20 +622,71 @@ mutable struct IRPrinter
     indent::Int
     line_prefix::String    # Prefix for continuation lines (│, spaces)
     is_last_stmt::Bool     # Whether current stmt is last in block
+    used::BitSet           # Which SSA values are used (for type coloring)
+    color::Bool            # Whether to use colors
 end
 
-IRPrinter(io::IO, code::CodeInfo) = IRPrinter(io, code, 0, "", false)
+function IRPrinter(io::IO, code::CodeInfo, entry::Block)
+    used = compute_used_ssas(entry)
+    color = get(io, :color, false)::Bool
+    IRPrinter(io, code, 0, "", false, used, color)
+end
 
 function indent(p::IRPrinter, n::Int=1)
     new_prefix = p.line_prefix * "    "  # 4 spaces per indent level
-    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false)
+    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false, p.used, p.color)
 end
 
 function print_indent(p::IRPrinter)
-    print(p.io, p.line_prefix)
+    # Color the line prefix (box-drawing characters from parent blocks)
+    print_colored(p, p.line_prefix, :light_black)
 end
 
-# Format an IR value for printing
+# Helper for colored output
+function print_colored(p::IRPrinter, s, color::Symbol)
+    if p.color
+        printstyled(p.io, s; color=color)
+    else
+        print(p.io, s)
+    end
+end
+
+# Print an IR value (no special coloring, like Julia's code_typed)
+function print_value(p::IRPrinter, v::SSAValue)
+    print(p.io, "%", v.id)
+end
+
+function print_value(p::IRPrinter, v::BlockArg)
+    print(p.io, "%arg", v.id)
+end
+
+function print_value(p::IRPrinter, v::Argument)
+    # Use slot names if available from CodeInfo
+    if v.n <= length(p.code.slotnames)
+        name = p.code.slotnames[v.n]
+        print(p.io, name)
+    else
+        print(p.io, "_", v.n)
+    end
+end
+
+function print_value(p::IRPrinter, v::SlotNumber)
+    print(p.io, "slot#", v.id)
+end
+
+function print_value(p::IRPrinter, v::QuoteNode)
+    print(p.io, repr(v.value))
+end
+
+function print_value(p::IRPrinter, v::GlobalRef)
+    print(p.io, v.mod, ".", v.name)
+end
+
+function print_value(p::IRPrinter, v)
+    print(p.io, repr(v))
+end
+
+# String versions for places that need strings (e.g., join)
 function format_value(p::IRPrinter, v::SSAValue)
     string("%", v.id)
 end
@@ -532,7 +694,6 @@ function format_value(p::IRPrinter, v::BlockArg)
     string("%arg", v.id)
 end
 function format_value(p::IRPrinter, v::Argument)
-    # Use slot names if available from CodeInfo
     if v.n <= length(p.code.slotnames)
         name = p.code.slotnames[v.n]
         return string(name)
@@ -564,7 +725,15 @@ function format_type(t)
     end
 end
 
-# Format result variables
+# Print type annotation with color based on whether the value is used
+# Like Julia's code_typed: both :: and type share the same color
+function print_type_annotation(p::IRPrinter, idx::Int, t)
+    is_used = idx in p.used
+    color = is_used ? :cyan : :light_black
+    print_colored(p, string("::", format_type(t)), color)
+end
+
+# Format result variables (string version for backwards compat)
 function format_results(p::IRPrinter, results::Vector{SSAValue})
     if isempty(results)
         ""
@@ -579,15 +748,57 @@ function format_results(p::IRPrinter, results::Vector{SSAValue})
     end
 end
 
+# Print result variables with type colors
+function print_results(p::IRPrinter, results::Vector{SSAValue})
+    if isempty(results)
+        return
+    elseif length(results) == 1
+        r = results[1]
+        print(p.io, "%", r.id)
+        is_used = r.id in p.used
+        color = is_used ? :cyan : :light_black
+        print_colored(p, string("::", format_type(p.code.ssavaluetypes[r.id])), color)
+    else
+        print(p.io, "(")
+        for (i, r) in enumerate(results)
+            i > 1 && print(p.io, ", ")
+            print(p.io, "%", r.id)
+            is_used = r.id in p.used
+            color = is_used ? :cyan : :light_black
+            print_colored(p, string("::", format_type(p.code.ssavaluetypes[r.id])), color)
+        end
+        print(p.io, ")")
+    end
+end
+
 # Print a statement
 function print_stmt(p::IRPrinter, stmt::Statement; prefix::String="│  ")
     print_indent(p)
-    print(p.io, prefix)
+    print_colored(p, prefix, :light_black)
 
-    # Print as: %N = <expr>::Type (Julia style)
-    print(p.io, "%", stmt.idx, " = ")
+    # Only show %N = when the value is used (like Julia's code_typed)
+    is_used = stmt.idx in p.used
+    if is_used
+        print(p.io, "%", stmt.idx, " = ")
+    else
+        print(p.io, "     ")  # Padding to align with used values
+    end
     print_expr(p, stmt.expr)
-    println(p.io, "::", format_type(stmt.type))
+    print_type_annotation(p, stmt.idx, stmt.type)
+    println(p.io)
+end
+
+# Check if a function reference is an intrinsic
+function is_intrinsic_call(func)
+    if func isa GlobalRef
+        try
+            f = getfield(func.mod, func.name)
+            return f isa Core.IntrinsicFunction
+        catch
+            return false
+        end
+    end
+    return false
 end
 
 # Print an expression (RHS of a statement)
@@ -595,47 +806,85 @@ function print_expr(p::IRPrinter, expr::Expr)
     if expr.head == :call
         func = expr.args[1]
         args = expr.args[2:end]
-        print(p.io, format_value(p, func), "(")
-        print(p.io, join([format_value(p, a) for a in args], ", "))
+        # Check if this is an intrinsic call
+        if is_intrinsic_call(func)
+            print_colored(p, "intrinsic ", :light_black)
+        end
+        print_value(p, func)
+        print(p.io, "(")
+        for (i, a) in enumerate(args)
+            i > 1 && print(p.io, ", ")
+            print_value(p, a)
+        end
         print(p.io, ")")
     elseif expr.head == :invoke
         mi = expr.args[1]
         func = expr.args[2]
         args = expr.args[3:end]
-        fname = mi isa Core.MethodInstance ? mi.def.name : format_value(p, func)
-        print(p.io, "invoke ", fname, "(")
-        print(p.io, join([format_value(p, a) for a in args], ", "))
-        print(p.io, ")")
+        print_colored(p, "invoke ", :light_black)
+        if mi isa Core.MethodInstance
+            print(p.io, mi.def.name)
+            # Get argument types from MethodInstance signature
+            sig = mi.specTypes isa DataType ? mi.specTypes.parameters : ()
+            print(p.io, "(")
+            for (i, a) in enumerate(args)
+                i > 1 && print(p.io, ", ")
+                print_value(p, a)
+                # Print type annotation if available (sig includes function type at position 1)
+                if i + 1 <= length(sig)
+                    print_colored(p, string("::", sig[i + 1]), :cyan)
+                end
+            end
+            print(p.io, ")")
+        else
+            print_value(p, func)
+            print(p.io, "(")
+            for (i, a) in enumerate(args)
+                i > 1 && print(p.io, ", ")
+                print_value(p, a)
+            end
+            print(p.io, ")")
+        end
     elseif expr.head == :new
-        typ = expr.args[1]
-        args = expr.args[2:end]
-        print(p.io, "new ", typ, "(")
-        print(p.io, join([format_value(p, a) for a in args], ", "))
+        print(p.io, "new ", expr.args[1], "(")
+        for (i, a) in enumerate(expr.args[2:end])
+            i > 1 && print(p.io, ", ")
+            print_value(p, a)
+        end
         print(p.io, ")")
     elseif expr.head == :foreigncall
         print(p.io, "foreigncall ", repr(expr.args[1]))
+    elseif expr.head == :boundscheck
+        print(p.io, "boundscheck")
     else
         print(p.io, expr.head, " ")
-        print(p.io, join([format_value(p, a) for a in expr.args], ", "))
+        for (i, a) in enumerate(expr.args)
+            i > 1 && print(p.io, ", ")
+            print_value(p, a)
+        end
     end
 end
 
 function print_expr(p::IRPrinter, node::PhiNode)
     print(p.io, "φ (")
-    parts = String[]
+    first = true
     for (edge, val) in zip(node.edges, node.values)
-        if val isa SSAValue || val isa BlockArg || val isa Argument
-            push!(parts, string("#", edge, " => ", format_value(p, val)))
+        first || print(p.io, ", ")
+        first = false
+        print(p.io, "#", edge, " => ")
+        if isassigned(node.values, findfirst(==(val), node.values))
+            print_value(p, val)
         else
-            push!(parts, string("#", edge, " => ", repr(val)))
+            print_colored(p, "#undef", :red)
         end
     end
-    print(p.io, join(parts, ", "))
     print(p.io, ")")
 end
 
 function print_expr(p::IRPrinter, node::PiNode)
-    print(p.io, "π (", format_value(p, node.val), ", ", node.typ, ")")
+    print(p.io, "π (")
+    print_value(p, node.val)
+    print(p.io, ", ", node.typ, ")")
 end
 
 function print_expr(p::IRPrinter, node::GotoNode)
@@ -643,19 +892,20 @@ function print_expr(p::IRPrinter, node::GotoNode)
 end
 
 function print_expr(p::IRPrinter, node::GotoIfNot)
-    print(p.io, "goto #", node.dest, " if not ", format_value(p, node.cond))
+    print(p.io, "goto #", node.dest, " if not ")
+    print_value(p, node.cond)
 end
 
 function print_expr(p::IRPrinter, node::ReturnNode)
+    print(p.io, "return")
     if isdefined(node, :val)
-        print(p.io, "return ", format_value(p, node.val))
-    else
-        print(p.io, "return")
+        print(p.io, " ")
+        print_value(p, node.val)
     end
 end
 
 function print_expr(p::IRPrinter, v)
-    print(p.io, format_value(p, v))
+    print_value(p, v)
 end
 
 # Print block arguments (for loops and structured control flow)
@@ -663,8 +913,14 @@ function print_block_args(p::IRPrinter, args::Vector{BlockArg})
     if isempty(args)
         return
     end
-    parts = [string("%arg", a.id, " : ", format_type(a.type)) for a in args]
-    print(p.io, "(", join(parts, ", "), ")")
+    print(p.io, "(")
+    for (i, a) in enumerate(args)
+        i > 1 && print(p.io, ", ")
+        print(p.io, "%arg", a.id)
+        # Block args are always "used" within their scope
+        print_colored(p, string("::", format_type(a.type)), :cyan)
+    end
+    print(p.io, ")")
 end
 
 # Print iteration arguments with initial values
@@ -672,52 +928,72 @@ function print_iter_args(p::IRPrinter, args::Vector{BlockArg}, init_values::Vect
     if isempty(args)
         return
     end
-    parts = String[]
-    for (arg, init) in zip(args, init_values)
-        push!(parts, string("%arg", arg.id, " = ", format_value(p, init), " : ", format_type(arg.type)))
+    print(p.io, " iter_args(")
+    for (i, (arg, init)) in enumerate(zip(args, init_values))
+        i > 1 && print(p.io, ", ")
+        print(p.io, "%arg", arg.id, " = ")
+        print_value(p, init)
+        # Block args are always "used" within their scope
+        print_colored(p, string("::", format_type(arg.type)), :cyan)
     end
-    print(p.io, " iter_args(", join(parts, ", "), ")")
+    print(p.io, ")")
 end
 
 # Print a terminator
 function print_terminator(p::IRPrinter, term::ReturnNode; prefix::String="└──")
     print_indent(p)
-    print(p.io, prefix, " ")
+    print_colored(p, prefix, :light_black)
+    print(p.io, "      return")  # Padding to align with %N =
     if isdefined(term, :val)
-        println(p.io, "return ", format_value(p, term.val))
-    else
-        println(p.io, "return")
+        print(p.io, " ")
+        print_value(p, term.val)
     end
+    println(p.io)
 end
 
 function print_terminator(p::IRPrinter, term::YieldOp; prefix::String="└──")
     print_indent(p)
-    print(p.io, prefix, " ")
-    if isempty(term.values)
-        println(p.io, "yield")
-    else
-        println(p.io, "yield ", join([format_value(p, v) for v in term.values], ", "))
+    print_colored(p, prefix, :light_black)
+    print(p.io, "      ")  # Padding to align with %N =
+    print_colored(p, "yield", :yellow)  # Structured keyword
+    if !isempty(term.values)
+        print(p.io, " ")
+        for (i, v) in enumerate(term.values)
+            i > 1 && print(p.io, ", ")
+            print_value(p, v)
+        end
     end
+    println(p.io)
 end
 
 function print_terminator(p::IRPrinter, term::ContinueOp; prefix::String="└──")
     print_indent(p)
-    print(p.io, prefix, " ")
-    if isempty(term.values)
-        println(p.io, "continue")
-    else
-        println(p.io, "continue ", join([format_value(p, v) for v in term.values], ", "))
+    print_colored(p, prefix, :light_black)
+    print(p.io, "      ")  # Padding to align with %N =
+    print_colored(p, "continue", :yellow)  # Structured keyword
+    if !isempty(term.values)
+        print(p.io, " ")
+        for (i, v) in enumerate(term.values)
+            i > 1 && print(p.io, ", ")
+            print_value(p, v)
+        end
     end
+    println(p.io)
 end
 
 function print_terminator(p::IRPrinter, term::BreakOp; prefix::String="└──")
     print_indent(p)
-    print(p.io, prefix, " ")
-    if isempty(term.values)
-        println(p.io, "break")
-    else
-        println(p.io, "break ", join([format_value(p, v) for v in term.values], ", "))
+    print_colored(p, prefix, :light_black)
+    print(p.io, "      ")  # Padding to align with %N =
+    print_colored(p, "break", :yellow)  # Structured keyword
+    if !isempty(term.values)
+        print(p.io, " ")
+        for (i, v) in enumerate(term.values)
+            i > 1 && print(p.io, ", ")
+            print_value(p, v)
+        end
     end
+    println(p.io)
 end
 
 function print_terminator(p::IRPrinter, ::Nothing; prefix::String="└──")
@@ -759,30 +1035,35 @@ function print_control_flow(p::IRPrinter, op::IfOp; is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
     print_indent(p)
+    print_colored(p, prefix, :light_black)
+    print(p.io, " ")
 
     # Print results assignment if any
     if !isempty(op.result_vars)
-        print(p.io, prefix, " ", format_results(p, op.result_vars), " = ")
-        print(p.io, "if ", format_value(p, op.condition))
-    else
-        print(p.io, prefix, " if ", format_value(p, op.condition))
+        print_results(p, op.result_vars)
+        print(p.io, " = ")
     end
+
+    print(p.io, "if ")
+    print_value(p, op.condition)
     println(p.io)
 
     # Then block body (indented with continuation line)
-    then_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
+    then_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
     print_block_body(then_p, op.then_block)
 
     # else - aligned with "if"
     print_indent(p)
-    println(p.io, cont_prefix, "else")
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "else")
 
     # Else block body
     print_block_body(then_p, op.else_block)
 
     # end - aligned with "if"
     print_indent(p)
-    println(p.io, cont_prefix, "end")
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "end")
 end
 
 # Print ForOp (Julia-style)
@@ -791,18 +1072,23 @@ function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
     print_indent(p)
+    print_colored(p, prefix, :light_black)
+    print(p.io, " ")
 
     # Print results assignment if any
     if !isempty(op.result_vars)
-        print(p.io, prefix, " ", format_results(p, op.result_vars), " = ")
-    else
-        print(p.io, prefix, " ")
+        print_results(p, op.result_vars)
+        print(p.io, " = ")
     end
 
     # for %iv = %lb:%step:%ub
-    print(p.io, "for %arg", op.iv_arg.id, " = ",
-          format_value(p, op.lower), ":", format_value(p, op.step), ":",
-          format_value(p, op.upper))
+    print_colored(p, "for", :yellow)  # Structured keyword
+    print(p.io, " %arg", op.iv_arg.id, " = ")
+    print_value(p, op.lower)
+    print(p.io, ":")
+    print_value(p, op.step)
+    print(p.io, ":")
+    print_value(p, op.upper)
 
     # Print iteration arguments (non-IV block args)
     carried_args = [arg for arg in op.body.args if arg !== op.iv_arg]
@@ -813,11 +1099,12 @@ function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
     println(p.io)
 
     # Body - substitutions already applied
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
     print_block_body(body_p, op.body)
 
     print_indent(p)
-    println(p.io, cont_prefix, "end")
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "end")
 end
 
 # Print LoopOp (general loop - distinct from structured WhileOp)
@@ -826,23 +1113,26 @@ function print_control_flow(p::IRPrinter, op::LoopOp; is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
     print_indent(p)
+    print_colored(p, prefix, :light_black)
+    print(p.io, " ")
 
     # Print results assignment if any
     if !isempty(op.result_vars)
-        print(p.io, prefix, " ", format_results(p, op.result_vars), " = ")
-        print(p.io, "loop")
-    else
-        print(p.io, prefix, " loop")
+        print_results(p, op.result_vars)
+        print(p.io, " = ")
     end
+
+    print_colored(p, "loop", :yellow)  # Structured keyword
     print_iter_args(p, op.body.args, op.init_values)
     println(p.io)
 
     # Body - substitutions already applied during construction
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
     print_block_body(body_p, op.body)
 
     print_indent(p)
-    println(p.io, cont_prefix, "end")
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "end")
 end
 
 # Print WhileOp (structured while with explicit condition)
@@ -851,23 +1141,28 @@ function print_control_flow(p::IRPrinter, op::WhileOp; is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
     print_indent(p)
+    print_colored(p, prefix, :light_black)
+    print(p.io, " ")
 
     # Print results assignment if any
     if !isempty(op.result_vars)
-        print(p.io, prefix, " ", format_results(p, op.result_vars), " = ")
-        print(p.io, "while ", format_value(p, op.condition))
-    else
-        print(p.io, prefix, " while ", format_value(p, op.condition))
+        print_results(p, op.result_vars)
+        print(p.io, " = ")
     end
+
+    print_colored(p, "while", :yellow)  # Structured keyword
+    print(p.io, " ")
+    print_value(p, op.condition)
     print_iter_args(p, op.body.args, op.init_values)
     println(p.io)
 
     # Body - substitutions already applied during construction
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
     print_block_body(body_p, op.body)
 
     print_indent(p)
-    println(p.io, cont_prefix, "end")
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "end")
 end
 
 # Main entry point: show for StructuredCodeInfo
@@ -886,15 +1181,23 @@ function Base.show(io::IO, ::MIME"text/plain", sci::StructuredCodeInfo)
         end
     end
 
-    # Print header like CodeInfo
+    color = get(io, :color, false)::Bool
+
+    # Print header
     println(io, "StructuredCodeInfo(")
 
-    p = IRPrinter(io, sci.code, 0, "", false)
+    p = IRPrinter(io, sci.code, sci.entry)
 
     # Print entry block body
     print_block_body(p, sci.entry)
 
-    println(io, ") => ", ret_type)
+    print(io, ") => ")
+    if color
+        printstyled(io, ret_type; color=:cyan)
+        println(io)
+    else
+        println(io, ret_type)
+    end
 end
 
 # Keep the simple show method for compact display
