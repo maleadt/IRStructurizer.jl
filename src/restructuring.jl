@@ -264,7 +264,7 @@ function handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, bloc
         collect_block_statements!(body_block, blocks[idx], code)
     end
 
-    loop_op = LoopOp(IRValue[], body_block, SSAValue[], idx, Set{Int}([idx]))
+    loop_op = LoopOp(IRValue[], body_block, SSAValue[])
     push!(block.body, loop_op)
 end
 
@@ -479,7 +479,7 @@ function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{
         body.terminator = ContinueOp(carried_values)
     end
 
-    return LoopOp(init_values, body, result_vars, header_idx, loop_blocks)
+    return LoopOp(init_values, body, result_vars)
 end
 
 #=============================================================================
@@ -510,24 +510,25 @@ end
 =============================================================================#
 
 """
-    apply_loop_patterns!(block::Block, code::CodeInfo, blocks::Vector{BlockInfo})
+    apply_loop_patterns!(block::Block)
 
 Upgrade LoopOps to ForOp/WhileOp where patterns match.
 Assumes substitutions have already been applied.
+Pattern matches entirely on the structured IR.
 """
-function apply_loop_patterns!(block::Block, code::CodeInfo, blocks::Vector{BlockInfo})
+function apply_loop_patterns!(block::Block)
     for (i, item) in enumerate(block.body)
         if item isa LoopOp
-            upgraded = try_upgrade_loop(item, code, blocks)
+            upgraded = try_upgrade_loop(item)
             if upgraded !== nothing
                 block.body[i] = upgraded
-                apply_loop_patterns!(upgraded.body, code, blocks)
+                apply_loop_patterns!(upgraded.body)
             else
-                apply_loop_patterns!(item.body, code, blocks)
+                apply_loop_patterns!(item.body)
             end
         elseif item isa IfOp
-            apply_loop_patterns!(item.then_block, code, blocks)
-            apply_loop_patterns!(item.else_block, code, blocks)
+            apply_loop_patterns!(item.then_block)
+            apply_loop_patterns!(item.else_block)
         end
     end
 end
@@ -548,137 +549,72 @@ function compute_loop_subs(loop::LoopOp)
 end
 
 """
-    try_upgrade_loop(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo}) -> Union{ForOp, WhileOp, Nothing}
+    try_upgrade_loop(loop::LoopOp) -> Union{ForOp, WhileOp, Nothing}
 
 Try to upgrade a LoopOp to a more specific loop type (ForOp or WhileOp).
 Returns the upgraded op, or nothing if no pattern matches.
+Pattern matches entirely on the structured IR (after substitutions).
 """
-function try_upgrade_loop(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo})
-    @assert loop.header_idx != 0 "LoopOp missing header_idx metadata"
-
+function try_upgrade_loop(loop::LoopOp)
     # Try ForOp pattern first
-    for_op = try_upgrade_to_for(loop, code, blocks)
+    for_op = try_upgrade_to_for(loop)
     for_op !== nothing && return for_op
 
     # Try WhileOp pattern
-    while_op = try_upgrade_to_while(loop, code, blocks)
+    while_op = try_upgrade_to_while(loop)
     while_op !== nothing && return while_op
 
     return nothing
 end
 
 """
-    try_upgrade_to_for(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo}) -> Union{ForOp, Nothing}
+    try_upgrade_to_for(loop::LoopOp) -> Union{ForOp, Nothing}
 
 Try to upgrade a LoopOp to a ForOp by detecting the for-loop pattern.
+Pattern matches entirely on the structured IR (after substitutions).
 """
-function try_upgrade_to_for(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo})
-    stmts = code.code
-    header_idx = loop.header_idx
-    loop_blocks = loop.loop_blocks
+function try_upgrade_to_for(loop::LoopOp)
+    # Find the IfOp in the loop body - this contains the condition check
+    condition_ifop = find_ifop(loop.body)
+    condition_ifop === nothing && return nothing
 
-    @assert 1 <= header_idx <= length(blocks) "Invalid header_idx: $header_idx"
-    header = blocks[header_idx]
+    # The condition should be an SSAValue pointing to a comparison Statement
+    condition_ifop.condition isa SSAValue || return nothing
+    cond_stmt = find_statement_by_ssa(loop.body, condition_ifop.condition)
+    cond_stmt === nothing && return nothing
 
-    # Find the GotoIfNot condition in header
-    cond_var = nothing
-    for si in header.range
-        stmt = stmts[si]
-        if stmt isa GotoIfNot
-            cond_var = stmt.cond
-            break
-        end
-    end
-    cond_var === nothing && return nothing
-    cond_var isa SSAValue || return nothing
+    # Check it's a for-loop condition: slt_int(iv_arg, upper_bound)
+    is_for_condition(cond_stmt.expr) || return nothing
 
-    # Trace to comparison: slt_int(%iv, %upper)
-    cond_var.id < 1 || cond_var.id > length(stmts) && return nothing
-    cond_stmt = stmts[cond_var.id]
-    cond_stmt isa Expr || return nothing
-    cond_stmt.head === :call || return nothing
+    # After substitution, the IV should be a BlockArg
+    iv_arg = cond_stmt.expr.args[2]
+    iv_arg isa BlockArg || return nothing
+    upper_bound = cond_stmt.expr.args[3]
 
-    func = cond_stmt.args[1]
-    is_less_than = func isa GlobalRef && func.name in (:slt_int, :ult_int)
-    is_less_than || return nothing
+    # Find which index this BlockArg corresponds to
+    iv_idx = findfirst(==(iv_arg), loop.body.args)
+    iv_idx === nothing && return nothing
 
-    iv_candidate = cond_stmt.args[2]  # induction variable
-    upper_bound_raw = cond_stmt.args[3]   # upper bound
+    # Get lower bound from init_values and IV SSA from result_vars
+    iv_idx > length(loop.init_values) && return nothing
+    iv_idx > length(loop.result_vars) && return nothing
+    lower_bound = loop.init_values[iv_idx]
+    iv_ssa = loop.result_vars[iv_idx]
 
-    # The iv_candidate should be a phi node in the header
-    iv_candidate isa SSAValue || return nothing
-    iv_phi_idx = iv_candidate.id
-    iv_phi_idx < 1 || iv_phi_idx > length(stmts) && return nothing
-    iv_phi_stmt = stmts[iv_phi_idx]
-    iv_phi_stmt isa PhiNode || return nothing
+    # Find the step: add_int(iv_arg, step)
+    step_stmt = find_add_int_for_iv(loop.body, iv_arg)
+    step_stmt === nothing && return nothing
+    step = step_stmt.expr.args[3]
 
-    # Verify the phi is in the header
-    iv_phi_idx in header.range || return nothing
-
-    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
-
-    # Extract lower bound (init value from outside loop)
-    lower_bound = nothing
-    for (edge_idx, _) in enumerate(iv_phi_stmt.edges)
-        if isassigned(iv_phi_stmt.values, edge_idx)
-            val = iv_phi_stmt.values[edge_idx]
-            if !is_value_in_loop(val, stmts, stmt_to_blk, loop_blocks)
-                lower_bound = convert_phi_value(val)
-                break
-            end
-        end
-    end
-    lower_bound === nothing && return nothing
-
-    # Find step and iv_incr_idx by looking for add_int(iv_phi, step) in loop body
-    step_raw = nothing
-    iv_incr_idx = 0
-    for bi in loop_blocks
-        bi < 1 || bi > length(blocks) && continue
-        for si in blocks[bi].range
-            stmt = stmts[si]
-            if stmt isa Expr && stmt.head === :call
-                func = stmt.args[1]
-                if func isa GlobalRef && func.name === :add_int
-                    if length(stmt.args) >= 2 && stmt.args[2] isa SSAValue && stmt.args[2].id == iv_phi_idx
-                        step_raw = stmt.args[3]
-                        iv_incr_idx = si
-                        break
-                    end
-                end
-            end
-        end
-        step_raw !== nothing && break
-    end
-    step_raw === nothing && return nothing
-
-    # Verify step and upper bound are loop-invariant
-    if is_value_in_loop(step_raw, stmts, stmt_to_blk, loop_blocks)
-        return nothing
-    end
-    if is_value_in_loop(upper_bound_raw, stmts, stmt_to_blk, loop_blocks)
-        return nothing
-    end
-    step = convert_phi_value(step_raw)
-    upper_bound = convert_phi_value(upper_bound_raw)
-
-    # Build ForOp from the existing LoopOp structure
-    # The body already has substitutions applied, we just need to:
-    # 1. Identify induction variable's block arg
-    # 2. Remove the IfOp condition structure (bounds are implicit in ForOp)
-    # 3. Filter out iv increment and condition comparison statements
-
-    # Find which result_var/block_arg corresponds to the induction variable
-    iv_result_idx = findfirst(rv -> rv.id == iv_phi_idx, loop.result_vars)
-    iv_result_idx === nothing && return nothing
-    iv_ssa = loop.result_vars[iv_result_idx]
-    iv_arg = loop.body.args[iv_result_idx]
+    # Verify upper_bound and step are loop-invariant
+    is_loop_invariant(upper_bound, loop.body) || return nothing
+    is_loop_invariant(step, loop.body) || return nothing
 
     # Separate non-IV carried values
     other_result_vars = SSAValue[]
     other_init_values = IRValue[]
     for (j, rv) in enumerate(loop.result_vars)
-        if j != iv_result_idx && j <= length(loop.init_values)
+        if j != iv_idx && j <= length(loop.init_values)
             push!(other_result_vars, rv)
             push!(other_init_values, loop.init_values[j])
         end
@@ -688,24 +624,20 @@ function try_upgrade_to_for(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockIn
     # LoopOp body: [header_stmts..., IfOp(cond, continue_block, break_block)]
     # ForOp body: [body_stmts...] with ContinueOp terminator
     new_body = Block(loop.body.id)
-    new_body.args = copy(loop.body.args)  # Keep same block args (already substituted)
+    new_body.args = copy(loop.body.args)
 
     # Extract body statements, filtering out iv-related ones
     for item in loop.body.body
         if item isa Statement
             # Skip iv increment and condition comparison
-            item.idx == iv_incr_idx && continue
-            orig_stmt = stmts[item.idx]
-            if orig_stmt isa Expr && orig_stmt.head === :call
-                func = orig_stmt.args[1]
-                func isa GlobalRef && func.name in (:slt_int, :ult_int) && continue
-            end
+            item === step_stmt && continue
+            item === cond_stmt && continue
             push!(new_body.body, item)
         elseif item isa IfOp
             # Extract the continue path's body (skip condition check structure)
             for sub_item in item.then_block.body
                 if sub_item isa Statement
-                    sub_item.idx == iv_incr_idx && continue
+                    sub_item === step_stmt && continue
                     push!(new_body.body, sub_item)
                 else
                     push!(new_body.body, sub_item)
@@ -722,7 +654,7 @@ function try_upgrade_to_for(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockIn
         last_item = loop.body.body[end]
         if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
             for (j, v) in enumerate(last_item.then_block.terminator.values)
-                j != iv_result_idx && push!(yield_values, v)
+                j != iv_idx && push!(yield_values, v)
             end
         end
     end
@@ -733,22 +665,17 @@ function try_upgrade_to_for(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockIn
 end
 
 """
-    try_upgrade_to_while(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo}) -> Union{WhileOp, Nothing}
+    try_upgrade_to_while(loop::LoopOp) -> Union{WhileOp, Nothing}
 
 Try to upgrade a LoopOp to a WhileOp by detecting the while-loop pattern.
+Pattern matches entirely on the structured IR (after substitutions).
 """
-function try_upgrade_to_while(loop::LoopOp, code::CodeInfo, blocks::Vector{BlockInfo})
+function try_upgrade_to_while(loop::LoopOp)
     # Build WhileOp from the existing LoopOp structure
     # The body already has substitutions applied from Phase 2a
 
     # Find the IfOp in the loop body - its condition is the while condition (already substituted)
-    condition_ifop = nothing
-    for item in loop.body.body
-        if item isa IfOp
-            condition_ifop = item
-            break
-        end
-    end
+    condition_ifop = find_ifop(loop.body)
     condition_ifop === nothing && return nothing
 
     # Rebuild body without the IfOp condition structure
@@ -844,7 +771,7 @@ function structurize!(sci::StructuredCodeInfo; loop_patterning::Bool=true)
 
     # Phase 2b: Upgrade loop patterns (optional)
     if loop_patterning
-        apply_loop_patterns!(sci.entry, code, blocks)
+        apply_loop_patterns!(sci.entry)
     end
 
     return sci

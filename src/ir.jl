@@ -229,21 +229,14 @@ end
 General loop with dynamic exit condition.
 Used for while loops and when bounds cannot be determined.
 
-Also used as the initial loop representation before pattern matching.
-Contains metadata (header_idx, loop_blocks) for pattern detection in Phase 2.
+Also used as the initial loop representation before pattern matching
+upgrades it to ForOp or WhileOp.
 """
 struct LoopOp <: ControlFlowOp
     init_values::Vector{IRValue}     # Initial values for loop-carried variables
     body::Block                      # Has carried vars as block args
     result_vars::Vector{SSAValue}    # SSA values that receive final results
-    # Metadata for pattern detection (populated during Phase 1, used in Phase 2)
-    header_idx::Int                  # Block index of loop header (0 if unknown)
-    loop_blocks::Set{Int}            # All block indices in the loop
 end
-
-# Convenience constructor for backward compatibility
-LoopOp(init::Vector{IRValue}, body::Block, results::Vector{SSAValue}) =
-    LoopOp(init, body, results, 0, Set{Int}())
 
 function Base.show(io::IO, op::LoopOp)
     print(io, "LoopOp(init=", length(op.init_values),
