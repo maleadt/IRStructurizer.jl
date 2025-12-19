@@ -399,8 +399,8 @@ end
 
     for_op = for_ops[1]
 
-    # Body has block args: [induction_var, accumulator]
-    @test length(for_op.body.args) == 2
+    # Body has block args: [accumulator] (IV is stored separately in for_op.iv_arg)
+    @test length(for_op.body.args) == 1
 
     # Loop produces one result (the final accumulator value)
     @test length(for_op.result_vars) == 1

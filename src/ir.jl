@@ -1143,10 +1143,9 @@ function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
     print(p.io, ":")
     print_value(p, op.upper)
 
-    # Print iteration arguments (non-IV block args)
-    carried_args = [arg for arg in op.body.args if arg !== op.iv_arg]
-    if !isempty(carried_args)
-        print_iter_args(p, carried_args, op.init_values)
+    # Print iteration arguments (carried values only, IV is separate)
+    if !isempty(op.body.args)
+        print_iter_args(p, op.body.args, op.init_values)
     end
 
     println(p.io)

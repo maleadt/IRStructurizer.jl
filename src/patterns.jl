@@ -213,7 +213,8 @@ function try_upgrade_to_for(loop::LoopOp)
     # LoopOp body: [header_stmts..., IfOp(cond, continue_block, break_block)]
     # ForOp body: [body_stmts...] with ContinueOp terminator
     new_body = Block(loop.body.id)
-    new_body.args = copy(loop.body.args)
+    # Only include carried values, not IV (IV is stored separately in ForOp.iv_arg)
+    new_body.args = [arg for arg in loop.body.args if arg !== iv_arg]
 
     # Extract body statements, filtering out iv-related ones
     for item in loop.body.body
