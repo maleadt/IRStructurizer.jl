@@ -66,6 +66,69 @@ BreakOp() = BreakOp(IRValue[])
 const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, Nothing}
 
 #=============================================================================
+ SSA Substitution (phi refs → block args)
+=============================================================================#
+
+"""
+    Substitutions
+
+A mapping from SSA value indices to BlockArgs.
+Used during IR construction to replace phi node references with block arguments.
+"""
+const Substitutions = Dict{Int, BlockArg}
+
+"""
+    substitute_ssa(value, subs::Substitutions)
+
+Recursively substitute SSAValues with BlockArgs according to the substitution map.
+Used to convert phi node references to block argument references inside loop bodies.
+"""
+function substitute_ssa(value, subs::Substitutions)
+    if value isa SSAValue && haskey(subs, value.id)
+        return subs[value.id]
+    elseif value isa Expr
+        new_args = Any[substitute_ssa(a, subs) for a in value.args]
+        return Expr(value.head, new_args...)
+    elseif value isa PiNode
+        return PiNode(substitute_ssa(value.val, subs), value.typ)
+    elseif value isa PhiNode
+        # Phi nodes shouldn't appear in structured IR, but handle gracefully
+        new_values = Vector{Any}(undef, length(value.values))
+        for i in eachindex(value.values)
+            if isassigned(value.values, i)
+                new_values[i] = substitute_ssa(value.values[i], subs)
+            end
+        end
+        return PhiNode(value.edges, new_values)
+    else
+        return value
+    end
+end
+
+# Convenience for empty substitutions
+substitute_ssa(value) = value
+
+#=============================================================================
+ Statement - self-contained statement with type
+=============================================================================#
+
+"""
+    Statement
+
+A statement in structured IR. Self-contained with expression and type.
+SSA substitutions (phi refs → block args) are applied during construction.
+"""
+struct Statement
+    idx::Int      # Original statement index (for source mapping/debugging)
+    expr::Any     # The expression (with SSA refs substituted where needed)
+    type::Any     # The SSA value type
+end
+
+function Base.show(io::IO, stmt::Statement)
+    print(io, "Statement(", stmt.idx, ", ", stmt.expr, ")")
+end
+
+#=============================================================================
  Structured Control Flow Operations
 =============================================================================#
 
@@ -76,21 +139,21 @@ abstract type ControlFlowOp end
     BlockItem
 
 Union type for items in a block's body.
-Can be either an SSA statement index (Int) or a structured control flow operation.
+Can be either a Statement or a structured control flow operation.
 """
-const BlockItem = Union{Int, ControlFlowOp}
+const BlockItem = Union{Statement, ControlFlowOp}
 
 """
     Block
 
 A basic block containing statements and potentially nested control flow.
-Statements are indices into the original CodeInfo.code array.
-Body items are interleaved - SSA indices and control flow ops can appear in any order.
+Statements are self-contained Statement objects with expressions and types.
+Body items are interleaved - Statements and control flow ops can appear in any order.
 """
 mutable struct Block
     id::Int
     args::Vector{BlockArg}           # Block arguments (for loop carried values)
-    body::Vector{BlockItem}          # Interleaved SSA indices and control flow ops
+    body::Vector{BlockItem}          # Interleaved Statements and control flow ops
     terminator::Terminator           # ReturnNode, ContinueOp, YieldOp, BreakOp, or nothing
 end
 
@@ -101,7 +164,7 @@ function Base.show(io::IO, block::Block)
     if !isempty(block.args)
         print(io, ", args=", length(block.args))
     end
-    n_stmts = count(x -> x isa Int, block.body)
+    n_stmts = count(x -> x isa Statement, block.body)
     n_ops = count(x -> x isa ControlFlowOp, block.body)
     print(io, ", stmts=", n_stmts)
     if n_ops > 0
@@ -109,6 +172,11 @@ function Base.show(io::IO, block::Block)
     end
     print(io, ")")
 end
+
+# Iteration protocol for Block
+Base.iterate(block::Block, state=1) = state > length(block.body) ? nothing : (block.body[state], state + 1)
+Base.length(block::Block) = length(block.body)
+Base.eltype(::Type{Block}) = BlockItem
 
 """
     IfOp <: ControlFlowOp
@@ -140,10 +208,11 @@ struct ForOp <: ControlFlowOp
     lower::IRValue                   # Lower bound
     upper::IRValue                   # Upper bound (exclusive)
     step::IRValue                    # Step value
-    iv_ssa::SSAValue                 # SSA value for induction variable phi
-    init_values::Vector{IRValue}     # Initial values for loop-carried variables
-    body::Block                      # Has induction var + carried vars as args
-    result_vars::Vector{SSAValue}    # SSA values that receive final results
+    iv_ssa::SSAValue                 # SSA value for induction variable phi (result)
+    iv_arg::BlockArg                 # Block arg for induction variable (for body/printing)
+    init_values::Vector{IRValue}     # Initial values for non-IV carried variables
+    body::Block                      # Block args in same order as LoopOp
+    result_vars::Vector{SSAValue}    # SSA values for non-IV carried results
 end
 
 function Base.show(io::IO, op::ForOp)
@@ -159,12 +228,22 @@ end
 
 General loop with dynamic exit condition.
 Used for while loops and when bounds cannot be determined.
+
+Also used as the initial loop representation before pattern matching.
+Contains metadata (header_idx, loop_blocks) for pattern detection in Phase 2.
 """
 struct LoopOp <: ControlFlowOp
     init_values::Vector{IRValue}     # Initial values for loop-carried variables
     body::Block                      # Has carried vars as block args
     result_vars::Vector{SSAValue}    # SSA values that receive final results
+    # Metadata for pattern detection (populated during Phase 1, used in Phase 2)
+    header_idx::Int                  # Block index of loop header (0 if unknown)
+    loop_blocks::Set{Int}            # All block indices in the loop
 end
+
+# Convenience constructor for backward compatibility
+LoopOp(init::Vector{IRValue}, body::Block, results::Vector{SSAValue}) =
+    LoopOp(init, body, results, 0, Set{Int}())
 
 function Base.show(io::IO, op::LoopOp)
     print(io, "LoopOp(init=", length(op.init_values),
@@ -201,28 +280,29 @@ end
     StructuredCodeInfo
 
 Represents a function's code with a structured view of control flow.
-Keeps the original Julia IR intact while providing a structured view
-with nested control flow operations.
+The CodeInfo is kept for metadata (slotnames, argtypes, method info).
+The entry Block contains self-contained Statement objects with expressions and types.
 
 Create with `StructuredCodeInfo(ci)` for a flat (unstructured) view,
 then call `structurize!(sci)` to convert control flow to structured ops.
 """
 mutable struct StructuredCodeInfo
-    const code::CodeInfo             # Original Julia IR - statements accessed by index
-    entry::Block                     # Structured view with nested control flow
+    const code::CodeInfo             # For metadata (slotnames, argtypes, etc.)
+    entry::Block                     # Self-contained structured IR
 end
 
 """
     StructuredCodeInfo(code::CodeInfo)
 
 Create a flat (unstructured) StructuredCodeInfo from Julia CodeInfo.
-All statements are placed sequentially in a single block, with control
-flow statements (GotoNode, GotoIfNot) included as-is.
+All statements are placed sequentially in a single block as Statement objects,
+with control flow statements (GotoNode, GotoIfNot) included as-is.
 
 Call `structurize!(sci)` to convert to structured control flow.
 """
 function StructuredCodeInfo(code::CodeInfo)
     stmts = code.code
+    types = code.ssavaluetypes
     n = length(stmts)
 
     entry = Block(1)
@@ -232,12 +312,99 @@ function StructuredCodeInfo(code::CodeInfo)
         if stmt isa ReturnNode
             entry.terminator = stmt
         else
-            # Include ALL statements, including control flow
-            push!(entry.body, i)
+            # Include ALL statements as Statement objects (no substitutions at entry level)
+            push!(entry.body, Statement(i, stmt, types[i]))
         end
     end
 
     return StructuredCodeInfo(code, entry)
+end
+
+#=============================================================================
+ Block Substitution (apply SSA → BlockArg mappings)
+=============================================================================#
+
+"""
+    substitute_block!(block::Block, subs::Substitutions)
+
+Apply SSA substitutions to all statements in a block and nested control flow.
+Modifies the block in-place by replacing Statement objects with substituted versions.
+"""
+function substitute_block!(block::Block, subs::Substitutions)
+    isempty(subs) && return  # No substitutions to apply
+
+    # Substitute statements and recurse into nested control flow
+    for (i, item) in enumerate(block.body)
+        if item isa Statement
+            new_expr = substitute_ssa(item.expr, subs)
+            if new_expr !== item.expr
+                block.body[i] = Statement(item.idx, new_expr, item.type)
+            end
+        else
+            substitute_control_flow!(item, subs)
+        end
+    end
+
+    # Substitute terminator
+    if block.terminator !== nothing
+        block.terminator = substitute_terminator(block.terminator, subs)
+    end
+end
+
+"""
+    substitute_control_flow!(op::ControlFlowOp, subs::Substitutions)
+
+Apply SSA substitutions to a control flow operation and its nested blocks.
+"""
+function substitute_control_flow!(op::IfOp, subs::Substitutions)
+    substitute_block!(op.then_block, subs)
+    substitute_block!(op.else_block, subs)
+end
+
+function substitute_control_flow!(op::ForOp, subs::Substitutions)
+    substitute_block!(op.body, subs)
+end
+
+function substitute_control_flow!(op::LoopOp, subs::Substitutions)
+    substitute_block!(op.body, subs)
+end
+
+function substitute_control_flow!(op::WhileOp, subs::Substitutions)
+    substitute_block!(op.body, subs)
+end
+
+"""
+    substitute_terminator(term, subs::Substitutions)
+
+Apply SSA substitutions to a terminator's values.
+"""
+function substitute_terminator(term::ContinueOp, subs::Substitutions)
+    new_values = [substitute_ssa(v, subs) for v in term.values]
+    return ContinueOp(new_values)
+end
+
+function substitute_terminator(term::BreakOp, subs::Substitutions)
+    new_values = [substitute_ssa(v, subs) for v in term.values]
+    return BreakOp(new_values)
+end
+
+function substitute_terminator(term::YieldOp, subs::Substitutions)
+    new_values = [substitute_ssa(v, subs) for v in term.values]
+    return YieldOp(new_values)
+end
+
+function substitute_terminator(term::ReturnNode, subs::Substitutions)
+    if isdefined(term, :val)
+        new_val = substitute_ssa(term.val, subs)
+        if new_val !== term.val
+            return ReturnNode(new_val)
+        end
+    end
+    return term
+end
+
+function substitute_terminator(term::Nothing, subs::Substitutions)
+    return nothing
 end
 
 #=============================================================================
@@ -278,11 +445,11 @@ end
 """
     each_stmt(f, block::Block)
 
-Recursively iterate over all statement indices.
+Recursively iterate over all statements, calling f on each Statement.
 """
 function each_stmt(f, block::Block)
     for item in block.body
-        if item isa Int
+        if item isa Statement
             f(item)
         else
             each_stmt_in_op(f, item)
@@ -323,14 +490,13 @@ mutable struct IRPrinter
     indent::Int
     line_prefix::String    # Prefix for continuation lines (│, spaces)
     is_last_stmt::Bool     # Whether current stmt is last in block
-    ssa_to_blockarg::Dict{Int,BlockArg}  # Maps SSA indices to block arguments (for loop-carried values)
 end
 
-IRPrinter(io::IO, code::CodeInfo) = IRPrinter(io, code, 0, "", false, Dict{Int,BlockArg}())
+IRPrinter(io::IO, code::CodeInfo) = IRPrinter(io, code, 0, "", false)
 
 function indent(p::IRPrinter, n::Int=1)
     new_prefix = p.line_prefix * "    "  # 4 spaces per indent level
-    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false, copy(p.ssa_to_blockarg))
+    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false)
 end
 
 function print_indent(p::IRPrinter)
@@ -339,10 +505,6 @@ end
 
 # Format an IR value for printing
 function format_value(p::IRPrinter, v::SSAValue)
-    # Check if this SSA value maps to a block argument (loop-carried variable)
-    if haskey(p.ssa_to_blockarg, v.id)
-        return format_value(p, p.ssa_to_blockarg[v.id])
-    end
     string("%", v.id)
 end
 function format_value(p::IRPrinter, v::BlockArg)
@@ -396,18 +558,15 @@ function format_results(p::IRPrinter, results::Vector{SSAValue})
     end
 end
 
-# Print a statement from the original CodeInfo
-function print_stmt(p::IRPrinter, stmt_idx::Int; prefix::String="│  ")
-    stmt = p.code.code[stmt_idx]
-    ssatype = p.code.ssavaluetypes[stmt_idx]
-
+# Print a statement
+function print_stmt(p::IRPrinter, stmt::Statement; prefix::String="│  ")
     print_indent(p)
     print(p.io, prefix)
 
     # Print as: %N = <expr>::Type (Julia style)
-    print(p.io, "%", stmt_idx, " = ")
-    print_expr(p, stmt)
-    println(p.io, "::", format_type(ssatype))
+    print(p.io, "%", stmt.idx, " = ")
+    print_expr(p, stmt.expr)
+    println(p.io, "::", format_type(stmt.type))
 end
 
 # Print an expression (RHS of a statement)
@@ -550,7 +709,7 @@ function print_block_body(p::IRPrinter, block::Block)
     items = []
 
     for item in block.body
-        if item isa Int
+        if item isa Statement
             push!(items, (:stmt, item))
         else
             push!(items, (:nested, item))
@@ -590,7 +749,7 @@ function print_control_flow(p::IRPrinter, op::IfOp; is_last::Bool=false)
     println(p.io)
 
     # Then block body (indented with continuation line)
-    then_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, copy(p.ssa_to_blockarg))
+    then_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
     print_block_body(then_p, op.then_block)
 
     # else - aligned with "if"
@@ -620,37 +779,20 @@ function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
     end
 
     # for %iv = %lb:%step:%ub
-    print(p.io, "for ")
-
-    # Induction variable (first block arg if present)
-    if !isempty(op.body.args)
-        iv = op.body.args[1]
-        print(p.io, "%arg", iv.id, " = ")
-    end
-
-    print(p.io, format_value(p, op.lower), ":", format_value(p, op.step), ":",
+    print(p.io, "for %arg", op.iv_arg.id, " = ",
+          format_value(p, op.lower), ":", format_value(p, op.step), ":",
           format_value(p, op.upper))
 
-    # Print iteration arguments (remaining block args after induction var)
-    if length(op.body.args) > 1
-        carried_args = op.body.args[2:end]
+    # Print iteration arguments (non-IV block args)
+    carried_args = [arg for arg in op.body.args if arg !== op.iv_arg]
+    if !isempty(carried_args)
         print_iter_args(p, carried_args, op.init_values)
     end
 
     println(p.io)
 
-    # Body - create printer with SSA-to-blockarg mapping for loop-carried values
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, copy(p.ssa_to_blockarg))
-    # Map induction variable SSA to first block arg
-    if !isempty(op.body.args)
-        body_p.ssa_to_blockarg[op.iv_ssa.id] = op.body.args[1]
-    end
-    # Map result vars to remaining block args
-    for (i, rv) in enumerate(op.result_vars)
-        if i + 1 <= length(op.body.args)
-            body_p.ssa_to_blockarg[rv.id] = op.body.args[i + 1]
-        end
-    end
+    # Body - substitutions already applied
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
     print_block_body(body_p, op.body)
 
     print_indent(p)
@@ -674,14 +816,8 @@ function print_control_flow(p::IRPrinter, op::LoopOp; is_last::Bool=false)
     print_iter_args(p, op.body.args, op.init_values)
     println(p.io)
 
-    # Body - create printer with SSA-to-blockarg mapping for loop-carried values
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, copy(p.ssa_to_blockarg))
-    # Map result vars to block args
-    for (i, rv) in enumerate(op.result_vars)
-        if i <= length(op.body.args)
-            body_p.ssa_to_blockarg[rv.id] = op.body.args[i]
-        end
-    end
+    # Body - substitutions already applied during construction
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
     print_block_body(body_p, op.body)
 
     print_indent(p)
@@ -705,14 +841,8 @@ function print_control_flow(p::IRPrinter, op::WhileOp; is_last::Bool=false)
     print_iter_args(p, op.body.args, op.init_values)
     println(p.io)
 
-    # Body - create printer with SSA-to-blockarg mapping for loop-carried values
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, copy(p.ssa_to_blockarg))
-    # Map result vars to block args
-    for (i, rv) in enumerate(op.result_vars)
-        if i <= length(op.body.args)
-            body_p.ssa_to_blockarg[rv.id] = op.body.args[i]
-        end
-    end
+    # Body - substitutions already applied during construction
+    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false)
     print_block_body(body_p, op.body)
 
     print_indent(p)
@@ -738,7 +868,7 @@ function Base.show(io::IO, ::MIME"text/plain", sci::StructuredCodeInfo)
     # Print header like CodeInfo
     println(io, "StructuredCodeInfo(")
 
-    p = IRPrinter(io, sci.code, 0, "", false, Dict{Int,BlockArg}())
+    p = IRPrinter(io, sci.code, 0, "", false)
 
     # Print entry block body
     print_block_body(p, sci.entry)

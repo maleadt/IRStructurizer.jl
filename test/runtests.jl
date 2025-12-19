@@ -2,7 +2,7 @@ using Test
 
 using IRStructurizer
 using IRStructurizer: Block, IfOp, ForOp, WhileOp, LoopOp, YieldOp, ContinueOp, BreakOp,
-                      ControlFlowOp, validate_scf
+                      ControlFlowOp, Statement, validate_scf
 
 @testset "IRStructurizer" verbose=true begin
 
@@ -37,14 +37,16 @@ end
     sci = StructuredCodeInfo(ci)
     gotoifnot_idx = findfirst(s -> s isa Core.GotoIfNot, ci.code)
     @test gotoifnot_idx !== nothing
-    @test gotoifnot_idx in sci.entry.body
+    # Check that the GotoIfNot statement is in the body
+    @test any(item -> item isa Statement && item.idx == gotoifnot_idx, sci.entry.body)
 
     # Validation should throw
     @test_throws UnstructuredControlFlowError validate_scf(sci)
 
     # After structurize!, validation passes
     structurize!(sci)
-    @test gotoifnot_idx ∉ sci.entry.body
+    # GotoIfNot should no longer be in body (replaced by IfOp)
+    @test !any(item -> item isa Statement && item.idx == gotoifnot_idx, sci.entry.body)
     validate_scf(sci)  # Should not throw
 end
 
@@ -117,7 +119,7 @@ end  # interface
 
     # Entry block: one statement (the add), no control flow ops
     @test length(sci.entry.body) == 1
-    @test sci.entry.body[1] isa Int
+    @test sci.entry.body[1] isa Statement
     @test sci.entry.terminator isa Core.ReturnNode
 
     # Multiple operations: (x + y) * (x - y)
@@ -128,7 +130,7 @@ end  # interface
 
     # Entry block: 3 statements (add, sub, mul), no control flow ops
     @test length(sci.entry.body) == 3
-    @test all(item isa Int for item in sci.entry.body)
+    @test all(item isa Statement for item in sci.entry.body)
     @test sci.entry.terminator isa Core.ReturnNode
 end
 
@@ -141,19 +143,19 @@ end
 
     # Entry: comparison stmt, then IfOp
     @test length(sci.entry.body) == 2
-    @test sci.entry.body[1] isa Int
+    @test sci.entry.body[1] isa Statement
     @test sci.entry.body[2] isa IfOp
 
     if_op = sci.entry.body[2]
 
     # Then branch: one stmt (addition), then return
     @test length(if_op.then_block.body) == 1
-    @test if_op.then_block.body[1] isa Int
+    @test if_op.then_block.body[1] isa Statement
     @test if_op.then_block.terminator isa Core.ReturnNode
 
     # Else branch: one stmt (subtraction), then return
     @test length(if_op.else_block.body) == 1
-    @test if_op.else_block.body[1] isa Int
+    @test if_op.else_block.body[1] isa Statement
     @test if_op.else_block.terminator isa Core.ReturnNode
 end
 
@@ -194,14 +196,14 @@ end
 
     # Entry: one stmt (comparison), then IfOp
     @test length(sci.entry.body) == 2
-    @test sci.entry.body[1] isa Int
+    @test sci.entry.body[1] isa Statement
     @test sci.entry.body[2] isa IfOp
 
     if_op = sci.entry.body[2]
 
     # Condition references the comparison result
     @test if_op.condition isa Core.SSAValue
-    @test if_op.condition.id == sci.entry.body[1]
+    @test if_op.condition.id == sci.entry.body[1].idx
 
     # Both branches terminate with return
     @test if_op.then_block.terminator isa Core.ReturnNode
@@ -222,7 +224,7 @@ end
 
     # Entry: [comparison_stmt, IfOp]
     @test length(sci.entry.body) == 2
-    @test sci.entry.body[1] isa Int
+    @test sci.entry.body[1] isa Statement
     @test sci.entry.body[2] isa IfOp
 
     if_op = sci.entry.body[2]
@@ -425,14 +427,14 @@ end
 
     # Entry: [init_stmt, outer_ForOp]
     @test length(sci.entry.body) == 2
-    @test sci.entry.body[1] isa Int
+    @test sci.entry.body[1] isa Statement
     @test sci.entry.body[2] isa ForOp
 
     outer_loop = sci.entry.body[2]
 
     # Outer body: [init_stmt, inner_ForOp]
     @test length(outer_loop.body.body) == 2
-    @test outer_loop.body.body[1] isa Int
+    @test outer_loop.body.body[1] isa Statement
     @test outer_loop.body.body[2] isa ForOp
 
     inner_loop = outer_loop.body.body[2]
@@ -472,7 +474,7 @@ end  # ForOp detection
 
     # Body has the condition computation statements
     @test !isempty(while_op.body.body)
-    @test all(item isa Int for item in while_op.body.body)
+    @test all(item isa Statement for item in while_op.body.body)
 
     # Terminates with ContinueOp
     @test while_op.body.terminator isa ContinueOp
@@ -624,7 +626,7 @@ end  # nested control flow
     @test sci isa StructuredCodeInfo
 
     # Collect all statement indices in entry block
-    stmt_indices = filter(item -> item isa Int, sci.entry.body)
+    stmt_indices = [item.idx for item in sci.entry.body if item isa Statement]
 
     # No duplicates
     @test length(stmt_indices) == length(unique(stmt_indices))

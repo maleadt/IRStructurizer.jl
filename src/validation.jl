@@ -25,19 +25,17 @@ converted to structured control flow operations (IfOp, LoopOp, ForOp).
 Throws `UnstructuredControlFlowError` if unstructured control flow remains.
 Returns `true` if all control flow is properly structured.
 
-The invariant is simple: no statement index in any `block.body` should point
-to a `GotoNode` or `GotoIfNot` - those should have been replaced by structured
-ops that the visitor descends into.
+The invariant is simple: no Statement in any `block.body` should contain
+a `GotoNode` or `GotoIfNot` expression - those should have been replaced by
+structured ops that the visitor descends into.
 """
 function validate_scf(sci::StructuredCodeInfo)
-    stmts = sci.code.code
     unstructured = Int[]
 
     # Walk all blocks and check that no statement is unstructured control flow
-    each_stmt(sci.entry) do idx
-        stmt = stmts[idx]
-        if stmt isa GotoNode || stmt isa GotoIfNot
-            push!(unstructured, idx)
+    each_stmt(sci.entry) do stmt::Statement
+        if stmt.expr isa GotoNode || stmt.expr isa GotoIfNot
+            push!(unstructured, stmt.idx)
         end
     end
 
