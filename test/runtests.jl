@@ -2,7 +2,7 @@ using Test
 
 using IRStructurizer
 using IRStructurizer: Block, IfOp, ForOp, WhileOp, LoopOp, YieldOp, ContinueOp, BreakOp,
-                      ControlFlowOp, Statement, validate_scf
+                      ConditionOp, ControlFlowOp, Statement, validate_scf
 
 @testset "IRStructurizer" verbose=true begin
 
@@ -465,19 +465,21 @@ end  # ForOp detection
 
     while_op = sci.entry.body[1]
 
-    # Condition is the != comparison
-    @test while_op.condition isa Core.SSAValue
+    # MLIR-style two-region structure: before (condition) and after (body)
+    # Condition is in the ConditionOp terminator of the before region
+    @test while_op.before.terminator isa ConditionOp
+    @test while_op.before.terminator.condition isa Core.SSAValue
 
     # No loop-carried values (flag is just re-read each iteration)
     @test isempty(while_op.init_values)
-    @test isempty(while_op.body.args)
+    @test isempty(while_op.before.args)
 
-    # Body has the condition computation statements
-    @test !isempty(while_op.body.body)
-    @test all(item isa Statement for item in while_op.body.body)
+    # Before region has the condition computation statements
+    @test !isempty(while_op.before.body)
+    @test all(item isa Statement for item in while_op.before.body)
 
-    # Terminates with ContinueOp
-    @test while_op.body.terminator isa ContinueOp
+    # After region terminates with YieldOp
+    @test while_op.after.terminator isa YieldOp
 end
 
 @testset "decrementing loop (non-ForOp pattern)" begin

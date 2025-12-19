@@ -117,13 +117,22 @@ function apply_loop_patterns!(block::Block)
             upgraded = try_upgrade_loop(item)
             if upgraded !== nothing
                 block.body[i] = upgraded
-                apply_loop_patterns!(upgraded.body)
+                # Recursively apply to the upgraded op's blocks
+                if upgraded isa ForOp
+                    apply_loop_patterns!(upgraded.body)
+                elseif upgraded isa WhileOp
+                    apply_loop_patterns!(upgraded.before)
+                    apply_loop_patterns!(upgraded.after)
+                end
             else
                 apply_loop_patterns!(item.body)
             end
         elseif item isa IfOp
             apply_loop_patterns!(item.then_block)
             apply_loop_patterns!(item.else_block)
+        elseif item isa WhileOp
+            apply_loop_patterns!(item.before)
+            apply_loop_patterns!(item.after)
         end
     end
 end
@@ -249,42 +258,63 @@ end
 
 Try to upgrade a LoopOp to a WhileOp by detecting the while-loop pattern.
 Pattern matches entirely on the structured IR (after substitutions).
+
+Creates MLIR-style scf.while with before/after regions:
+- before: condition computation, ends with ConditionOp
+- after: loop body, ends with YieldOp
 """
 function try_upgrade_to_while(loop::LoopOp)
-    # Build WhileOp from the existing LoopOp structure
     # The body already has substitutions applied from Phase 2a
 
-    # Find the IfOp in the loop body - its condition is the while condition (already substituted)
+    # Find the IfOp in the loop body - its condition is the while condition
     condition_ifop = find_ifop(loop.body)
     condition_ifop === nothing && return nothing
 
-    # Rebuild body without the IfOp condition structure
-    new_body = Block(loop.body.id)
-    new_body.args = copy(loop.body.args)
+    # Build "before" region: statements before the IfOp + ConditionOp
+    before = Block(loop.body.id)
+    before.args = copy(loop.body.args)
 
-    # Extract statements and the continue path from the IfOp
     for item in loop.body.body
         if item isa Statement
-            push!(new_body.body, item)
+            push!(before.body, item)
         elseif item isa IfOp
-            # This is the condition check - extract the continue path's body
-            for sub_item in item.then_block.body
-                push!(new_body.body, sub_item)
-            end
+            # Stop before IfOp - the condition becomes ConditionOp
+            break
         else
-            push!(new_body.body, item)
+            push!(before.body, item)
         end
+    end
+
+    # Get break values (become results when condition is false)
+    # Also used as args passed to after region when condition is true
+    condition_args = IRValue[]
+    if condition_ifop.else_block.terminator isa BreakOp
+        condition_args = copy(condition_ifop.else_block.terminator.values)
+    elseif !isempty(before.args)
+        # Default: forward the block args
+        condition_args = [arg for arg in before.args]
+    end
+
+    before.terminator = ConditionOp(condition_ifop.condition, condition_args)
+
+    # Build "after" region: statements from the then_block + YieldOp
+    after = Block(loop.body.id + 1000)  # Different block ID
+    # After region receives args from ConditionOp - create new BlockArgs
+    for (i, arg) in enumerate(before.args)
+        push!(after.args, BlockArg(i, arg.type))
+    end
+
+    # Copy body statements from the continue path
+    for item in condition_ifop.then_block.body
+        push!(after.body, item)
     end
 
     # Get yield values from the continue terminator
     yield_values = IRValue[]
-    if !isempty(loop.body.body)
-        last_item = loop.body.body[end]
-        if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
-            yield_values = copy(last_item.then_block.terminator.values)
-        end
+    if condition_ifop.then_block.terminator isa ContinueOp
+        yield_values = copy(condition_ifop.then_block.terminator.values)
     end
-    new_body.terminator = ContinueOp(yield_values)
+    after.terminator = YieldOp(yield_values)
 
-    return WhileOp(condition_ifop.condition, loop.init_values, new_body, loop.result_vars)
+    return WhileOp(before, after, loop.init_values, loop.result_vars)
 end

@@ -63,7 +63,21 @@ end
 
 BreakOp() = BreakOp(IRValue[])
 
-const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, Nothing}
+"""
+    ConditionOp
+
+Terminator for the 'before' region of a WhileOp (MLIR scf.condition).
+If condition is true, args are passed to the 'after' region.
+If condition is false, args become the final loop results.
+"""
+struct ConditionOp
+    condition::IRValue           # Boolean condition
+    args::Vector{IRValue}        # Values passed to after region or used as break results
+end
+
+ConditionOp(cond::IRValue) = ConditionOp(cond, IRValue[])
+
+const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, ConditionOp, Nothing}
 
 #=============================================================================
  SSA Substitution (phi refs → block args)
@@ -247,21 +261,25 @@ end
 """
     WhileOp <: ControlFlowOp
 
-Structured while loop with explicit condition.
-The condition is evaluated at the start of each iteration.
-More structured than LoopOp - the condition is separate from the body.
+Structured while loop with MLIR-style two-region structure (scf.while).
+
+- `before`: Computes the condition, ends with ConditionOp(cond, args)
+- `after`: Loop body, ends with YieldOp to pass values back to before region
+
+When condition is true, args are passed to the after region.
+When condition is false, args become the final loop results.
 """
 struct WhileOp <: ControlFlowOp
-    condition::IRValue               # Loop condition (evaluated each iteration)
+    before::Block                    # Condition computation, ends with ConditionOp
+    after::Block                     # Loop body, ends with YieldOp
     init_values::Vector{IRValue}     # Initial values for loop-carried variables
-    body::Block                      # Loop body (no condition check inside)
     result_vars::Vector{SSAValue}    # SSA values that receive final results
 end
 
 function Base.show(io::IO, op::WhileOp)
-    print(io, "WhileOp(cond=", op.condition,
+    print(io, "WhileOp(before=Block(", op.before.id, ")",
+          ", after=Block(", op.after.id, ")",
           ", init=", length(op.init_values),
-          ", body=Block(", op.body.id, ")",
           ", results=", length(op.result_vars), ")")
 end
 
@@ -363,7 +381,8 @@ function substitute_control_flow!(op::LoopOp, subs::Substitutions)
 end
 
 function substitute_control_flow!(op::WhileOp, subs::Substitutions)
-    substitute_block!(op.body, subs)
+    substitute_block!(op.before, subs)
+    substitute_block!(op.after, subs)
 end
 
 """
@@ -379,6 +398,12 @@ end
 function substitute_terminator(term::BreakOp, subs::Substitutions)
     new_values = [substitute_ssa(v, subs) for v in term.values]
     return BreakOp(new_values)
+end
+
+function substitute_terminator(term::ConditionOp, subs::Substitutions)
+    new_cond = substitute_ssa(term.condition, subs)
+    new_args = [substitute_ssa(v, subs) for v in term.args]
+    return ConditionOp(new_cond, new_args)
 end
 
 function substitute_terminator(term::YieldOp, subs::Substitutions)
@@ -432,7 +457,8 @@ function each_block_in_op(f, op::LoopOp)
 end
 
 function each_block_in_op(f, op::WhileOp)
-    each_block(f, op.body)
+    each_block(f, op.before)
+    each_block(f, op.after)
 end
 
 """
@@ -464,7 +490,8 @@ function each_stmt_in_op(f, op::LoopOp)
 end
 
 function each_stmt_in_op(f, op::WhileOp)
-    each_stmt(f, op.body)
+    each_stmt(f, op.before)
+    each_stmt(f, op.after)
 end
 
 #=============================================================================
@@ -489,7 +516,8 @@ function defines(block::Block, ssa::SSAValue)
         elseif item isa ForOp
             defines(item.body, ssa) && return true
         elseif item isa WhileOp
-            defines(item.body, ssa) && return true
+            defines(item.before, ssa) && return true
+            defines(item.after, ssa) && return true
         end
     end
     return false
@@ -576,6 +604,13 @@ function _scan_terminator_uses!(used::BitSet, term::BreakOp)
     end
 end
 
+function _scan_terminator_uses!(used::BitSet, term::ConditionOp)
+    _scan_expr_uses!(used, term.condition)
+    for v in term.args
+        _scan_expr_uses!(used, v)
+    end
+end
+
 function _scan_terminator_uses!(used::BitSet, ::Nothing)
 end
 
@@ -603,11 +638,11 @@ function _scan_control_flow_uses!(used::BitSet, op::LoopOp)
 end
 
 function _scan_control_flow_uses!(used::BitSet, op::WhileOp)
-    _scan_expr_uses!(used, op.condition)
     for v in op.init_values
         _scan_expr_uses!(used, v)
     end
-    _scan_uses!(used, op.body)
+    _scan_uses!(used, op.before)
+    _scan_uses!(used, op.after)
 end
 
 """
@@ -996,6 +1031,24 @@ function print_terminator(p::IRPrinter, term::BreakOp; prefix::String="└──
     println(p.io)
 end
 
+function print_terminator(p::IRPrinter, term::ConditionOp; prefix::String="└──")
+    print_indent(p)
+    print_colored(p, prefix, :light_black)
+    print(p.io, "      ")  # Padding to align with %N =
+    print_colored(p, "condition", :yellow)
+    print(p.io, "(")
+    print_value(p, term.condition)
+    print(p.io, ")")
+    if !isempty(term.args)
+        print(p.io, " ")
+        for (i, v) in enumerate(term.args)
+            i > 1 && print(p.io, ", ")
+            print_value(p, v)
+        end
+    end
+    println(p.io)
+end
+
 function print_terminator(p::IRPrinter, ::Nothing; prefix::String="└──")
     # No terminator
 end
@@ -1135,7 +1188,7 @@ function print_control_flow(p::IRPrinter, op::LoopOp; is_last::Bool=false)
     println(p.io, "end")
 end
 
-# Print WhileOp (structured while with explicit condition)
+# Print WhileOp (two-region while with before/after regions)
 function print_control_flow(p::IRPrinter, op::WhileOp; is_last::Bool=false)
     prefix = is_last ? "└──" : "├──"
     cont_prefix = is_last ? "    " : "│   "
@@ -1150,19 +1203,26 @@ function print_control_flow(p::IRPrinter, op::WhileOp; is_last::Bool=false)
         print(p.io, " = ")
     end
 
-    print_colored(p, "while", :yellow)  # Structured keyword
-    print(p.io, " ")
-    print_value(p, op.condition)
-    print_iter_args(p, op.body.args, op.init_values)
-    println(p.io)
+    print_colored(p, "while", :yellow)
+    print_iter_args(p, op.before.args, op.init_values)
+    println(p.io, " {")
 
-    # Body - substitutions already applied during construction
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(body_p, op.body)
+    # Before region (condition computation)
+    before_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
+    print_block_body(before_p, op.before)
+
+    # "} do {" separator
+    print_indent(p)
+    print_colored(p, cont_prefix, :light_black)
+    println(p.io, "} do {")
+
+    # After region (loop body)
+    after_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
+    print_block_body(after_p, op.after)
 
     print_indent(p)
     print_colored(p, cont_prefix, :light_black)
-    println(p.io, "end")
+    println(p.io, "}")
 end
 
 # Main entry point: show for StructuredCodeInfo
