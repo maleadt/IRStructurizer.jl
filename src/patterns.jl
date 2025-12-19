@@ -1,50 +1,10 @@
-# loop helper functions for restructuring.jl
+# Phase 2b: Pattern matching and loop upgrades
 #
-# These functions are used by the two-phase restructuring approach:
-# - Phase 1 uses get_loop_blocks, convert_phi_value
-# - Phase 2 uses pattern matching helpers on structured IR
+# This file contains functions for upgrading LoopOp to ForOp/WhileOp.
+# All pattern matching operates on the structured IR after substitutions.
 
 #=============================================================================
- Phase 1 Helper Functions (CFG analysis)
-=============================================================================#
-
-"""
-    get_loop_blocks(tree::ControlTree, blocks::Vector{BlockInfo}) -> Set{Int}
-
-Get all block indices contained in a loop control tree.
-"""
-function get_loop_blocks(tree::ControlTree, blocks::Vector{BlockInfo})
-    loop_blocks = Set{Int}()
-    for subtree in PreOrderDFS(tree)
-        idx = node_index(subtree)
-        if 1 <= idx <= length(blocks)
-            push!(loop_blocks, idx)
-        end
-    end
-    return loop_blocks
-end
-
-"""
-    convert_phi_value(val) -> IRValue
-
-Convert a phi node value to an IRValue.
-"""
-function convert_phi_value(val)
-    if val isa SSAValue
-        return val
-    elseif val isa Argument
-        return val
-    elseif val isa Integer
-        return val
-    elseif val isa QuoteNode
-        return val.value
-    else
-        return 0  # Fallback
-    end
-end
-
-#=============================================================================
- Phase 2 Helper Functions (Pattern matching on structured IR)
+ Helper Functions (Pattern matching on structured IR)
 =============================================================================#
 
 """
@@ -128,26 +88,6 @@ function is_loop_invariant(val, block::Block)
 end
 
 """
-    defines(block::Block, ssa::SSAValue) -> Bool
-
-Check if a block defines an SSA value (i.e., contains a Statement that produces it).
-Searches nested blocks recursively.
-"""
-function defines(block::Block, ssa::SSAValue)
-    for item in block.body
-        if item isa Statement && item.idx == ssa.id
-            return true
-        elseif item isa IfOp
-            defines(item.then_block, ssa) && return true
-            defines(item.else_block, ssa) && return true
-        elseif item isa LoopOp
-            defines(item.body, ssa) && return true
-        end
-    end
-    return false
-end
-
-"""
     is_for_condition(expr) -> Bool
 
 Check if an expression is a for-loop condition pattern: slt_int or ult_int.
@@ -158,4 +98,193 @@ function is_for_condition(expr)
     length(expr.args) >= 3 || return false
     func = expr.args[1]
     return func isa GlobalRef && func.name in (:slt_int, :ult_int)
+end
+
+#=============================================================================
+ Loop Pattern Matching (upgrade LoopOp → ForOp/WhileOp)
+=============================================================================#
+
+"""
+    apply_loop_patterns!(block::Block)
+
+Upgrade LoopOps to ForOp/WhileOp where patterns match.
+Assumes substitutions have already been applied.
+Pattern matches entirely on the structured IR.
+"""
+function apply_loop_patterns!(block::Block)
+    for (i, item) in enumerate(block.body)
+        if item isa LoopOp
+            upgraded = try_upgrade_loop(item)
+            if upgraded !== nothing
+                block.body[i] = upgraded
+                apply_loop_patterns!(upgraded.body)
+            else
+                apply_loop_patterns!(item.body)
+            end
+        elseif item isa IfOp
+            apply_loop_patterns!(item.then_block)
+            apply_loop_patterns!(item.else_block)
+        end
+    end
+end
+
+"""
+    try_upgrade_loop(loop::LoopOp) -> Union{ForOp, WhileOp, Nothing}
+
+Try to upgrade a LoopOp to a more specific loop type (ForOp or WhileOp).
+Returns the upgraded op, or nothing if no pattern matches.
+Pattern matches entirely on the structured IR (after substitutions).
+"""
+function try_upgrade_loop(loop::LoopOp)
+    # Try ForOp pattern first
+    for_op = try_upgrade_to_for(loop)
+    for_op !== nothing && return for_op
+
+    # Try WhileOp pattern
+    while_op = try_upgrade_to_while(loop)
+    while_op !== nothing && return while_op
+
+    return nothing
+end
+
+"""
+    try_upgrade_to_for(loop::LoopOp) -> Union{ForOp, Nothing}
+
+Try to upgrade a LoopOp to a ForOp by detecting the for-loop pattern.
+Pattern matches entirely on the structured IR (after substitutions).
+"""
+function try_upgrade_to_for(loop::LoopOp)
+    # Find the IfOp in the loop body - this contains the condition check
+    condition_ifop = find_ifop(loop.body)
+    condition_ifop === nothing && return nothing
+
+    # The condition should be an SSAValue pointing to a comparison Statement
+    condition_ifop.condition isa SSAValue || return nothing
+    cond_stmt = find_statement_by_ssa(loop.body, condition_ifop.condition)
+    cond_stmt === nothing && return nothing
+
+    # Check it's a for-loop condition: slt_int(iv_arg, upper_bound)
+    is_for_condition(cond_stmt.expr) || return nothing
+
+    # After substitution, the IV should be a BlockArg
+    iv_arg = cond_stmt.expr.args[2]
+    iv_arg isa BlockArg || return nothing
+    upper_bound = cond_stmt.expr.args[3]
+
+    # Find which index this BlockArg corresponds to
+    iv_idx = findfirst(==(iv_arg), loop.body.args)
+    iv_idx === nothing && return nothing
+
+    # Get lower bound from init_values and IV SSA from result_vars
+    iv_idx > length(loop.init_values) && return nothing
+    iv_idx > length(loop.result_vars) && return nothing
+    lower_bound = loop.init_values[iv_idx]
+    iv_ssa = loop.result_vars[iv_idx]
+
+    # Find the step: add_int(iv_arg, step)
+    step_stmt = find_add_int_for_iv(loop.body, iv_arg)
+    step_stmt === nothing && return nothing
+    step = step_stmt.expr.args[3]
+
+    # Verify upper_bound and step are loop-invariant
+    is_loop_invariant(upper_bound, loop.body) || return nothing
+    is_loop_invariant(step, loop.body) || return nothing
+
+    # Separate non-IV carried values
+    other_result_vars = SSAValue[]
+    other_init_values = IRValue[]
+    for (j, rv) in enumerate(loop.result_vars)
+        if j != iv_idx && j <= length(loop.init_values)
+            push!(other_result_vars, rv)
+            push!(other_init_values, loop.init_values[j])
+        end
+    end
+
+    # Rebuild body block without condition structure
+    # LoopOp body: [header_stmts..., IfOp(cond, continue_block, break_block)]
+    # ForOp body: [body_stmts...] with ContinueOp terminator
+    new_body = Block(loop.body.id)
+    new_body.args = copy(loop.body.args)
+
+    # Extract body statements, filtering out iv-related ones
+    for item in loop.body.body
+        if item isa Statement
+            # Skip iv increment and condition comparison
+            item === step_stmt && continue
+            item === cond_stmt && continue
+            push!(new_body.body, item)
+        elseif item isa IfOp
+            # Extract the continue path's body (skip condition check structure)
+            for sub_item in item.then_block.body
+                if sub_item isa Statement
+                    sub_item === step_stmt && continue
+                    push!(new_body.body, sub_item)
+                else
+                    push!(new_body.body, sub_item)
+                end
+            end
+        else
+            push!(new_body.body, item)
+        end
+    end
+
+    # Get yield values from continue terminator, excluding the IV
+    yield_values = IRValue[]
+    if !isempty(loop.body.body)
+        last_item = loop.body.body[end]
+        if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
+            for (j, v) in enumerate(last_item.then_block.terminator.values)
+                j != iv_idx && push!(yield_values, v)
+            end
+        end
+    end
+    new_body.terminator = ContinueOp(yield_values)
+
+    return ForOp(lower_bound, upper_bound, step, iv_ssa, iv_arg,
+                 other_init_values, new_body, other_result_vars)
+end
+
+"""
+    try_upgrade_to_while(loop::LoopOp) -> Union{WhileOp, Nothing}
+
+Try to upgrade a LoopOp to a WhileOp by detecting the while-loop pattern.
+Pattern matches entirely on the structured IR (after substitutions).
+"""
+function try_upgrade_to_while(loop::LoopOp)
+    # Build WhileOp from the existing LoopOp structure
+    # The body already has substitutions applied from Phase 2a
+
+    # Find the IfOp in the loop body - its condition is the while condition (already substituted)
+    condition_ifop = find_ifop(loop.body)
+    condition_ifop === nothing && return nothing
+
+    # Rebuild body without the IfOp condition structure
+    new_body = Block(loop.body.id)
+    new_body.args = copy(loop.body.args)
+
+    # Extract statements and the continue path from the IfOp
+    for item in loop.body.body
+        if item isa Statement
+            push!(new_body.body, item)
+        elseif item isa IfOp
+            # This is the condition check - extract the continue path's body
+            for sub_item in item.then_block.body
+                push!(new_body.body, sub_item)
+            end
+        else
+            push!(new_body.body, item)
+        end
+    end
+
+    # Get yield values from the continue terminator
+    yield_values = IRValue[]
+    if !isempty(loop.body.body)
+        last_item = loop.body.body[end]
+        if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
+            yield_values = copy(last_item.then_block.terminator.values)
+        end
+    end
+    new_body.terminator = ContinueOp(yield_values)
+
+    return WhileOp(condition_ifop.condition, loop.init_values, new_body, loop.result_vars)
 end

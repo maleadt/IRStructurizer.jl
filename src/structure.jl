@@ -1,16 +1,52 @@
-# control tree to structured IR conversion
+# Phase 1: Control Tree to Structured IR
 #
-# Two-phase approach:
-# Phase 1: Convert ControlTree to structured IR with LoopOp for all loops (no SSA substitutions)
-# Phase 2: Walk outer→inner, upgrade LoopOp to ForOp/WhileOp and apply local substitutions
+# Converts a ControlTree (from graph contraction) to structured IR with Block,
+# Statement, and ControlFlowOp objects. All loops become LoopOp in this phase.
+# Pattern matching (ForOp/WhileOp) and substitutions happen in later phases.
 
-export StructuredCodeInfo, structurize!
-
-using Graphs: SimpleDiGraph, add_edge!, vertices, edges, nv, ne,
-              inneighbors, outneighbors, Edge
+using AbstractTrees: PreOrderDFS
 
 #=============================================================================
- Phase 1: Control Tree to Structured IR (no substitutions)
+ Phase 1 Helpers
+=============================================================================#
+
+"""
+    get_loop_blocks(tree::ControlTree, blocks::Vector{BlockInfo}) -> Set{Int}
+
+Get all block indices contained in a loop control tree.
+"""
+function get_loop_blocks(tree::ControlTree, blocks::Vector{BlockInfo})
+    loop_blocks = Set{Int}()
+    for subtree in PreOrderDFS(tree)
+        idx = node_index(subtree)
+        if 1 <= idx <= length(blocks)
+            push!(loop_blocks, idx)
+        end
+    end
+    return loop_blocks
+end
+
+"""
+    convert_phi_value(val) -> IRValue
+
+Convert a phi node value to an IRValue.
+"""
+function convert_phi_value(val)
+    if val isa SSAValue
+        return val
+    elseif val isa Argument
+        return val
+    elseif val isa Integer
+        return val
+    elseif val isa QuoteNode
+        return val.value
+    else
+        return 0  # Fallback
+    end
+end
+
+#=============================================================================
+ Control Tree to Structured IR
 =============================================================================#
 
 """
@@ -64,6 +100,10 @@ function tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
 
     return block
 end
+
+#=============================================================================
+ Region Handlers
+=============================================================================#
 
 """
     handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
@@ -289,6 +329,10 @@ function handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks:
     handle_block_region!(block, tree, code, blocks, block_id)
 end
 
+#=============================================================================
+ Statement Collection Helpers
+=============================================================================#
+
 """
     collect_block_statements!(block::Block, info::BlockInfo, code::CodeInfo)
 
@@ -356,10 +400,14 @@ function set_block_terminator!(block::Block, code::CodeInfo, blocks::Vector{Bloc
     end
 end
 
+#=============================================================================
+ Loop Construction
+=============================================================================#
+
 """
     build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int}) -> LoopOp
 
-Build a LoopOp with metadata for Phase 1. No substitutions applied yet.
+Build a LoopOp for Phase 1. No substitutions applied yet.
 Pattern detection and substitution happens in Phase 2.
 """
 function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
@@ -483,14 +531,14 @@ function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{
 end
 
 #=============================================================================
- Phase 2a: Apply SSA Substitutions (outer → inner)
+ Phase 1 Completion: Apply SSA Substitutions (outer → inner)
 =============================================================================#
 
 """
     apply_loop_substitutions!(block::Block)
 
 Apply SSA→BlockArg substitutions to all loops, processing outer→inner.
-Must be called before pattern matching.
+Must be called after Phase 1 to complete the structured IR.
 """
 function apply_loop_substitutions!(block::Block)
     for item in block.body
@@ -501,34 +549,6 @@ function apply_loop_substitutions!(block::Block)
         elseif item isa IfOp
             apply_loop_substitutions!(item.then_block)
             apply_loop_substitutions!(item.else_block)
-        end
-    end
-end
-
-#=============================================================================
- Phase 2b: Pattern Matching (upgrade LoopOp → ForOp/WhileOp)
-=============================================================================#
-
-"""
-    apply_loop_patterns!(block::Block)
-
-Upgrade LoopOps to ForOp/WhileOp where patterns match.
-Assumes substitutions have already been applied.
-Pattern matches entirely on the structured IR.
-"""
-function apply_loop_patterns!(block::Block)
-    for (i, item) in enumerate(block.body)
-        if item isa LoopOp
-            upgraded = try_upgrade_loop(item)
-            if upgraded !== nothing
-                block.body[i] = upgraded
-                apply_loop_patterns!(upgraded.body)
-            else
-                apply_loop_patterns!(item.body)
-            end
-        elseif item isa IfOp
-            apply_loop_patterns!(item.then_block)
-            apply_loop_patterns!(item.else_block)
         end
     end
 end
@@ -546,233 +566,4 @@ function compute_loop_subs(loop::LoopOp)
         subs[result_var.id] = loop.body.args[i]
     end
     return subs
-end
-
-"""
-    try_upgrade_loop(loop::LoopOp) -> Union{ForOp, WhileOp, Nothing}
-
-Try to upgrade a LoopOp to a more specific loop type (ForOp or WhileOp).
-Returns the upgraded op, or nothing if no pattern matches.
-Pattern matches entirely on the structured IR (after substitutions).
-"""
-function try_upgrade_loop(loop::LoopOp)
-    # Try ForOp pattern first
-    for_op = try_upgrade_to_for(loop)
-    for_op !== nothing && return for_op
-
-    # Try WhileOp pattern
-    while_op = try_upgrade_to_while(loop)
-    while_op !== nothing && return while_op
-
-    return nothing
-end
-
-"""
-    try_upgrade_to_for(loop::LoopOp) -> Union{ForOp, Nothing}
-
-Try to upgrade a LoopOp to a ForOp by detecting the for-loop pattern.
-Pattern matches entirely on the structured IR (after substitutions).
-"""
-function try_upgrade_to_for(loop::LoopOp)
-    # Find the IfOp in the loop body - this contains the condition check
-    condition_ifop = find_ifop(loop.body)
-    condition_ifop === nothing && return nothing
-
-    # The condition should be an SSAValue pointing to a comparison Statement
-    condition_ifop.condition isa SSAValue || return nothing
-    cond_stmt = find_statement_by_ssa(loop.body, condition_ifop.condition)
-    cond_stmt === nothing && return nothing
-
-    # Check it's a for-loop condition: slt_int(iv_arg, upper_bound)
-    is_for_condition(cond_stmt.expr) || return nothing
-
-    # After substitution, the IV should be a BlockArg
-    iv_arg = cond_stmt.expr.args[2]
-    iv_arg isa BlockArg || return nothing
-    upper_bound = cond_stmt.expr.args[3]
-
-    # Find which index this BlockArg corresponds to
-    iv_idx = findfirst(==(iv_arg), loop.body.args)
-    iv_idx === nothing && return nothing
-
-    # Get lower bound from init_values and IV SSA from result_vars
-    iv_idx > length(loop.init_values) && return nothing
-    iv_idx > length(loop.result_vars) && return nothing
-    lower_bound = loop.init_values[iv_idx]
-    iv_ssa = loop.result_vars[iv_idx]
-
-    # Find the step: add_int(iv_arg, step)
-    step_stmt = find_add_int_for_iv(loop.body, iv_arg)
-    step_stmt === nothing && return nothing
-    step = step_stmt.expr.args[3]
-
-    # Verify upper_bound and step are loop-invariant
-    is_loop_invariant(upper_bound, loop.body) || return nothing
-    is_loop_invariant(step, loop.body) || return nothing
-
-    # Separate non-IV carried values
-    other_result_vars = SSAValue[]
-    other_init_values = IRValue[]
-    for (j, rv) in enumerate(loop.result_vars)
-        if j != iv_idx && j <= length(loop.init_values)
-            push!(other_result_vars, rv)
-            push!(other_init_values, loop.init_values[j])
-        end
-    end
-
-    # Rebuild body block without condition structure
-    # LoopOp body: [header_stmts..., IfOp(cond, continue_block, break_block)]
-    # ForOp body: [body_stmts...] with ContinueOp terminator
-    new_body = Block(loop.body.id)
-    new_body.args = copy(loop.body.args)
-
-    # Extract body statements, filtering out iv-related ones
-    for item in loop.body.body
-        if item isa Statement
-            # Skip iv increment and condition comparison
-            item === step_stmt && continue
-            item === cond_stmt && continue
-            push!(new_body.body, item)
-        elseif item isa IfOp
-            # Extract the continue path's body (skip condition check structure)
-            for sub_item in item.then_block.body
-                if sub_item isa Statement
-                    sub_item === step_stmt && continue
-                    push!(new_body.body, sub_item)
-                else
-                    push!(new_body.body, sub_item)
-                end
-            end
-        else
-            push!(new_body.body, item)
-        end
-    end
-
-    # Get yield values from continue terminator, excluding the IV
-    yield_values = IRValue[]
-    if !isempty(loop.body.body)
-        last_item = loop.body.body[end]
-        if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
-            for (j, v) in enumerate(last_item.then_block.terminator.values)
-                j != iv_idx && push!(yield_values, v)
-            end
-        end
-    end
-    new_body.terminator = ContinueOp(yield_values)
-
-    return ForOp(lower_bound, upper_bound, step, iv_ssa, iv_arg,
-                 other_init_values, new_body, other_result_vars)
-end
-
-"""
-    try_upgrade_to_while(loop::LoopOp) -> Union{WhileOp, Nothing}
-
-Try to upgrade a LoopOp to a WhileOp by detecting the while-loop pattern.
-Pattern matches entirely on the structured IR (after substitutions).
-"""
-function try_upgrade_to_while(loop::LoopOp)
-    # Build WhileOp from the existing LoopOp structure
-    # The body already has substitutions applied from Phase 2a
-
-    # Find the IfOp in the loop body - its condition is the while condition (already substituted)
-    condition_ifop = find_ifop(loop.body)
-    condition_ifop === nothing && return nothing
-
-    # Rebuild body without the IfOp condition structure
-    new_body = Block(loop.body.id)
-    new_body.args = copy(loop.body.args)
-
-    # Extract statements and the continue path from the IfOp
-    for item in loop.body.body
-        if item isa Statement
-            push!(new_body.body, item)
-        elseif item isa IfOp
-            # This is the condition check - extract the continue path's body
-            for sub_item in item.then_block.body
-                push!(new_body.body, sub_item)
-            end
-        else
-            push!(new_body.body, item)
-        end
-    end
-
-    # Get yield values from the continue terminator
-    yield_values = IRValue[]
-    if !isempty(loop.body.body)
-        last_item = loop.body.body[end]
-        if last_item isa IfOp && last_item.then_block.terminator isa ContinueOp
-            yield_values = copy(last_item.then_block.terminator.values)
-        end
-    end
-    new_body.terminator = ContinueOp(yield_values)
-
-    return WhileOp(condition_ifop.condition, loop.init_values, new_body, loop.result_vars)
-end
-
-#=============================================================================
- Public API
-=============================================================================#
-
-"""
-    structurize!(sci::StructuredCodeInfo; loop_patterning=true) -> StructuredCodeInfo
-
-Convert unstructured control flow in `sci` to structured control flow operations
-(IfOp, ForOp, WhileOp, LoopOp) in-place.
-
-This transforms GotoNode and GotoIfNot statements into nested structured ops
-that can be traversed hierarchically.
-
-Two-phase approach:
-1. Build structure with LoopOp for all loops (no SSA substitutions)
-2. Walk outer→inner, upgrade loops and apply local substitutions
-
-When `loop_patterning=true` (default), loops are classified as ForOp (bounded counters)
-or WhileOp (condition-based). When `false`, all loops become LoopOp.
-
-Returns `sci` for convenience (allows chaining).
-"""
-function structurize!(sci::StructuredCodeInfo; loop_patterning::Bool=true)
-    code = sci.code
-    stmts = code.code
-    types = code.ssavaluetypes
-    n = length(stmts)
-
-    n == 0 && return sci
-
-    # Check if the code is straight-line (no control flow)
-    has_control_flow = any(s -> s isa GotoNode || s isa GotoIfNot, stmts)
-
-    if !has_control_flow
-        # Straight-line code - no substitutions needed
-        new_entry = Block(1)
-        for i in 1:n
-            stmt = stmts[i]
-            if stmt isa ReturnNode
-                new_entry.terminator = stmt
-            elseif !(stmt isa GotoNode || stmt isa GotoIfNot)
-                push!(new_entry.body, Statement(i, stmt, types[i]))
-            end
-        end
-        sci.entry = new_entry
-        return sci
-    end
-
-    # Build block-level CFG
-    blocks, cfg = build_block_cfg(code)
-
-    # Build control tree using SPIRV.jl-style graph contraction
-    ctree = ControlTree(cfg)
-
-    # Phase 1: Convert control tree to structured IR (LoopOp for all loops, no subs)
-    sci.entry = control_tree_to_structured_ir(ctree, code, blocks)
-
-    # Phase 2a: Apply SSA substitutions (always)
-    apply_loop_substitutions!(sci.entry)
-
-    # Phase 2b: Upgrade loop patterns (optional)
-    if loop_patterning
-        apply_loop_patterns!(sci.entry)
-    end
-
-    return sci
 end

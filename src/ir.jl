@@ -468,6 +468,34 @@ function each_stmt_in_op(f, op::WhileOp)
 end
 
 #=============================================================================
+ Block Queries
+=============================================================================#
+
+"""
+    defines(block::Block, ssa::SSAValue) -> Bool
+
+Check if a block defines an SSA value (i.e., contains a Statement that produces it).
+Searches nested blocks recursively.
+"""
+function defines(block::Block, ssa::SSAValue)
+    for item in block.body
+        if item isa Statement && item.idx == ssa.id
+            return true
+        elseif item isa IfOp
+            defines(item.then_block, ssa) && return true
+            defines(item.else_block, ssa) && return true
+        elseif item isa LoopOp
+            defines(item.body, ssa) && return true
+        elseif item isa ForOp
+            defines(item.body, ssa) && return true
+        elseif item isa WhileOp
+            defines(item.body, ssa) && return true
+        end
+    end
+    return false
+end
+
+#=============================================================================
  Pretty Printing (Julia CodeInfo-style)
 =============================================================================#
 
