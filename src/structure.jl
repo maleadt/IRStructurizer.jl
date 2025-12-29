@@ -1,13 +1,9 @@
-# Phase 1: Control Tree to Structured IR
-#
-# Converts a ControlTree (from graph contraction) to structured IR with Block,
-# Statement, and ControlFlowOp objects. All loops become LoopOp in this phase.
-# Pattern matching (ForOp/WhileOp) and substitutions happen in later phases.
+# Control Tree to Structured IR
 
 using AbstractTrees: PreOrderDFS
 
 #=============================================================================
- Phase 1 Helpers
+ Helpers
 =============================================================================#
 
 """
@@ -41,7 +37,7 @@ function convert_phi_value(val)
     elseif val isa QuoteNode
         return val.value
     else
-        return 0  # Fallback
+        error("Unexpected phi value type: $(typeof(val))")
     end
 end
 
@@ -50,49 +46,45 @@ end
 =============================================================================#
 
 """
-    control_tree_to_structured_ir(ctree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}) -> Block
+    control_tree_to_structured_ir(ctree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext) -> Block
 
 Convert a control tree to structured IR entry block.
 All loops become LoopOp (no pattern matching yet, no substitutions).
 """
-function control_tree_to_structured_ir(ctree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo})
-    block_id = Ref(1)
-    entry_block = tree_to_block(ctree, code, blocks, block_id)
-    return entry_block
+function control_tree_to_structured_ir(ctree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                                       ctx::StructurizationContext)
+    return tree_to_block(ctree, code, blocks, ctx)
 end
 
 """
-    tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int}) -> Block
+    tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext) -> Block
 
-Convert a control tree node to a Block. Creates Statement objects with raw expressions (no substitutions).
+Convert a control tree node to a Block with raw expressions (no substitutions).
 """
-function tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                       ctx::StructurizationContext)
     idx = node_index(tree)
     rtype = region_type(tree)
-    id = block_id[]
-    block_id[] += 1
-
-    block = Block(id)
+    block = Block()
 
     if rtype == REGION_BLOCK
-        handle_block_region!(block, tree, code, blocks, block_id)
+        handle_block_region!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_IF_THEN_ELSE
-        handle_if_then_else!(block, tree, code, blocks, block_id)
+        handle_if_then_else!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_IF_THEN
-        handle_if_then!(block, tree, code, blocks, block_id)
+        handle_if_then!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_TERMINATION
-        handle_termination!(block, tree, code, blocks, block_id)
+        handle_termination!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
-        handle_loop!(block, tree, code, blocks, block_id)
+        handle_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SELF_LOOP
-        handle_self_loop!(block, tree, code, blocks, block_id)
+        handle_self_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_PROPER
-        handle_proper_region!(block, tree, code, blocks, block_id)
+        handle_proper_region!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, code, blocks, block_id)
+        handle_switch!(block, tree, code, blocks, ctx)
     else
-        # Fallback: collect statements
-        handle_block_region!(block, tree, code, blocks, block_id)
+        error("Unknown region type: $rtype")
     end
 
     # Set terminator if not already set
@@ -106,11 +98,12 @@ end
 =============================================================================#
 
 """
-    handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_BLOCK - a linear sequence of blocks.
 """
-function handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                              ctx::StructurizationContext)
     if isempty(children(tree))
         # Leaf node - collect statements from the block
         idx = node_index(tree)
@@ -122,62 +115,68 @@ function handle_block_region!(block::Block, tree::ControlTree, code::CodeInfo, b
         for child in children(tree)
             child_rtype = region_type(child)
             if child_rtype == REGION_BLOCK
-                handle_block_region!(block, child, code, blocks, block_id)
+                handle_block_region!(block, child, code, blocks, ctx)
             else
                 # Nested control flow - create appropriate op
-                handle_nested_region!(block, child, code, blocks, block_id)
+                handle_nested_region!(block, child, code, blocks, ctx)
             end
         end
     end
 end
 
 """
-    handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle a nested control flow region.
 """
-function handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                               ctx::StructurizationContext)
     rtype = region_type(tree)
 
     if rtype == REGION_IF_THEN_ELSE
-        handle_if_then_else!(block, tree, code, blocks, block_id)
+        handle_if_then_else!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_IF_THEN
-        handle_if_then!(block, tree, code, blocks, block_id)
+        handle_if_then!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_TERMINATION
-        handle_termination!(block, tree, code, blocks, block_id)
+        handle_termination!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
-        handle_loop!(block, tree, code, blocks, block_id)
+        handle_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SELF_LOOP
-        handle_self_loop!(block, tree, code, blocks, block_id)
+        handle_self_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_PROPER
-        handle_proper_region!(block, tree, code, blocks, block_id)
+        handle_proper_region!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, code, blocks, block_id)
+        handle_switch!(block, tree, code, blocks, ctx)
     else
-        handle_block_region!(block, tree, code, blocks, block_id)
+        error("Unknown region type in nested region: $rtype")
     end
 end
 
 """
-    handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_IF_THEN_ELSE.
 """
-function handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                              ctx::StructurizationContext)
     tree_children = children(tree)
-    length(tree_children) >= 3 || return handle_block_region!(block, tree, code, blocks, block_id)
+    length(tree_children) >= 3 || return handle_block_region!(block, tree, code, blocks, ctx)
 
     # First child is the condition block
     cond_tree = tree_children[1]
     cond_idx = node_index(cond_tree)
 
-    # Collect condition block statements and find condition
+    # Find the GotoIfNot's SSA index for keying (fallback if no merge phi)
+    gotoifnot_idx = nothing
     if 1 <= cond_idx <= length(blocks)
         cond_block = blocks[cond_idx]
         for si in cond_block.range
             stmt = code.code[si]
+            if stmt isa GotoIfNot
+                gotoifnot_idx = si
+            end
             if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block.body, Statement(si, stmt, code.ssavaluetypes[si]))
+                push!(block, si, stmt, code.ssavaluetypes[si])
             end
         end
     end
@@ -188,34 +187,114 @@ function handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, b
     then_tree = tree_children[2]
     else_tree = tree_children[3]
 
-    then_block = tree_to_block(then_tree, code, blocks, block_id)
-    else_block = tree_to_block(else_tree, code, blocks, block_id)
+    then_blk = tree_to_block(then_tree, code, blocks, ctx)
+    else_blk = tree_to_block(else_tree, code, blocks, ctx)
 
-    # Create IfOp
-    if_op = IfOp(cond_value, then_block, else_block, SSAValue[])
-    push!(block.body, if_op)
+    # Find merge block and detect merge phis
+    then_block_idx = node_index(then_tree)
+    else_block_idx = node_index(else_tree)
+    merge_phis = find_merge_phis(code, blocks, then_block_idx, else_block_idx)
+
+    # Add YieldOp terminators with phi values
+    if !isempty(merge_phis)
+        then_values = [phi.then_val for phi in merge_phis]
+        else_values = [phi.else_val for phi in merge_phis]
+        then_blk.terminator = YieldOp(then_values)
+        else_blk.terminator = YieldOp(else_values)
+    end
+
+    if_op = IfOp(cond_value, then_blk, else_blk)
+
+    # Key by first merge phi's SSA index if available, else by GotoIfNot
+    if !isempty(merge_phis)
+        result_idx = merge_phis[1].ssa_idx
+        result_types = [ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
+        if length(result_types) == 1
+            result_type = result_types[1]
+        else
+            result_type = Tuple{result_types...}
+        end
+    else
+        result_idx = gotoifnot_idx !== nothing ? gotoifnot_idx : last(blocks[cond_idx].range)
+        result_type = Nothing
+    end
+    push!(block, result_idx, if_op, result_type)
 end
 
 """
-    handle_if_then!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    find_merge_phis(code, blocks, then_block_idx, else_block_idx)
+
+Find phis in the merge block (common successor of then and else blocks)
+that receive values from both branches.
+
+Returns a vector of NamedTuples: (ssa_idx, then_val, else_val)
+"""
+function find_merge_phis(code::CodeInfo, blocks::Vector{BlockInfo},
+                         then_block_idx::Int, else_block_idx::Int)
+    merge_phis = NamedTuple{(:ssa_idx, :then_val, :else_val), Tuple{Int, Any, Any}}[]
+
+    # Find common successor (merge block)
+    then_succs = 1 <= then_block_idx <= length(blocks) ? blocks[then_block_idx].succs : Int[]
+    else_succs = 1 <= else_block_idx <= length(blocks) ? blocks[else_block_idx].succs : Int[]
+    merge_blocks = intersect(then_succs, else_succs)
+    isempty(merge_blocks) && return merge_phis
+
+    merge_block_idx = first(merge_blocks)
+    1 <= merge_block_idx <= length(blocks) || return merge_phis
+    merge_block = blocks[merge_block_idx]
+
+    then_range = blocks[then_block_idx].range
+    else_range = blocks[else_block_idx].range
+
+    # Look for phis that have edges from both then and else blocks
+    for si in merge_block.range
+        stmt = code.code[si]
+        stmt isa PhiNode || continue
+
+        then_val = nothing
+        else_val = nothing
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            if edge in then_range
+                then_val = stmt.values[edge_idx]
+            elseif edge in else_range
+                else_val = stmt.values[edge_idx]
+            end
+        end
+
+        # Only include if we have values from both branches
+        if then_val !== nothing && else_val !== nothing
+            push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=else_val))
+        end
+    end
+
+    return merge_phis
+end
+
+"""
+    handle_if_then!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_IF_THEN.
 """
-function handle_if_then!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_if_then!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                         ctx::StructurizationContext)
     tree_children = children(tree)
-    length(tree_children) >= 2 || return handle_block_region!(block, tree, code, blocks, block_id)
+    length(tree_children) >= 2 || return handle_block_region!(block, tree, code, blocks, ctx)
 
     # First child is the condition block
     cond_tree = tree_children[1]
     cond_idx = node_index(cond_tree)
 
-    # Collect condition block statements
+    # Find the GotoIfNot's SSA index for keying
+    gotoifnot_idx = nothing
     if 1 <= cond_idx <= length(blocks)
         cond_block = blocks[cond_idx]
         for si in cond_block.range
             stmt = code.code[si]
+            if stmt isa GotoIfNot
+                gotoifnot_idx = si
+            end
             if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block.body, Statement(si, stmt, code.ssavaluetypes[si]))
+                push!(block, si, stmt, code.ssavaluetypes[si])
             end
         end
     end
@@ -224,109 +303,125 @@ function handle_if_then!(block::Block, tree::ControlTree, code::CodeInfo, blocks
 
     # Then block
     then_tree = tree_children[2]
-    then_block = tree_to_block(then_tree, code, blocks, block_id)
+    then_blk = tree_to_block(then_tree, code, blocks, ctx)
 
     # Empty else block
-    else_block = Block(block_id[])
-    block_id[] += 1
+    else_blk = Block()
 
-    if_op = IfOp(cond_value, then_block, else_block, SSAValue[])
-    push!(block.body, if_op)
+    if_op = IfOp(cond_value, then_blk, else_blk)
+    result_idx = gotoifnot_idx !== nothing ? gotoifnot_idx : last(blocks[cond_idx].range)
+    push!(block, result_idx, if_op, Nothing)
 end
 
 """
-    handle_termination!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_termination!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_TERMINATION - branches where some paths terminate.
 """
-function handle_termination!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_termination!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                             ctx::StructurizationContext)
     tree_children = children(tree)
-    isempty(tree_children) && return handle_block_region!(block, tree, code, blocks, block_id)
+    isempty(tree_children) && return handle_block_region!(block, tree, code, blocks, ctx)
 
     # First child is the condition block
     cond_tree = tree_children[1]
     cond_idx = node_index(cond_tree)
 
-    # Collect condition block statements
+    # Find the GotoIfNot's SSA index for keying
+    gotoifnot_idx = nothing
     if 1 <= cond_idx <= length(blocks)
         cond_block = blocks[cond_idx]
         for si in cond_block.range
             stmt = code.code[si]
+            if stmt isa GotoIfNot
+                gotoifnot_idx = si
+            end
             if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block.body, Statement(si, stmt, code.ssavaluetypes[si]))
+                push!(block, si, stmt, code.ssavaluetypes[si])
             end
         end
     end
 
     cond_value = find_condition_value(cond_idx, code, blocks)
+    result_idx = gotoifnot_idx !== nothing ? gotoifnot_idx : last(blocks[cond_idx].range)
 
     # Build then and else blocks from remaining children
     if length(tree_children) >= 3
         then_tree = tree_children[2]
         else_tree = tree_children[3]
-        then_block = tree_to_block(then_tree, code, blocks, block_id)
-        else_block = tree_to_block(else_tree, code, blocks, block_id)
-        if_op = IfOp(cond_value, then_block, else_block, SSAValue[])
-        push!(block.body, if_op)
+        then_blk = tree_to_block(then_tree, code, blocks, ctx)
+        else_blk = tree_to_block(else_tree, code, blocks, ctx)
+        if_op = IfOp(cond_value, then_blk, else_blk)
+        push!(block, result_idx, if_op, Nothing)
     elseif length(tree_children) == 2
         then_tree = tree_children[2]
-        then_block = tree_to_block(then_tree, code, blocks, block_id)
-        else_block = Block(block_id[])
-        block_id[] += 1
-        if_op = IfOp(cond_value, then_block, else_block, SSAValue[])
-        push!(block.body, if_op)
+        then_blk = tree_to_block(then_tree, code, blocks, ctx)
+        else_blk = Block()
+        if_op = IfOp(cond_value, then_blk, else_blk)
+        push!(block, result_idx, if_op, Nothing)
     end
 end
 
 """
-    handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_WHILE_LOOP and REGION_NATURAL_LOOP.
-Phase 1: Always creates LoopOp with metadata. Pattern matching happens in Phase 2.
+Phase 1: Always creates LoopOp with metadata. Pattern matching happens in Phase 3.
 """
-function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
-    loop_op = build_loop_op_phase1(tree, code, blocks, block_id)
-    push!(block.body, loop_op)
+function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                      ctx::StructurizationContext)
+    loop_op = build_loop_op(tree, code, blocks, ctx)
+    results = derive_result_vars(loop_op)
+    if !isempty(results)
+        # Key by first result phi's SSA index
+        push!(block, results[1].id, loop_op, Nothing)
+    else
+        # Spin loops with no loop-carried variables have no result phis.
+        # Use the header's last statement (typically GotoIfNot) as the key.
+        header_idx = node_index(tree)
+        @assert 1 <= header_idx <= length(blocks) "Invalid header index: $header_idx"
+        push!(block, last(blocks[header_idx].range), loop_op, Nothing)
+    end
 end
 
 """
-    handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_SELF_LOOP.
 """
-function handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                           ctx::StructurizationContext)
     idx = node_index(tree)
+    @assert 1 <= idx <= length(blocks) "Invalid block index from control tree: $idx"
 
-    body_block = Block(block_id[])
-    block_id[] += 1
+    body_blk = Block()
+    collect_block_statements!(body_blk, blocks[idx], code)
 
-    if 1 <= idx <= length(blocks)
-        collect_block_statements!(body_block, blocks[idx], code)
-    end
-
-    loop_op = LoopOp(IRValue[], body_block, SSAValue[])
-    push!(block.body, loop_op)
+    loop_op = LoopOp(body_blk, IRValue[])
+    push!(block, last(blocks[idx].range), loop_op, Nothing)
 end
 
 """
-    handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_PROPER - acyclic region not matching other patterns.
 """
-function handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                               ctx::StructurizationContext)
     # Process as a sequence of blocks
-    handle_block_region!(block, tree, code, blocks, block_id)
+    handle_block_region!(block, tree, code, blocks, ctx)
 end
 
 """
-    handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+    handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_SWITCH.
 """
-function handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                        ctx::StructurizationContext)
     # For now, handle as a nested if-else chain
     # TODO: Implement proper switch handling if needed
-    handle_block_region!(block, tree, code, blocks, block_id)
+    handle_block_region!(block, tree, code, blocks, ctx)
 end
 
 #=============================================================================
@@ -337,7 +432,7 @@ end
     collect_block_statements!(block::Block, info::BlockInfo, code::CodeInfo)
 
 Collect statements from a BlockInfo into a Block, excluding control flow.
-Creates Statement objects with raw expressions (no substitutions).
+Stores raw expressions (no substitutions) with their SSA indices.
 """
 function collect_block_statements!(block::Block, info::BlockInfo, code::CodeInfo)
     stmts = code.code
@@ -347,7 +442,7 @@ function collect_block_statements!(block::Block, info::BlockInfo, code::CodeInfo
         if stmt isa ReturnNode
             block.terminator = stmt
         elseif !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa PhiNode)
-            push!(block.body, Statement(si, stmt, types[si]))
+            push!(block, si, stmt, types[si])
         end
     end
 end
@@ -358,22 +453,19 @@ end
 Find the condition value for a GotoIfNot in the given block.
 """
 function find_condition_value(block_idx::Int, code::CodeInfo, blocks::Vector{BlockInfo})
-    block_idx < 1 || block_idx > length(blocks) && return SSAValue(1)
+    @assert 1 <= block_idx <= length(blocks) "Invalid block index: $block_idx"
 
     block = blocks[block_idx]
     for si in block.range
         stmt = code.code[si]
         if stmt isa GotoIfNot
             cond = stmt.cond
-            if cond isa SSAValue || cond isa SlotNumber || cond isa Argument
-                return cond
-            else
-                return SSAValue(max(1, si - 1))
-            end
+            @assert cond isa SSAValue || cond isa SlotNumber || cond isa Argument "Unexpected condition type: $(typeof(cond))"
+            return cond
         end
     end
 
-    return SSAValue(max(1, first(block.range)))
+    error("No GotoIfNot found in block $block_idx")
 end
 
 """
@@ -384,12 +476,12 @@ Set the block terminator based on statements.
 function set_block_terminator!(block::Block, code::CodeInfo, blocks::Vector{BlockInfo})
     block.terminator !== nothing && return
 
-    # Find the last statement index in body
     last_idx = nothing
-    for item in reverse(block.body)
-        if item isa Statement
-            last_idx = item.idx
-            break
+    for (idx, entry) in block.body
+        if !(entry.stmt isa ControlFlowOp)
+            if last_idx === nothing || idx > last_idx
+                last_idx = idx
+            end
         end
     end
     if last_idx !== nothing && last_idx < length(code.code)
@@ -405,12 +497,13 @@ end
 =============================================================================#
 
 """
-    build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int}) -> LoopOp
+    build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext) -> LoopOp
 
-Build a LoopOp for Phase 1. No substitutions applied yet.
-Pattern detection and substitution happens in Phase 2.
+Build a LoopOp from a control tree. Pure structure building - no BlockArgs or substitutions.
+BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
 """
-function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, block_id::Ref{Int})
+function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                              ctx::StructurizationContext)
     stmts = code.code
     types = code.ssavaluetypes
     header_idx = node_index(tree)
@@ -420,16 +513,14 @@ function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{
     header_block = blocks[header_idx]
     stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
 
-    # Find phi nodes in header - these become loop-carried values and results
-    init_values = IRValue[]
+    iter_args = IRValue[]
     carried_values = IRValue[]
-    block_args = BlockArg[]
-    result_vars = SSAValue[]
+    result_ssa_indices = SSAValue[]
 
     for si in header_block.range
         stmt = stmts[si]
         if stmt isa PhiNode
-            push!(result_vars, SSAValue(si))
+            push!(result_ssa_indices, SSAValue(si))
             phi = stmt
 
             entry_val = nothing
@@ -457,34 +548,30 @@ function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{
                 end
             end
 
-            entry_val !== nothing && push!(init_values, entry_val)
+            entry_val !== nothing && push!(iter_args, entry_val)
             carried_val !== nothing && push!(carried_values, carried_val)
-
-            phi_type = types[si]
-            push!(block_args, BlockArg(length(block_args) + 1, phi_type))
         end
     end
 
-    # Build loop body block
-    body = Block(block_id[])
-    block_id[] += 1
-    body.args = block_args
+    body = Block()
 
-    # Find the condition for loop exit
+    # Find the condition for loop exit and its SSA index
     condition = nothing
+    condition_idx = nothing
     for si in header_block.range
         stmt = stmts[si]
         if stmt isa GotoIfNot
             condition = stmt.cond
+            condition_idx = si
             break
         end
     end
 
-    # Collect header statements (excluding phi nodes and control flow) - NO SUBSTITUTION
+    # Collect header statements (excluding phi nodes and control flow)
     for si in header_block.range
         stmt = stmts[si]
         if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-            push!(body.body, Statement(si, stmt, types[si]))
+            push!(body, si, stmt, types[si])
         end
     end
 
@@ -492,78 +579,142 @@ function build_loop_op_phase1(tree::ControlTree, code::CodeInfo, blocks::Vector{
     if condition !== nothing
         cond_value = convert_phi_value(condition)
 
-        then_block = Block(block_id[])
-        block_id[] += 1
+        then_blk = Block()
 
         # Process loop body blocks (excluding header)
         for child in children(tree)
             child_idx = node_index(child)
             if child_idx != header_idx
-                handle_block_region!(then_block, child, code, blocks, block_id)
+                handle_block_region!(then_blk, child, code, blocks, ctx)
             end
         end
-        # Raw carried values (no substitution yet)
-        then_block.terminator = ContinueOp(carried_values)
+        then_blk.terminator = ContinueOp(copy(carried_values))
 
-        else_block = Block(block_id[])
-        block_id[] += 1
-        # Block args are the references for break
-        result_values = IRValue[]
-        for arg in block_args
-            push!(result_values, arg)
-        end
-        else_block.terminator = BreakOp(result_values)
+        else_blk = Block()
+        else_blk.terminator = BreakOp(IRValue[rv for rv in result_ssa_indices])
 
-        if_op = IfOp(cond_value, then_block, else_block, SSAValue[])
-        push!(body.body, if_op)
+        if_op = IfOp(cond_value, then_blk, else_blk)
+        push!(body, condition_idx, if_op, Nothing)
     else
         # No condition - process children directly
         for child in children(tree)
             child_idx = node_index(child)
             if child_idx != header_idx
-                handle_block_region!(body, child, code, blocks, block_id)
+                handle_block_region!(body, child, code, blocks, ctx)
             end
         end
-        body.terminator = ContinueOp(carried_values)
+        body.terminator = ContinueOp(copy(carried_values))
     end
 
-    return LoopOp(init_values, body, result_vars)
+    # Create loop op with iter_args
+    loop_op = LoopOp(body, iter_args)
+    return loop_op
+end
+
+"""
+    collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
+
+Collect all SSA indices defined by statements in the block (recursively).
+Also includes results from control flow ops (phi nodes define SSAValues).
+"""
+function collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
+    for (idx, entry) in block.body
+        if entry.stmt isa ControlFlowOp
+            for rv in derive_result_vars(entry.stmt)
+                push!(defined, rv.id)
+            end
+            if entry.stmt isa LoopOp
+                collect_defined_ssas!(defined, entry.stmt.body, ctx)
+            elseif entry.stmt isa IfOp
+                collect_defined_ssas!(defined, entry.stmt.then_region, ctx)
+                collect_defined_ssas!(defined, entry.stmt.else_region, ctx)
+            elseif entry.stmt isa WhileOp
+                collect_defined_ssas!(defined, entry.stmt.before, ctx)
+                collect_defined_ssas!(defined, entry.stmt.after, ctx)
+            elseif entry.stmt isa ForOp
+                collect_defined_ssas!(defined, entry.stmt.body, ctx)
+            end
+        else
+            push!(defined, idx)
+        end
+    end
 end
 
 #=============================================================================
- Phase 1 Completion: Apply SSA Substitutions (outer → inner)
+ Phase 2: Apply Block Arguments
 =============================================================================#
 
 """
-    apply_loop_substitutions!(block::Block)
+    apply_block_args!(block::Block, ctx::StructurizationContext, defined::Set{Int}=Set{Int}(), parent_subs::Substitutions=Substitutions())
 
-Apply SSA→BlockArg substitutions to all loops, processing outer→inner.
-Must be called after Phase 1 to complete the structured IR.
+Single pass that creates BlockArgs and substitutes SSAValue references.
+
+Phase 2 of structurization - called after control_tree_to_structured_ir.
+For each :loop op: creates BlockArgs for phi nodes (iter_args).
+For :if ops: no BlockArgs needed (outer refs are accessed directly).
+Substitutes phi refs → BlockArg references throughout.
+
+The parent_subs parameter carries substitutions from outer scopes, so nested
+control flow ops can convert phi refs to the correct BlockArgs.
 """
-function apply_loop_substitutions!(block::Block)
-    for item in block.body
-        if item isa LoopOp
-            subs = compute_loop_subs(item)
-            substitute_block!(item.body, subs)
-            apply_loop_substitutions!(item.body)
-        elseif item isa IfOp
-            apply_loop_substitutions!(item.then_block)
-            apply_loop_substitutions!(item.else_block)
+function apply_block_args!(block::Block, ctx::StructurizationContext,
+                           defined::Set{Int}=Set{Int}(), parent_subs::Substitutions=Substitutions())
+    defined = copy(defined)
+    for (idx, entry) in block.body
+        if !(entry.stmt isa ControlFlowOp)
+            push!(defined, idx)
+        end
+    end
+
+    for stmt in statements(block.body)
+        if stmt isa LoopOp || stmt isa IfOp
+            process_block_args!(stmt, ctx, defined, parent_subs)
         end
     end
 end
 
 """
-    compute_loop_subs(loop::LoopOp) -> Substitutions
-
-Compute the SSA→BlockArg substitutions for a loop.
-Maps each phi node SSA index to its corresponding block argument.
+Create BlockArgs for a LoopOp and substitute SSAValue references.
+iter_args substitution is handled by apply_substitutions! in the parent block.
 """
-function compute_loop_subs(loop::LoopOp)
-    @assert length(loop.result_vars) == length(loop.body.args) "Mismatch between result_vars and body.args"
+function process_block_args!(loop::LoopOp, ctx::StructurizationContext,
+                             parent_defined::Set{Int}, parent_subs::Substitutions)
+    body = loop.body::Block
     subs = Substitutions()
-    for (i, result_var) in enumerate(loop.result_vars)
-        subs[result_var.id] = loop.body.args[i]
+    result_vars = derive_result_vars(loop)
+
+    for (i, result_var) in enumerate(result_vars)
+        phi_type = ctx.ssavaluetypes[result_var.id]
+        new_arg = BlockArg(i, phi_type)
+        push!(body.args, new_arg)
+        subs[result_var.id] = new_arg
     end
-    return subs
+
+    apply_substitutions!(body, subs)
+
+    merged_subs = merge(parent_subs, subs)
+    nested_defined = Set{Int}(rv.id for rv in result_vars)
+    collect_defined_ssas!(nested_defined, body, ctx)
+    apply_block_args!(body, ctx, nested_defined, merged_subs)
 end
+
+"""
+Apply parent substitutions to IfOp branches and recurse.
+"""
+function process_block_args!(if_op::IfOp, ctx::StructurizationContext,
+                             parent_defined::Set{Int}, parent_subs::Substitutions)
+    then_blk = if_op.then_region::Block
+    else_blk = if_op.else_region::Block
+
+    apply_substitutions!(then_blk, parent_subs)
+    apply_substitutions!(else_blk, parent_subs)
+
+    then_defined = copy(parent_defined)
+    else_defined = copy(parent_defined)
+    collect_defined_ssas!(then_defined, then_blk, ctx)
+    collect_defined_ssas!(else_defined, else_blk, ctx)
+
+    apply_block_args!(then_blk, ctx, then_defined, parent_subs)
+    apply_block_args!(else_blk, ctx, else_defined, parent_subs)
+end
+

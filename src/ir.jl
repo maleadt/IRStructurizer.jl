@@ -26,6 +26,77 @@ end
 const IRValue = Any
 
 #=============================================================================
+ SSAVector - Vector of (ssa_idx, stmt, type) triples
+=============================================================================#
+
+"""
+    SSAEntry
+
+Named tuple for SSAVector entries: `(; stmt, typ)`.
+"""
+const SSAEntry = @NamedTuple{stmt::Any, typ::Any}
+
+"""
+    SSAVector
+
+A vector of `(ssa_idx, statement, type)` triples, ordered by insertion.
+Used to store block body contents with their original Julia SSA indices.
+
+Iteration yields `(idx, entry)` pairs where `entry` is a `SSAEntry` named tuple.
+Indexing by position returns `SSAEntry`. Use `idx in v` to test presence by SSA index.
+"""
+struct SSAVector <: AbstractVector{Tuple{Int, SSAEntry}}
+    data::Vector{Tuple{Int, Any, Any}}
+end
+
+SSAVector() = SSAVector(Tuple{Int,Any,Any}[])
+
+# Iteration yields (idx, (; stmt, typ)) pairs
+function Base.iterate(v::SSAVector)
+    isempty(v.data) && return nothing
+    idx, stmt, typ = v.data[1]
+    return (idx, SSAEntry((stmt, typ))), 2
+end
+
+function Base.iterate(v::SSAVector, state::Int)
+    state > length(v.data) && return nothing
+    idx, stmt, typ = v.data[state]
+    return (idx, SSAEntry((stmt, typ))), state + 1
+end
+
+Base.length(v::SSAVector) = length(v.data)
+Base.size(v::SSAVector) = (length(v.data),)
+
+# Positional indexing returns SSAEntry
+Base.getindex(v::SSAVector, i::Int) = let (_, stmt, typ) = v.data[i]; SSAEntry((stmt, typ)) end
+
+# Push raw tuple
+Base.push!(v::SSAVector, item::Tuple{Int,Any,Any}) = push!(v.data, item)
+
+# Test if SSA index is present
+Base.in(ssa_idx::Int, v::SSAVector) = any(idx == ssa_idx for (idx, _, _) in v.data)
+
+# Lazy iterators
+indices(v::SSAVector) = (idx for (idx, _, _) in v.data)
+statements(v::SSAVector) = (stmt for (_, stmt, _) in v.data)
+types(v::SSAVector) = (typ for (_, _, typ) in v.data)
+
+# Alias for backwards compatibility
+items(v::SSAVector) = statements(v)
+
+"""
+    find_by_ssa(v::SSAVector, ssa_idx::Int) -> Union{SSAEntry, Nothing}
+
+Find a statement and its type by SSA index. Returns SSAEntry or nothing.
+"""
+function find_by_ssa(v::SSAVector, ssa_idx::Int)
+    for (idx, stmt, typ) in v.data
+        idx == ssa_idx && return SSAEntry((stmt, typ))
+    end
+    nothing
+end
+
+#=============================================================================
  Terminator Operations
 =============================================================================#
 
@@ -122,165 +193,199 @@ end
 # Convenience for empty substitutions
 substitute_ssa(value) = value
 
+
 #=============================================================================
- Statement - self-contained statement with type
+ Abstract Control Flow Type
 =============================================================================#
 
 """
-    Statement
+    ControlFlowOp
 
-A statement in structured IR. Self-contained with expression and type.
-SSA substitutions (phi refs → block args) are applied during construction.
+Abstract type for all structured control flow operations.
 """
-struct Statement
-    idx::Int      # Original statement index (for source mapping/debugging)
-    expr::Any     # The expression (with SSA refs substituted where needed)
-    type::Any     # The SSA value type
-end
-
-function Base.show(io::IO, stmt::Statement)
-    print(io, "Statement(", stmt.idx, ", ", stmt.expr, ")")
-end
-
-#=============================================================================
- Structured Control Flow Operations
-=============================================================================#
-
-# Forward declaration for Block (needed for mutual recursion)
 abstract type ControlFlowOp end
 
-"""
-    BlockItem
-
-Union type for items in a block's body.
-Can be either a Statement or a structured control flow operation.
-"""
-const BlockItem = Union{Statement, ControlFlowOp}
+#=============================================================================
+ Block (defined before control flow ops so they can reference it)
+=============================================================================#
 
 """
     Block
 
-A basic block containing statements and potentially nested control flow.
-Statements are self-contained Statement objects with expressions and types.
-Body items are interleaved - Statements and control flow ops can appear in any order.
+A block of statements with block arguments and a terminator.
+Body is stored as SSAVector of (ssa_idx, stmt, type) triples.
 """
 mutable struct Block
-    id::Int
-    args::Vector{BlockArg}           # Block arguments (for loop carried values)
-    body::Vector{BlockItem}          # Interleaved Statements and control flow ops
-    terminator::Terminator           # ReturnNode, ContinueOp, YieldOp, BreakOp, or nothing
+    args::Vector{BlockArg}
+    body::SSAVector
+    terminator::Terminator
 end
 
-Block(id::Int) = Block(id, BlockArg[], BlockItem[], nothing)
+Block() = Block(BlockArg[], SSAVector(), nothing)
+
+"""
+    push!(block::Block, idx::Int, stmt, typ)
+
+Push a statement or control flow op to a block with its SSA index and type.
+"""
+Base.push!(block::Block, idx::Int, stmt, typ) = push!(block.body, (idx, stmt, typ))
 
 function Base.show(io::IO, block::Block)
-    print(io, "Block(id=", block.id)
+    print(io, "Block(")
     if !isempty(block.args)
-        print(io, ", args=", length(block.args))
+        print(io, "args=", length(block.args), ", ")
     end
-    n_stmts = count(x -> x isa Statement, block.body)
-    n_ops = count(x -> x isa ControlFlowOp, block.body)
-    print(io, ", stmts=", n_stmts)
-    if n_ops > 0
-        print(io, ", ops=", n_ops)
+    n_ops = count(((_, item, _),) -> item isa ControlFlowOp, block.body)
+    n_exprs = length(block.body) - n_ops
+    print(io, n_exprs + n_ops, " items")
+    print(io, ")")
+end
+
+# Iteration protocol for Block - yields (idx, stmt, typ) triples
+Base.iterate(block::Block) = iterate(block.body)
+Base.iterate(block::Block, state) = iterate(block.body, state)
+Base.length(block::Block) = length(block.body)
+Base.eltype(::Type{Block}) = Tuple{Int,Any,Any}
+
+#=============================================================================
+ Structurization Context
+=============================================================================#
+
+"""
+    StructurizationContext
+
+Context for IR construction (Phases 1-5). Holds metadata that shouldn't be part
+of the IR node types themselves:
+- ssavaluetypes: Julia types for each SSA value (from CodeInfo)
+"""
+struct StructurizationContext
+    ssavaluetypes::Any  # Vector of types (from CodeInfo.ssavaluetypes)
+end
+
+#=============================================================================
+ Control Flow Types
+=============================================================================#
+
+"""
+    IfOp
+
+Structured if-then-else operation.
+"""
+mutable struct IfOp <: ControlFlowOp
+    condition::IRValue
+    then_region::Block
+    else_region::Block
+end
+
+function Base.show(io::IO, ::IfOp)
+    print(io, "IfOp()")
+end
+
+"""
+    ForOp
+
+Counted for-loop with lower/upper/step bounds.
+iter_args = loop-carried values.
+"""
+mutable struct ForOp <: ControlFlowOp
+    lower::IRValue
+    upper::IRValue
+    step::IRValue
+    iv_arg::BlockArg
+    body::Block
+    iter_args::Vector{IRValue}
+end
+
+function Base.show(io::IO, op::ForOp)
+    print(io, "ForOp(")
+    if !isempty(op.iter_args)
+        print(io, "iter_args=", length(op.iter_args))
     end
     print(io, ")")
 end
 
-# Iteration protocol for Block
-Base.iterate(block::Block, state=1) = state > length(block.body) ? nothing : (block.body[state], state + 1)
-Base.length(block::Block) = length(block.body)
-Base.eltype(::Type{Block}) = BlockItem
-
 """
-    IfOp <: ControlFlowOp
+    WhileOp
 
-Structured if-then-else with nested blocks.
-Both branches must yield values of the same types.
+MLIR-style while loop with before (condition) and after (body) regions.
+iter_args = loop-carried values.
 """
-struct IfOp <: ControlFlowOp
-    condition::IRValue               # SSAValue or BlockArg for the condition
-    then_block::Block
-    else_block::Block
-    result_vars::Vector{SSAValue}    # SSA values that receive the yielded results
-end
-
-function Base.show(io::IO, op::IfOp)
-    print(io, "IfOp(cond=", op.condition,
-          ", then=Block(", op.then_block.id, ")",
-          ", else=Block(", op.else_block.id, ")",
-          ", results=", length(op.result_vars), ")")
-end
-
-"""
-    ForOp <: ControlFlowOp
-
-Structured for loop with known bounds.
-Used when loop bounds can be determined (e.g., from range iteration).
-"""
-struct ForOp <: ControlFlowOp
-    lower::IRValue                   # Lower bound
-    upper::IRValue                   # Upper bound (exclusive)
-    step::IRValue                    # Step value
-    iv_ssa::SSAValue                 # SSA value for induction variable phi (result)
-    iv_arg::BlockArg                 # Block arg for induction variable (for body/printing)
-    init_values::Vector{IRValue}     # Initial values for non-IV carried variables
-    body::Block                      # Block args in same order as LoopOp
-    result_vars::Vector{SSAValue}    # SSA values for non-IV carried results
-end
-
-function Base.show(io::IO, op::ForOp)
-    print(io, "ForOp(lower=", op.lower, ", upper=", op.upper, ", step=", op.step,
-          ", iv=", op.iv_ssa,
-          ", init=", length(op.init_values),
-          ", body=Block(", op.body.id, ")",
-          ", results=", length(op.result_vars), ")")
-end
-
-"""
-    LoopOp <: ControlFlowOp
-
-General loop with dynamic exit condition.
-Used for while loops and when bounds cannot be determined.
-
-Also used as the initial loop representation before pattern matching
-upgrades it to ForOp or WhileOp.
-"""
-struct LoopOp <: ControlFlowOp
-    init_values::Vector{IRValue}     # Initial values for loop-carried variables
-    body::Block                      # Has carried vars as block args
-    result_vars::Vector{SSAValue}    # SSA values that receive final results
-end
-
-function Base.show(io::IO, op::LoopOp)
-    print(io, "LoopOp(init=", length(op.init_values),
-          ", body=Block(", op.body.id, ")",
-          ", results=", length(op.result_vars), ")")
-end
-
-"""
-    WhileOp <: ControlFlowOp
-
-Structured while loop with MLIR-style two-region structure (scf.while).
-
-- `before`: Computes the condition, ends with ConditionOp(cond, args)
-- `after`: Loop body, ends with YieldOp to pass values back to before region
-
-When condition is true, args are passed to the after region.
-When condition is false, args become the final loop results.
-"""
-struct WhileOp <: ControlFlowOp
-    before::Block                    # Condition computation, ends with ConditionOp
-    after::Block                     # Loop body, ends with YieldOp
-    init_values::Vector{IRValue}     # Initial values for loop-carried variables
-    result_vars::Vector{SSAValue}    # SSA values that receive final results
+mutable struct WhileOp <: ControlFlowOp
+    before::Block
+    after::Block
+    iter_args::Vector{IRValue}
 end
 
 function Base.show(io::IO, op::WhileOp)
-    print(io, "WhileOp(before=Block(", op.before.id, ")",
-          ", after=Block(", op.after.id, ")",
-          ", init=", length(op.init_values),
-          ", results=", length(op.result_vars), ")")
+    print(io, "WhileOp(")
+    if !isempty(op.iter_args)
+        print(io, "iter_args=", length(op.iter_args))
+    end
+    print(io, ")")
+end
+
+"""
+    LoopOp
+
+General loop with dynamic exit via BreakOp/ContinueOp.
+iter_args = loop-carried values.
+"""
+mutable struct LoopOp <: ControlFlowOp
+    body::Block
+    iter_args::Vector{IRValue}
+end
+
+function Base.show(io::IO, op::LoopOp)
+    print(io, "LoopOp(")
+    if !isempty(op.iter_args)
+        print(io, "iter_args=", length(op.iter_args))
+    end
+    print(io, ")")
+end
+
+#=============================================================================
+ derive_result_vars - extract result info from terminators
+=============================================================================#
+
+"""
+    derive_result_vars(op::LoopOp) -> Vector{SSAValue}
+
+Derive result SSAValues from a LoopOp's terminator. Used for keying loop ops
+during Phase 1 structure building.
+
+For LoopOp: BreakOp.values in body (kept as SSAValues, not substituted)
+"""
+function derive_result_vars(op::LoopOp)
+    body = op.body::Block
+    break_vals = find_break_values(body)
+    return SSAValue[v for v in break_vals if v isa SSAValue]
+end
+
+# Other control flow ops - results are determined by iter_args count, not SSA indices
+derive_result_vars(::IfOp) = SSAValue[]
+derive_result_vars(::ForOp) = SSAValue[]
+derive_result_vars(::WhileOp) = SSAValue[]
+
+"""
+    find_break_values(block::Block) -> Vector{IRValue}
+
+Find BreakOp values in a block, searching inside nested IfOp.
+"""
+function find_break_values(block::Block)
+    # Check block terminator
+    if block.terminator isa BreakOp
+        return block.terminator.values
+    end
+    # Search in nested IfOp (common loop structure)
+    for stmt in statements(block.body)
+        if stmt isa IfOp
+            else_blk = stmt.else_region::Block
+            if else_blk.terminator isa BreakOp
+                return else_blk.terminator.values
+            end
+        end
+    end
+    return IRValue[]
 end
 
 #=============================================================================
@@ -292,21 +397,23 @@ end
 
 Represents a function's code with a structured view of control flow.
 The CodeInfo is kept for metadata (slotnames, argtypes, method info).
-The entry Block contains self-contained Statement objects with expressions and types.
+
+After structurize!(), the entry Block contains the final structured IR with
+expressions and control flow ops.
 
 Create with `StructuredCodeInfo(ci)` for a flat (unstructured) view,
 then call `structurize!(sci)` to convert control flow to structured ops.
 """
 mutable struct StructuredCodeInfo
-    const code::CodeInfo             # For metadata (slotnames, argtypes, etc.)
-    entry::Block                     # Self-contained structured IR
+    const code::CodeInfo                      # For metadata (slotnames, argtypes, etc.)
+    entry::Block                              # Structured IR
 end
 
 """
     StructuredCodeInfo(code::CodeInfo)
 
 Create a flat (unstructured) StructuredCodeInfo from Julia CodeInfo.
-All statements are placed sequentially in a single block as Statement objects,
+All statements are placed sequentially in a single block,
 with control flow statements (GotoNode, GotoIfNot) included as-is.
 
 Call `structurize!(sci)` to convert to structured control flow.
@@ -316,15 +423,15 @@ function StructuredCodeInfo(code::CodeInfo)
     types = code.ssavaluetypes
     n = length(stmts)
 
-    entry = Block(1)
+    entry = Block()
 
     for i in 1:n
         stmt = stmts[i]
         if stmt isa ReturnNode
             entry.terminator = stmt
         else
-            # Include ALL statements as Statement objects (no substitutions at entry level)
-            push!(entry.body, Statement(i, stmt, types[i]))
+            # Include ALL statements (no substitutions at entry level)
+            push!(entry, i, stmt, types[i])
         end
     end
 
@@ -336,54 +443,42 @@ end
 =============================================================================#
 
 """
-    substitute_block!(block::Block, subs::Substitutions)
+    apply_substitutions!(block::Block, subs::Substitutions)
 
-Apply SSA substitutions to all statements in a block and nested control flow.
-Modifies the block in-place by replacing Statement objects with substituted versions.
+Apply SSA substitutions within a block. Does not recurse into control flow regions.
+Each control flow op's entry values (condition, iter_args) are substituted,
+but the nested regions are handled by process_block_args! dispatch.
 """
-function substitute_block!(block::Block, subs::Substitutions)
-    isempty(subs) && return  # No substitutions to apply
+function apply_substitutions!(block::Block, subs::Substitutions)
+    isempty(subs) && return
 
-    # Substitute statements and recurse into nested control flow
-    for (i, item) in enumerate(block.body)
-        if item isa Statement
-            new_expr = substitute_ssa(item.expr, subs)
-            if new_expr !== item.expr
-                block.body[i] = Statement(item.idx, new_expr, item.type)
-            end
+    new_body = SSAVector()
+    for (idx, entry) in block.body
+        if entry.stmt isa ControlFlowOp
+            apply_substitutions!(entry.stmt, subs)
+            push!(new_body, (idx, entry.stmt, entry.typ))
         else
-            substitute_control_flow!(item, subs)
+            new_expr = substitute_ssa(entry.stmt, subs)
+            push!(new_body, (idx, new_expr, entry.typ))
         end
     end
+    block.body = new_body
 
-    # Substitute terminator
     if block.terminator !== nothing
         block.terminator = substitute_terminator(block.terminator, subs)
     end
 end
 
-"""
-    substitute_control_flow!(op::ControlFlowOp, subs::Substitutions)
-
-Apply SSA substitutions to a control flow operation and its nested blocks.
-"""
-function substitute_control_flow!(op::IfOp, subs::Substitutions)
-    substitute_block!(op.then_block, subs)
-    substitute_block!(op.else_block, subs)
+function apply_substitutions!(op::IfOp, subs::Substitutions)
+    op.condition = substitute_ssa(op.condition, subs)
 end
 
-function substitute_control_flow!(op::ForOp, subs::Substitutions)
-    substitute_block!(op.body, subs)
+function apply_substitutions!(op::LoopOp, subs::Substitutions)
+    for (j, v) in enumerate(op.iter_args)
+        op.iter_args[j] = substitute_ssa(v, subs)
+    end
 end
 
-function substitute_control_flow!(op::LoopOp, subs::Substitutions)
-    substitute_block!(op.body, subs)
-end
-
-function substitute_control_flow!(op::WhileOp, subs::Substitutions)
-    substitute_block!(op.before, subs)
-    substitute_block!(op.after, subs)
-end
 
 """
     substitute_terminator(term, subs::Substitutions)
@@ -396,8 +491,7 @@ function substitute_terminator(term::ContinueOp, subs::Substitutions)
 end
 
 function substitute_terminator(term::BreakOp, subs::Substitutions)
-    new_values = [substitute_ssa(v, subs) for v in term.values]
-    return BreakOp(new_values)
+    return term
 end
 
 function substitute_terminator(term::ConditionOp, subs::Substitutions)
@@ -425,160 +519,17 @@ function substitute_terminator(term::Nothing, subs::Substitutions)
     return nothing
 end
 
-#=============================================================================
- Iteration Utilities
-=============================================================================#
-
-"""
-    each_block(f, block::Block)
-
-Recursively iterate over all blocks, calling f on each.
-"""
-function each_block(f, block::Block)
-    f(block)
-    for item in block.body
-        if item isa ControlFlowOp
-            each_block_in_op(f, item)
-        end
-    end
-end
-
-function each_block_in_op(f, op::IfOp)
-    each_block(f, op.then_block)
-    each_block(f, op.else_block)
-end
-
-function each_block_in_op(f, op::ForOp)
-    each_block(f, op.body)
-end
-
-function each_block_in_op(f, op::LoopOp)
-    each_block(f, op.body)
-end
-
-function each_block_in_op(f, op::WhileOp)
-    each_block(f, op.before)
-    each_block(f, op.after)
-end
-
-"""
-    each_stmt(f, block::Block)
-
-Recursively iterate over all statements, calling f on each Statement.
-"""
-function each_stmt(f, block::Block)
-    for item in block.body
-        if item isa Statement
-            f(item)
-        else
-            each_stmt_in_op(f, item)
-        end
-    end
-end
-
-function each_stmt_in_op(f, op::IfOp)
-    each_stmt(f, op.then_block)
-    each_stmt(f, op.else_block)
-end
-
-function each_stmt_in_op(f, op::ForOp)
-    each_stmt(f, op.body)
-end
-
-function each_stmt_in_op(f, op::LoopOp)
-    each_stmt(f, op.body)
-end
-
-function each_stmt_in_op(f, op::WhileOp)
-    each_stmt(f, op.before)
-    each_stmt(f, op.after)
-end
-
-#=============================================================================
- Block Queries
-=============================================================================#
-
-"""
-    defines(block::Block, ssa::SSAValue) -> Bool
-
-Check if a block defines an SSA value (i.e., contains a Statement that produces it).
-Searches nested blocks recursively.
-"""
-function defines(block::Block, ssa::SSAValue)
-    for item in block.body
-        if item isa Statement && item.idx == ssa.id
-            return true
-        elseif item isa IfOp
-            defines(item.then_block, ssa) && return true
-            defines(item.else_block, ssa) && return true
-        elseif item isa LoopOp
-            defines(item.body, ssa) && return true
-        elseif item isa ForOp
-            defines(item.body, ssa) && return true
-        elseif item isa WhileOp
-            defines(item.before, ssa) && return true
-            defines(item.after, ssa) && return true
-        end
-    end
-    return false
-end
 
 #=============================================================================
  Pretty Printing (Julia CodeInfo-style with colors)
 =============================================================================#
 
-"""
-    compute_used_ssas(block::Block) -> BitSet
-
-Compute which SSA values are used anywhere in the structured IR.
-Used for coloring types appropriately (used values get cyan, unused get gray).
-"""
-function compute_used_ssas(block::Block)
-    used = BitSet()
-    _scan_uses!(used, block)
-    return used
-end
-
-function _scan_uses!(used::BitSet, block::Block)
-    for item in block.body
-        if item isa Statement
-            _scan_expr_uses!(used, item.expr)
-        else
-            _scan_control_flow_uses!(used, item)
-        end
-    end
-    if block.terminator !== nothing
-        _scan_terminator_uses!(used, block.terminator)
-    end
-end
-
-function _scan_expr_uses!(used::BitSet, v::SSAValue)
-    push!(used, v.id)
-end
-
-function _scan_expr_uses!(used::BitSet, v::Expr)
-    for arg in v.args
-        _scan_expr_uses!(used, arg)
-    end
-end
-
-function _scan_expr_uses!(used::BitSet, v::PhiNode)
-    for val in v.values
-        _scan_expr_uses!(used, val)
-    end
-end
-
-function _scan_expr_uses!(used::BitSet, v::PiNode)
-    _scan_expr_uses!(used, v.val)
-end
-
-function _scan_expr_uses!(used::BitSet, v::GotoIfNot)
-    _scan_expr_uses!(used, v.cond)
-end
-
-function _scan_expr_uses!(used::BitSet, v)
-    # Other values (constants, GlobalRefs, etc.) don't reference SSA values
-end
+_scan_expr_uses!(used::BitSet, v::SSAValue) = push!(used, v.id)
+_scan_expr_uses!(used::BitSet, v::Expr) = _scan_expr_uses!.(Ref(used), v.args)
+_scan_expr_uses!(used::BitSet, v::PhiNode) = _scan_expr_uses!.(Ref(used), v.values)
+_scan_expr_uses!(used::BitSet, v::PiNode) = _scan_expr_uses!(used, v.val)
+_scan_expr_uses!(used::BitSet, v::GotoIfNot) = _scan_expr_uses!(used, v.cond)
+_scan_expr_uses!(::BitSet, _) = nothing  # constants, GlobalRefs, etc.
 
 function _scan_terminator_uses!(used::BitSet, term::ReturnNode)
     if isdefined(term, :val)
@@ -586,63 +537,65 @@ function _scan_terminator_uses!(used::BitSet, term::ReturnNode)
     end
 end
 
-function _scan_terminator_uses!(used::BitSet, term::YieldOp)
-    for v in term.values
-        _scan_expr_uses!(used, v)
-    end
-end
-
-function _scan_terminator_uses!(used::BitSet, term::ContinueOp)
-    for v in term.values
-        _scan_expr_uses!(used, v)
-    end
-end
-
-function _scan_terminator_uses!(used::BitSet, term::BreakOp)
-    for v in term.values
-        _scan_expr_uses!(used, v)
-    end
-end
+_scan_terminator_uses!(used::BitSet, term::Union{YieldOp,ContinueOp,BreakOp}) =
+    _scan_expr_uses!.(Ref(used), term.values)
 
 function _scan_terminator_uses!(used::BitSet, term::ConditionOp)
     _scan_expr_uses!(used, term.condition)
-    for v in term.args
-        _scan_expr_uses!(used, v)
-    end
+    _scan_expr_uses!.(Ref(used), term.args)
 end
 
-function _scan_terminator_uses!(used::BitSet, ::Nothing)
+_scan_terminator_uses!(::BitSet, ::Nothing) = nothing
+
+# Block usage scanning (for type coloring)
+function compute_used_ssas(block::Block)
+    used = BitSet()
+    _scan_block_uses!(used, block)
+    return used
+end
+
+function _scan_block_uses!(used::BitSet, block::Block)
+    for stmt in statements(block.body)
+        if stmt isa ControlFlowOp
+            _scan_control_flow_uses!(used, stmt)
+        else
+            _scan_expr_uses!(used, stmt)
+        end
+    end
+    if block.terminator !== nothing
+        _scan_terminator_uses!(used, block.terminator)
+    end
 end
 
 function _scan_control_flow_uses!(used::BitSet, op::IfOp)
     _scan_expr_uses!(used, op.condition)
-    _scan_uses!(used, op.then_block)
-    _scan_uses!(used, op.else_block)
+    _scan_block_uses!(used, op.then_region)
+    _scan_block_uses!(used, op.else_region)
 end
 
 function _scan_control_flow_uses!(used::BitSet, op::ForOp)
     _scan_expr_uses!(used, op.lower)
     _scan_expr_uses!(used, op.upper)
     _scan_expr_uses!(used, op.step)
-    for v in op.init_values
+    for v in op.iter_args
         _scan_expr_uses!(used, v)
     end
-    _scan_uses!(used, op.body)
-end
-
-function _scan_control_flow_uses!(used::BitSet, op::LoopOp)
-    for v in op.init_values
-        _scan_expr_uses!(used, v)
-    end
-    _scan_uses!(used, op.body)
+    _scan_block_uses!(used, op.body)
 end
 
 function _scan_control_flow_uses!(used::BitSet, op::WhileOp)
-    for v in op.init_values
+    for v in op.iter_args
         _scan_expr_uses!(used, v)
     end
-    _scan_uses!(used, op.before)
-    _scan_uses!(used, op.after)
+    _scan_block_uses!(used, op.before)
+    _scan_block_uses!(used, op.after)
+end
+
+function _scan_control_flow_uses!(used::BitSet, op::LoopOp)
+    for v in op.iter_args
+        _scan_expr_uses!(used, v)
+    end
+    _scan_block_uses!(used, op.body)
 end
 
 """
@@ -657,19 +610,45 @@ mutable struct IRPrinter
     indent::Int
     line_prefix::String    # Prefix for continuation lines (│, spaces)
     is_last_stmt::Bool     # Whether current stmt is last in block
-    used::BitSet           # Which SSA values are used (for type coloring)
+    used::BitSet           # Which SSA values are used anywhere in the IR
+    max_idx_width::Int     # Max width of "%N = " for alignment (like Julia's SSA printer)
     color::Bool            # Whether to use colors
 end
 
 function IRPrinter(io::IO, code::CodeInfo, entry::Block)
     used = compute_used_ssas(entry)
+    # Compute max index width for alignment: "%N = " where N is the max index
+    max_idx_width = ndigits(length(entry.body)) + 4  # % + digits + space + = + space
     color = get(io, :color, false)::Bool
-    IRPrinter(io, code, 0, "", false, used, color)
+    IRPrinter(io, code, 0, "", false, used, max_idx_width, color)
 end
 
 function indent(p::IRPrinter, n::Int=1)
     new_prefix = p.line_prefix * "    "  # 4 spaces per indent level
-    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false, p.used, p.color)
+    return IRPrinter(p.io, p.code, p.indent + n, new_prefix, false, p.used, p.max_idx_width, p.color)
+end
+
+# Create a child printer for a nested Block
+function child_printer(p::IRPrinter, nested_block::Block, cont_prefix::String)
+    nested_max_idx_width = ndigits(length(nested_block.body)) + 4
+    IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, nested_max_idx_width, p.color)
+end
+
+# Print region header: "├ label(%arg1::Type):" (regions always use ├, closing is on last line of content)
+function print_region_header(p::IRPrinter, label::String, args::Vector{BlockArg})
+    print_indent(p)
+    print_colored(p, "├", :light_black)
+    print(p.io, " ", label)
+    if !isempty(args)
+        print(p.io, "(")
+        for (i, arg) in enumerate(args)
+            i > 1 && print(p.io, ", ")
+            print(p.io, "%arg", arg.id)
+            print_colored(p, string("::", format_type(arg.type)), :cyan)
+        end
+        print(p.io, ")")
+    end
+    println(p.io, ":")
 end
 
 function print_indent(p::IRPrinter)
@@ -804,23 +783,6 @@ function print_results(p::IRPrinter, results::Vector{SSAValue})
         end
         print(p.io, ")")
     end
-end
-
-# Print a statement
-function print_stmt(p::IRPrinter, stmt::Statement; prefix::String="│  ")
-    print_indent(p)
-    print_colored(p, prefix, :light_black)
-
-    # Only show %N = when the value is used (like Julia's code_typed)
-    is_used = stmt.idx in p.used
-    if is_used
-        print(p.io, "%", stmt.idx, " = ")
-    else
-        print(p.io, "     ")  # Padding to align with used values
-    end
-    print_expr(p, stmt.expr)
-    print_type_annotation(p, stmt.idx, stmt.type)
-    println(p.io)
 end
 
 # Check if a function reference is an intrinsic
@@ -958,27 +920,33 @@ function print_block_args(p::IRPrinter, args::Vector{BlockArg})
     print(p.io, ")")
 end
 
-# Print iteration arguments with initial values
-function print_iter_args(p::IRPrinter, args::Vector{BlockArg}, init_values::Vector{IRValue})
-    if isempty(args)
+# Print iteration arguments (carries) with initial values
+function print_iter_args(p::IRPrinter, carry_args::Vector{BlockArg}, iter_args::Vector{IRValue})
+    if isempty(carry_args)
         return
     end
     print(p.io, " iter_args(")
-    for (i, (arg, init)) in enumerate(zip(args, init_values))
+    for (i, (arg, init)) in enumerate(zip(carry_args, iter_args))
         i > 1 && print(p.io, ", ")
-        print(p.io, "%arg", arg.id, " = ")
+        print(p.io, "%carry", i - 1, " = ")
         print_value(p, init)
-        # Block args are always "used" within their scope
         print_colored(p, string("::", format_type(arg.type)), :cyan)
     end
     print(p.io, ")")
 end
 
+function print_loop_args(p::IRPrinter, block_args::Vector{BlockArg}, iter_args::Vector{IRValue})
+    print_iter_args(p, block_args, iter_args)
+end
+
 # Print a terminator
 function print_terminator(p::IRPrinter, term::ReturnNode; prefix::String="└──")
     print_indent(p)
-    print_colored(p, prefix, :light_black)
-    print(p.io, "      return")  # Padding to align with %N =
+    if !isempty(prefix)
+        print_colored(p, prefix, :light_black)
+        print(p.io, " ")
+    end
+    print(p.io, "return")
     if isdefined(term, :val)
         print(p.io, " ")
         print_value(p, term.val)
@@ -986,66 +954,13 @@ function print_terminator(p::IRPrinter, term::ReturnNode; prefix::String="└─
     println(p.io)
 end
 
-function print_terminator(p::IRPrinter, term::YieldOp; prefix::String="└──")
+function print_terminator(p::IRPrinter, term::Union{YieldOp,ContinueOp,BreakOp,ConditionOp}; prefix::String="└──")
     print_indent(p)
-    print_colored(p, prefix, :light_black)
-    print(p.io, "      ")  # Padding to align with %N =
-    print_colored(p, "yield", :yellow)  # Structured keyword
-    if !isempty(term.values)
+    if !isempty(prefix)
+        print_colored(p, prefix, :light_black)
         print(p.io, " ")
-        for (i, v) in enumerate(term.values)
-            i > 1 && print(p.io, ", ")
-            print_value(p, v)
-        end
     end
-    println(p.io)
-end
-
-function print_terminator(p::IRPrinter, term::ContinueOp; prefix::String="└──")
-    print_indent(p)
-    print_colored(p, prefix, :light_black)
-    print(p.io, "      ")  # Padding to align with %N =
-    print_colored(p, "continue", :yellow)  # Structured keyword
-    if !isempty(term.values)
-        print(p.io, " ")
-        for (i, v) in enumerate(term.values)
-            i > 1 && print(p.io, ", ")
-            print_value(p, v)
-        end
-    end
-    println(p.io)
-end
-
-function print_terminator(p::IRPrinter, term::BreakOp; prefix::String="└──")
-    print_indent(p)
-    print_colored(p, prefix, :light_black)
-    print(p.io, "      ")  # Padding to align with %N =
-    print_colored(p, "break", :yellow)  # Structured keyword
-    if !isempty(term.values)
-        print(p.io, " ")
-        for (i, v) in enumerate(term.values)
-            i > 1 && print(p.io, ", ")
-            print_value(p, v)
-        end
-    end
-    println(p.io)
-end
-
-function print_terminator(p::IRPrinter, term::ConditionOp; prefix::String="└──")
-    print_indent(p)
-    print_colored(p, prefix, :light_black)
-    print(p.io, "      ")  # Padding to align with %N =
-    print_colored(p, "condition", :yellow)
-    print(p.io, "(")
-    print_value(p, term.condition)
-    print(p.io, ")")
-    if !isempty(term.args)
-        print(p.io, " ")
-        for (i, v) in enumerate(term.args)
-            i > 1 && print(p.io, ", ")
-            print_value(p, v)
-        end
-    end
+    print_terminator_content(p, term)
     println(p.io)
 end
 
@@ -1053,16 +968,48 @@ function print_terminator(p::IRPrinter, ::Nothing; prefix::String="└──")
     # No terminator
 end
 
-# Print a block's contents (statements, nested ops, terminator)
-function print_block_body(p::IRPrinter, block::Block)
-    # Collect all items to print to determine which is last
-    items = []
+#=============================================================================
+ Pretty Printing for Final Block/ControlFlowOp
+=============================================================================#
 
-    for item in block.body
-        if item isa Statement
-            push!(items, (:stmt, item))
+# Print expression with type annotation (for final Block)
+# prefix can be "│  " for continuation, "└──" for last, or "" for no prefix (inside regions)
+function print_expr_with_type(p::IRPrinter, idx::Int, expr, typ; prefix::String="│  ")
+    print_indent(p)
+    if !isempty(prefix)
+        print_colored(p, prefix, :light_black)
+        print(p.io, " ")
+    end
+
+    # Show %N = if value is used anywhere in the IR (global usage)
+    # Type color: cyan if used, grey if unused (matches Julia's SSA IR printer)
+    is_used = idx in p.used
+    if is_used
+        idx_s = string(idx)
+        pad = " "^(p.max_idx_width - length(idx_s) - 4)  # -4 for "% = "
+        print(p.io, "%", idx_s, pad, " = ")
+    else
+        # Pad to align with "%N = " (like Julia's SSA printer)
+        print(p.io, " "^p.max_idx_width)
+    end
+    print_expr(p, expr)
+
+    # Print type annotation
+    color = is_used ? :cyan : :light_black
+    print_colored(p, string("::", format_type(typ)), color)
+    println(p.io)
+end
+
+# Print a Block's contents (final type)
+# If inside_region=true, don't show statement-level box drawing (just use line_prefix)
+# If is_last_region=true, modify the last line to show outer block closing
+function print_block_body(p::IRPrinter, block::Block; inside_region::Bool=false, is_last_region::Bool=false, cascade_depth::Int=0)
+    items = []
+    for (i, (idx, entry)) in enumerate(block.body)
+        if entry.stmt isa ControlFlowOp
+            push!(items, (:nested, idx, entry.stmt, entry.typ))
         else
-            push!(items, (:nested, item))
+            push!(items, (:expr, idx, entry.stmt, entry.typ))
         end
     end
     if block.terminator !== nothing
@@ -1071,71 +1018,203 @@ function print_block_body(p::IRPrinter, block::Block)
 
     for (i, item) in enumerate(items)
         is_last = (i == length(items))
-        if item[1] == :stmt
-            prefix = is_last ? "└──" : "│  "
-            print_stmt(p, item[2]; prefix=prefix)
+        if item[1] == :expr
+            if inside_region
+                prefix = ""
+            else
+                prefix = is_last ? "└──" : "│  "
+            end
+            if is_last && is_last_region
+                # Replace trailing │ characters in line_prefix with └ for outer block closing
+                print_expr_with_type_closing(p, item[2], item[3], item[4]; cascade_depth=cascade_depth)
+            else
+                print_expr_with_type(p, item[2], item[3], item[4]; prefix=prefix)
+            end
         elseif item[1] == :nested
-            print_control_flow(p, item[2]; is_last=is_last)
+            if is_last && is_last_region
+                # Cascade the closing - don't use └── here (is_last=false), and increment cascade_depth
+                # so the nested op knows to close this level too
+                print_control_flow(p, item[3], item[2]; is_last=false, cascade_depth=cascade_depth + 1)
+            else
+                print_control_flow(p, item[3], item[2]; is_last=is_last, cascade_depth=cascade_depth)
+            end
         else  # :term
-            print_terminator(p, item[2]; prefix="└──")
+            if inside_region
+                prefix = ""
+            else
+                prefix = "└──"
+            end
+            if is_last && is_last_region
+                # Replace trailing │ characters in line_prefix with └ for outer block closing
+                print_terminator_closing(p, item[2]; cascade_depth=cascade_depth)
+            else
+                print_terminator(p, item[2]; prefix=prefix)
+            end
         end
     end
 end
 
-# Print IfOp (Julia-style)
-function print_control_flow(p::IRPrinter, op::IfOp; is_last::Bool=false)
-    prefix = is_last ? "└──" : "├──"
-    cont_prefix = is_last ? "    " : "│   "
+"""
+    close_trailing_boxes(prefix::String, count::Int) -> String
+
+Replace `count` trailing │ characters in prefix: the last one becomes └, the rest become spaces.
+E.g., close_trailing_boxes("│   │   │   ", 2) → "│   └       " (closes 2 levels)
+"""
+function close_trailing_boxes(prefix::String, count::Int)
+    count <= 0 && return prefix
+
+    # Find all │ positions (working backwards)
+    chars = collect(prefix)
+    box_positions = Int[]
+    for i in length(chars):-1:1
+        if chars[i] == '│'
+            push!(box_positions, i)
+        end
+    end
+
+    # Replace up to `count` trailing │ characters
+    n_to_replace = min(count, length(box_positions))
+    for (i, pos) in enumerate(box_positions[1:n_to_replace])
+        if i == 1
+            # Last │ becomes └
+            chars[pos] = '└'
+        else
+            # Other trailing │ become space
+            chars[pos] = ' '
+        end
+    end
+
+    return String(chars)
+end
+
+# Print expression for last line of last region (replace trailing │ with └)
+function print_expr_with_type_closing(p::IRPrinter, idx::Int, expr, typ; cascade_depth::Int=0)
+    # Replace (cascade_depth + 1) trailing │ characters: last one becomes └, rest become spaces
+    closing_prefix = close_trailing_boxes(p.line_prefix, cascade_depth + 1)
+    print_colored(p, closing_prefix, :light_black)
+
+    # Show %N = if value is used anywhere in the IR (global usage)
+    # Type color: cyan if used, grey if unused (matches Julia's SSA IR printer)
+    is_used = idx in p.used
+    if is_used
+        idx_s = string(idx)
+        pad = " "^(p.max_idx_width - length(idx_s) - 4)  # -4 for "% = "
+        print(p.io, "%", idx_s, pad, " = ")
+    else
+        # Pad to align with "%N = " (like Julia's SSA printer)
+        print(p.io, " "^p.max_idx_width)
+    end
+    print_expr(p, expr)
+
+    # Print type annotation
+    color = is_used ? :cyan : :light_black
+    print_colored(p, string("::", format_type(typ)), color)
+    println(p.io)
+end
+
+# Print terminator for last line of last region (replace trailing │ with └)
+function print_terminator_closing(p::IRPrinter, term; cascade_depth::Int=0)
+    closing_prefix = close_trailing_boxes(p.line_prefix, cascade_depth + 1)
+    print_colored(p, closing_prefix, :light_black)
+    print_terminator_content(p, term)
+    println(p.io)
+end
+
+# Print just the terminator content (keyword + values), no prefix or newline
+function print_terminator_content(p::IRPrinter, term::YieldOp)
+    print_colored(p, "yield", :yellow)
+    print_terminator_values(p, term.values)
+end
+function print_terminator_content(p::IRPrinter, term::ContinueOp)
+    print_colored(p, "continue", :yellow)
+    print_terminator_values(p, term.values)
+end
+function print_terminator_content(p::IRPrinter, term::BreakOp)
+    print_colored(p, "break", :yellow)
+    print_terminator_values(p, term.values)
+end
+function print_terminator_content(p::IRPrinter, term::ConditionOp)
+    print_colored(p, "condition", :yellow)
+    print(p.io, "(")
+    print_value(p, term.condition)
+    print(p.io, ")")
+    print_terminator_values(p, term.args)
+end
+function print_terminator_content(p::IRPrinter, term::ReturnNode)
+    print(p.io, "return")
+    if isdefined(term, :val)
+        print(p.io, " ")
+        print_value(p, term.val)
+    end
+end
+
+function print_terminator_values(p::IRPrinter, values)
+    if !isempty(values)
+        print(p.io, " ")
+        for (i, v) in enumerate(values)
+            i > 1 && print(p.io, ", ")
+            print_value(p, v)
+        end
+    end
+end
+
+# Print ControlFlowOp (final type, dispatches via multiple dispatch)
+print_control_flow(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_if_op_final(p, op, pos; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_for_op_final(p, op, pos; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::WhileOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_while_op_final(p, op, pos; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_loop_op_final(p, op, pos; is_last, cascade_depth)
+
+function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+    # When cascade_depth > 0, keep │ going (don't use └──) so inner content can close it
+    use_closing = is_last && cascade_depth == 0
+    prefix = use_closing ? "└──" : "├──"
+    cont_prefix = use_closing ? "    " : "│   "
 
     print_indent(p)
     print_colored(p, prefix, :light_black)
     print(p.io, " ")
 
-    # Print results assignment if any
-    if !isempty(op.result_vars)
-        print_results(p, op.result_vars)
-        print(p.io, " = ")
+    # Show assignment if this position is used anywhere in the IR
+    if pos in p.used
+        print(p.io, "%", pos, " = ")
     end
 
     print(p.io, "if ")
     print_value(p, op.condition)
     println(p.io)
 
-    # Then block body (indented with continuation line)
-    then_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(then_p, op.then_block)
+    # Print "then:" region header
+    then_p = child_printer(p, op.then_region, cont_prefix)
+    print_region_header(then_p, "then", op.then_region.args)
+    # Print then region body (inside_region=true, no statement-level box drawing)
+    then_body_p = child_printer(then_p, op.then_region, "│   ")
+    print_block_body(then_body_p, op.then_region; inside_region=true)
 
-    # else - aligned with "if"
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "else")
-
-    # Else block body
-    print_block_body(then_p, op.else_block)
-
-    # end - aligned with "if"
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "end")
+    # Print "else:" region header
+    else_p = child_printer(p, op.else_region, cont_prefix)
+    print_region_header(else_p, "else", op.else_region.args)
+    # Print else region body (last region, show closing on last line)
+    # Pass cascade_depth so innermost item can close all cascaded levels
+    else_body_p = child_printer(else_p, op.else_region, "│   ")
+    print_block_body(else_body_p, op.else_region; inside_region=true, is_last_region=true, cascade_depth=cascade_depth)
 end
 
-# Print ForOp (Julia-style)
-function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
-    prefix = is_last ? "└──" : "├──"
-    cont_prefix = is_last ? "    " : "│   "
+function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+    # When cascade_depth > 0, keep │ going so inner content can close it
+    use_closing = is_last && cascade_depth == 0
+    prefix = use_closing ? "└──" : "├──"
+    cont_prefix = use_closing ? "    " : "│   "
 
     print_indent(p)
     print_colored(p, prefix, :light_black)
     print(p.io, " ")
 
-    # Print results assignment if any
-    if !isempty(op.result_vars)
-        print_results(p, op.result_vars)
-        print(p.io, " = ")
+    # Show assignment if this position is used anywhere in the IR
+    if pos in p.used
+        print(p.io, "%", pos, " = ")
     end
 
-    # for %iv = %lb:%step:%ub
-    print_colored(p, "for", :yellow)  # Structured keyword
+    print_colored(p, "for", :yellow)
     print(p.io, " %arg", op.iv_arg.id, " = ")
     print_value(p, op.lower)
     print(p.io, ":")
@@ -1143,85 +1222,78 @@ function print_control_flow(p::IRPrinter, op::ForOp; is_last::Bool=false)
     print(p.io, ":")
     print_value(p, op.upper)
 
-    # Print iteration arguments (carried values only, IV is separate)
     if !isempty(op.body.args)
-        print_iter_args(p, op.body.args, op.init_values)
+        print_loop_args(p, op.body.args, op.iter_args)
     end
 
     println(p.io)
 
-    # Body - substitutions already applied
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(body_p, op.body)
-
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "end")
+    # Body is inline (no region header for single-region ops)
+    # Always pass is_last_region=true so the last item closes the for's box drawing
+    # Pass cascade_depth so innermost item can close all cascaded levels
+    body_p = child_printer(p, op.body, cont_prefix)
+    print_block_body(body_p, op.body; is_last_region=true, cascade_depth=cascade_depth)
 end
 
-# Print LoopOp (general loop - distinct from structured WhileOp)
-function print_control_flow(p::IRPrinter, op::LoopOp; is_last::Bool=false)
-    prefix = is_last ? "└──" : "├──"
-    cont_prefix = is_last ? "    " : "│   "
+function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+    # When cascade_depth > 0, keep │ going so inner content can close it
+    use_closing = is_last && cascade_depth == 0
+    prefix = use_closing ? "└──" : "├──"
+    cont_prefix = use_closing ? "    " : "│   "
 
     print_indent(p)
     print_colored(p, prefix, :light_black)
     print(p.io, " ")
 
-    # Print results assignment if any
-    if !isempty(op.result_vars)
-        print_results(p, op.result_vars)
-        print(p.io, " = ")
+    # Show assignment if this position is used anywhere in the IR
+    if pos in p.used
+        print(p.io, "%", pos, " = ")
     end
 
-    print_colored(p, "loop", :yellow)  # Structured keyword
-    print_iter_args(p, op.body.args, op.init_values)
+    print_colored(p, "loop", :yellow)
+    print_loop_args(p, op.body.args, op.iter_args)
     println(p.io)
 
-    # Body - substitutions already applied during construction
-    body_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(body_p, op.body)
-
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "end")
+    # Body is inline (no region header for single-region ops)
+    # Always pass is_last_region=true so the last item closes the loop's box drawing
+    # Pass cascade_depth so innermost item can close all cascaded levels
+    body_p = child_printer(p, op.body, cont_prefix)
+    print_block_body(body_p, op.body; is_last_region=true, cascade_depth=cascade_depth)
 end
 
-# Print WhileOp (two-region while with before/after regions)
-function print_control_flow(p::IRPrinter, op::WhileOp; is_last::Bool=false)
-    prefix = is_last ? "└──" : "├──"
-    cont_prefix = is_last ? "    " : "│   "
+function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+    # When cascade_depth > 0, keep │ going so inner content can close it
+    use_closing = is_last && cascade_depth == 0
+    prefix = use_closing ? "└──" : "├──"
+    cont_prefix = use_closing ? "    " : "│   "
 
     print_indent(p)
     print_colored(p, prefix, :light_black)
     print(p.io, " ")
 
-    # Print results assignment if any
-    if !isempty(op.result_vars)
-        print_results(p, op.result_vars)
-        print(p.io, " = ")
+    # Show assignment if this position is used anywhere in the IR
+    if pos in p.used
+        print(p.io, "%", pos, " = ")
     end
 
     print_colored(p, "while", :yellow)
-    print_iter_args(p, op.before.args, op.init_values)
-    println(p.io, " {")
+    print_loop_args(p, op.before.args, op.iter_args)
+    println(p.io)
 
-    # Before region (condition computation)
-    before_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(before_p, op.before)
+    # Print "before" region header
+    before_p = child_printer(p, op.before, cont_prefix)
+    print_region_header(before_p, "before", op.before.args)
+    # Print before region body (inside_region=true, no statement-level box drawing)
+    before_body_p = child_printer(before_p, op.before, "│   ")
+    print_block_body(before_body_p, op.before; inside_region=true)
 
-    # "} do {" separator
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "} do {")
-
-    # After region (loop body)
-    after_p = IRPrinter(p.io, p.code, p.indent + 1, p.line_prefix * cont_prefix, false, p.used, p.color)
-    print_block_body(after_p, op.after)
-
-    print_indent(p)
-    print_colored(p, cont_prefix, :light_black)
-    println(p.io, "}")
+    # Print "do" region header
+    after_p = child_printer(p, op.after, cont_prefix)
+    print_region_header(after_p, "do", op.after.args)
+    # Print do region body (last region, show closing on last line)
+    # Pass cascade_depth so innermost item can close all cascaded levels
+    after_body_p = child_printer(after_p, op.after, "│   ")
+    print_block_body(after_body_p, op.after; inside_region=true, is_last_region=true, cascade_depth=cascade_depth)
 end
 
 # Main entry point: show for StructuredCodeInfo
@@ -1261,5 +1333,6 @@ end
 
 # Keep the simple show method for compact display
 function Base.show(io::IO, sci::StructuredCodeInfo)
-    print(io, "StructuredCodeInfo(", length(sci.code.code), " stmts, entry=Block#", sci.entry.id, ")")
+    n_body = length(sci.entry.body)
+    print(io, "StructuredCodeInfo(", length(sci.code.code), " stmts, entry=Block(", n_body, " items))")
 end
