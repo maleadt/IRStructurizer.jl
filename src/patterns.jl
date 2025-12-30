@@ -44,6 +44,34 @@ end
     Some(expr.args[3])
 end
 
+# Match equality condition for Julia's for-loop: ===(BlockArg, upper_bound)
+# Returns (iv_arg, iv_idx, upper_bound) if matched, nothing otherwise
+@active for_equality_condition_pattern(args) begin
+    (expr, body_args) = args
+    expr isa Expr || return nothing
+    expr.head === :call || return nothing
+    length(expr.args) >= 3 || return nothing
+
+    func = expr.args[1]
+    # Match both Base.:(===) and :(===)
+    if func isa GlobalRef
+        func.name === :(===) || return nothing
+    elseif func === :(===)
+        # Direct symbol
+    else
+        return nothing
+    end
+
+    iv_candidate = expr.args[2]
+    iv_candidate isa BlockArg || return nothing
+
+    iv_idx = findfirst(==(iv_candidate), body_args)
+    iv_idx === nothing && return nothing
+
+    upper_bound = expr.args[3]
+    (iv_candidate, iv_idx, upper_bound)
+end
+
 #=============================================================================
  Getfield Helper Functions (for tuple+getfield loop result handling)
 =============================================================================#
@@ -150,18 +178,23 @@ defines_in_op(op::WhileOp, ssa::SSAValue) = defines(op.before, ssa) || defines(o
 """
     apply_loop_patterns!(block::Block, ctx::StructurizationContext)
 
-Upgrade WhileOp to ForOp where patterns match.
+Upgrade WhileOp/LoopOp to ForOp where patterns match.
 
 For ForOp upgrades:
 - The loop's key remains unchanged (no re-keying)
 - The IV's getfield statement is removed from the parent block
 - Remaining getfield indices are adjusted to account for the removed IV
+- For LoopOp upgrades (Julia's `for i in 1:n`), the upper bound is adjusted +1
 """
 function apply_loop_patterns!(block::Block, ctx::StructurizationContext)
     # Collect upgrades: (loop_key => (new_op, iv_getfield_idx, iv_field_idx))
     # iv_getfield_idx: SSA index of the IV's getfield (to remove), or nothing if no cleanup needed
     # iv_field_idx: field index of the IV in the tuple (to adjust other getfields)
     upgrades = Dict{Int, Tuple{ControlFlowOp, Union{Nothing, Int}, Int}}()
+
+    # Separate dict for LoopOp upgrades that need upper bound adjustment
+    # (loop_key => (ForOp, iv_getfield_idx, iv_field_idx, original_upper))
+    loopop_upgrades = Dict{Int, Tuple{ForOp, Union{Nothing, Int}, Int, IRValue}}()
 
     for (idx, entry) in block.body
         if entry.stmt isa WhileOp
@@ -170,13 +203,49 @@ function apply_loop_patterns!(block::Block, ctx::StructurizationContext)
             if result !== nothing
                 upgrades[idx] = result
             end
+        elseif entry.stmt isa LoopOp
+            # Use MLStyle pattern matching for LoopOp → ForOp (Julia's for i in 1:n)
+            result = try_upgrade_loopop_to_for(entry.stmt, ctx, idx, block)
+            if result !== nothing
+                loopop_upgrades[idx] = result
+            end
         end
+    end
+
+    # Handle LoopOp upgrades: insert add_int for upper bound adjustment
+    # We need to do this before the main upgrade pass to get the new SSA indices
+    # Collect: loop_key => (adj_ssa_idx, add_int_expr)
+    upper_bound_adjustments = Dict{Int, Tuple{Int, Expr}}()
+    for (loop_key, (for_op, iv_getfield_idx, iv_field_idx, original_upper)) in loopop_upgrades
+        # Allocate a synthesized SSA for the adjusted upper bound
+        adj_ssa_idx = ctx.next_ssa_idx
+        ctx.next_ssa_idx += 1
+        adj_ssa = SSAValue(adj_ssa_idx)
+
+        # Create add_int(original_upper, 1) expression
+        add_int_expr = Expr(:call, GlobalRef(Base, :add_int), original_upper, 1)
+
+        # Update the ForOp's upper bound to the new SSA
+        for_op.upper = adj_ssa
+
+        # Store for later insertion
+        upper_bound_adjustments[loop_key] = (adj_ssa_idx, add_int_expr)
+
+        # Store as regular upgrade for the main pass
+        upgrades[loop_key] = (for_op, iv_getfield_idx, iv_field_idx)
     end
 
     # Apply upgrades: replace WhileOp/LoopOp with ForOp (same key!)
     if !isempty(upgrades)
         new_body = SSAVector()
+
         for (old_key, entry) in block.body
+            # Insert any synthesized add_int statements before the loop they belong to
+            if haskey(upper_bound_adjustments, old_key)
+                adj_ssa_idx, add_int_expr = upper_bound_adjustments[old_key]
+                push!(new_body, (adj_ssa_idx, add_int_expr, Int64))
+            end
+
             if haskey(upgrades, old_key)
                 new_op, _, _ = upgrades[old_key]
                 # Update result type: ForOp has one fewer result
@@ -361,6 +430,174 @@ Find the step expression `add_int(iv_arg, step)` in the after region.
 Returns (ssa_idx, step_value) or nothing.
 """
 function find_step_in_after(block::Block, iv_arg::BlockArg)
+    for (idx, entry) in block.body
+        if !(entry.stmt isa ControlFlowOp)
+            matched = @match (entry.stmt, iv_arg) begin
+                for_step_pattern(step) => step
+                _ => nothing
+            end
+            if matched !== nothing
+                return (idx, matched)
+            end
+        end
+    end
+    return nothing
+end
+
+#=============================================================================
+ LoopOp → ForOp Pattern Matching (for Julia's `for i in 1:n`)
+=============================================================================#
+
+"""
+    try_upgrade_loopop_to_for(loop_op::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+        -> Union{Tuple{ForOp, Union{Nothing, Int}, Int, IRValue}, Nothing}
+
+Try to upgrade a LoopOp to ForOp for Julia's `for i in 1:n` pattern.
+Returns (ForOp, iv_getfield_idx, iv_field_idx, upper_bound_adj) if upgraded, or nothing.
+
+The upper_bound_adj is the adjusted upper bound expression that needs to be inserted
+in the parent block before the ForOp.
+
+Julia's `for i in 1:n` pattern in LoopOp:
+- Body contains an IfOp with `=== (BlockArg, upper_bound)` condition
+- One branch has ContinueOp with step (add_int on IV)
+- Other branch has BreakOp
+- Bound needs +1 adjustment (inclusive to exclusive)
+"""
+function try_upgrade_loopop_to_for(loop_op::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+    body = loop_op.body::Block
+    n_init_values = length(loop_op.init_values)
+
+    # Find the terminating IfOp in the body
+    if_op = nothing
+    if_idx = nothing
+    for (idx, entry) in body.body
+        if entry.stmt isa IfOp
+            if_op = entry.stmt
+            if_idx = idx
+        end
+    end
+    if_op === nothing && return nothing
+
+    # Get the condition SSAValue
+    cond_val = if_op.condition
+    cond_val isa SSAValue || return nothing
+
+    # Find the condition expression in the body
+    cond_entry = find_by_ssa(body.body, cond_val.id)
+    cond_entry === nothing && return nothing
+    cond_expr = cond_entry.stmt
+
+    # Match the equality condition pattern: ===(BlockArg, upper_bound)
+    matched = @match (cond_expr, body.args) begin
+        for_equality_condition_pattern(iv, iv_idx, upper) => (iv, iv_idx, upper)
+        _ => nothing
+    end
+    matched === nothing && return nothing
+    iv_arg, iv_idx, upper_bound_raw = matched
+
+    # Verify IV is in init_values range
+    iv_idx > n_init_values && return nothing
+    lower_bound = loop_op.init_values[iv_idx]
+
+    # Determine which branch has ContinueOp (loop body) vs BreakOp (exit)
+    then_term = if_op.then_region.terminator
+    else_term = if_op.else_region.terminator
+
+    continue_region = nothing
+    break_region = nothing
+    if then_term isa ContinueOp && else_term isa BreakOp
+        continue_region = if_op.then_region
+        break_region = if_op.else_region
+    elseif else_term isa ContinueOp && then_term isa BreakOp
+        continue_region = if_op.else_region
+        break_region = if_op.then_region
+    else
+        return nothing
+    end
+
+    # For Julia's `for i in 1:n` pattern with === check, the step is always 1.
+    # The step computation is in a different control flow path (not directly in body),
+    # so we assume step=1 for UnitRange iteration.
+    step = 1
+    step_ssa_indices = Int[]
+
+    # Try to find explicit step in body (for other patterns)
+    step_result = find_step_in_block(body, iv_arg)
+    if step_result !== nothing
+        step_idx, step = step_result
+        push!(step_ssa_indices, step_idx)
+    end
+
+    # Resolve upper_bound if it's a BlockArg
+    function resolve_blockarg(arg)
+        if arg isa BlockArg && arg.id <= n_init_values
+            return loop_op.init_values[arg.id]
+        end
+        return arg
+    end
+
+    upper_bound = resolve_blockarg(upper_bound_raw)
+
+    # Verify upper_bound is loop-invariant (step is constant 1, always invariant)
+    is_loop_invariant(upper_bound, body, n_init_values) || return nothing
+
+    # For Julia's inclusive range, we need upper_bound + 1 for exclusive ForOp semantics
+    # This will be handled by inserting add_int in parent block
+
+    # Separate non-IV init_values and identify the IV index for result types
+    other_init_values = IRValue[]
+    for (j, v) in enumerate(loop_op.init_values)
+        j != iv_idx && push!(other_init_values, v)
+    end
+
+    # Find the IV's getfield in the parent block
+    loop_ssa = SSAValue(current_key)
+    getfields = find_getfields_for(parent_block, loop_ssa)
+    iv_getfield_idx = nothing
+    for gf in getfields
+        if gf.field_idx == iv_idx
+            iv_getfield_idx = gf.ssa_idx
+            break
+        end
+    end
+
+    # Build ForOp body from LoopOp body, excluding:
+    # - The condition check (=== expression)
+    # - The IfOp
+    # - Step computations for the IV
+    new_body = Block()
+    new_body.args = [arg for arg in body.args if arg != iv_arg]
+
+    cond_ssa_id = cond_val.id
+    for (idx, entry) in body.body
+        # Skip the condition check, IfOp, and step computations
+        if idx == cond_ssa_id || idx == if_idx || idx in step_ssa_indices
+            continue
+        end
+        push!(new_body, idx, entry.stmt, entry.typ)
+    end
+
+    # Get yield values from ContinueOp, excluding the IV
+    cont_op = continue_region.terminator::ContinueOp
+    yield_values = IRValue[]
+    for (j, v) in enumerate(cont_op.values)
+        j != iv_idx && j <= n_init_values && push!(yield_values, v)
+    end
+    new_body.terminator = ContinueOp(yield_values)
+
+    # Create ForOp - upper bound will be adjusted by caller (add 1)
+    for_op = ForOp(lower_bound, upper_bound, step, iv_arg, new_body, other_init_values)
+    return (for_op, iv_getfield_idx, iv_idx, upper_bound)
+end
+
+"""
+    find_step_in_block(block::Block, iv_arg::BlockArg) -> Union{Tuple{Int, Any}, Nothing}
+
+Find the step expression `add_int(iv_arg, step)` in a block.
+Returns (ssa_idx, step_value) or nothing.
+"""
+function find_step_in_block(block::Block, iv_arg::BlockArg)
     for (idx, entry) in block.body
         if !(entry.stmt isa ControlFlowOp)
             matched = @match (entry.stmt, iv_arg) begin

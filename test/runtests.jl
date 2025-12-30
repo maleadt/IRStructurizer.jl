@@ -421,6 +421,57 @@ end
     @test length(for_op.init_values) == 1
 end
 
+@testset "Julia for-in-range (1:n)" begin
+    # Julia's native `for i in 1:n` syntax uses === equality check,
+    # which is detected and upgraded to ForOp
+    function sum_range(n::Int)
+        acc = 0
+        for i in 1:n
+            acc += i
+        end
+        return acc
+    end
+
+    sci = code_structured(sum_range, Tuple{Int})
+    @test sci isa StructuredCodeInfo
+    validate_scf(sci)
+
+    # Helper to find ForOp in nested structure
+    function find_for_op(block::Block)
+        for stmt in statements(block.body)
+            if stmt isa ForOp
+                return stmt
+            elseif stmt isa IfOp
+                result = find_for_op(stmt.then_region)
+                result !== nothing && return result
+                result = find_for_op(stmt.else_region)
+                result !== nothing && return result
+            end
+        end
+        return nothing
+    end
+
+    for_op = find_for_op(sci.entry)
+    @test for_op !== nothing
+
+    if for_op !== nothing
+        # Lower bound is the initial iterator state (an SSAValue for the first element)
+        # For `1:n`, this will be an SSAValue pointing to the computed first value
+        @test for_op.lower isa Union{SSAValue, Int}
+
+        # Step should be 1
+        @test for_op.step == 1
+
+        # Body should have loop-carried values (excluding IV)
+        # For sum_range: original has 3 loop-carried values (value, state, acc),
+        # after removing the IV (state), we have 2 remaining
+        @test length(for_op.body.args) >= 1  # At least the accumulator
+
+        # Body terminates with ContinueOp
+        @test for_op.body.terminator isa ContinueOp
+    end
+end
+
 @testset "nested for loops" begin
     # Two nested counting loops
     function nested_count(n::Int, m::Int)
@@ -692,27 +743,25 @@ end
     @test sci isa StructuredCodeInfo
     validate_scf(sci)
 
-    # Find the LoopOp in the structure (for i in 1:n becomes REGION_NATURAL_LOOP → LoopOp)
-    # Note: Julia's `for i in 1:n` generates complex IR with equality check (===), not slt_int,
-    # so it doesn't match the ForOp pattern and stays as LoopOp.
-    function find_loop_op(block::Block)
+    # Find a loop op in the structure (for i in 1:n is now upgraded to ForOp)
+    function find_any_loop_op(block::Block)
         for stmt in statements(block.body)
-            if stmt isa LoopOp
+            if stmt isa ForOp || stmt isa LoopOp
                 return stmt
             elseif stmt isa IfOp
-                result = find_loop_op(stmt.then_region)
+                result = find_any_loop_op(stmt.then_region)
                 result !== nothing && return result
-                result = find_loop_op(stmt.else_region)
+                result = find_any_loop_op(stmt.else_region)
                 result !== nothing && return result
-            elseif stmt isa ForOp || stmt isa WhileOp
-                result = find_loop_op(stmt.body)
+            elseif stmt isa WhileOp
+                result = find_any_loop_op(stmt.after)
                 result !== nothing && return result
             end
         end
         return nothing
     end
 
-    loop_op = find_loop_op(sci.entry)
+    loop_op = find_any_loop_op(sci.entry)
     @test loop_op !== nothing
 
     # Loop-carried values are properly tracked via init_values and BlockArgs
