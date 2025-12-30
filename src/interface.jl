@@ -16,8 +16,8 @@ control flow restructured into nested SCF-style operations (if/for/while).
 - `validate`: Whether to validate that all control flow was properly structured (default: true).
   When `true`, throws `UnstructuredControlFlowError` if any unstructured control flow remains.
 - `loop_patterning`: Whether to apply loop pattern detection (default: true).
-  When `true`, loops are classified as ForOp (bounded counters) or WhileOp (condition-based).
-  When `false`, all loops become LoopOp, useful for testing CFG analysis separately.
+  When `true`, WhileOp (condition-based) may be upgraded to ForOp (bounded counters) if patterns match.
+  When `false`, loops remain as WhileOp (for REGION_WHILE_LOOP) or LoopOp (for REGION_NATURAL_LOOP).
 
 Other keyword arguments are passed to `code_typed`.
 
@@ -63,8 +63,9 @@ Convert unstructured control flow in `sci` to structured control flow operations
 This transforms GotoNode and GotoIfNot statements into nested structured ops
 that can be traversed hierarchically.
 
-When `loop_patterning=true` (default), loops are classified as ForOp (bounded counters)
-or WhileOp (condition-based). When `false`, all loops remain as LoopOp.
+When `loop_patterning=true` (default), WhileOp may be upgraded to ForOp if bounded counter
+patterns are detected. When `false`, loops remain as WhileOp (for simple while loops) or
+LoopOp (for complex cyclic regions).
 
 Returns `sci` for convenience (allows chaining).
 """

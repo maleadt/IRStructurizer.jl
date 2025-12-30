@@ -1,4 +1,48 @@
-# Pattern matching and loop upgrades (LoopOp → ForOp/WhileOp)
+# Pattern matching and loop upgrades (WhileOp/LoopOp → ForOp)
+
+using MLStyle: @active, @match, Some
+
+#=============================================================================
+ MLStyle Active Patterns for For-Loop Detection
+=============================================================================#
+
+# Match a for-loop condition: slt_int(iv, bound) or ult_int(iv, bound)
+# Returns (iv, iv_idx, upper) if matched, nothing otherwise
+@active for_condition_pattern(args) begin
+    (expr, body_args) = args
+    expr isa Expr || return nothing
+    expr.head === :call || return nothing
+    length(expr.args) >= 3 || return nothing
+
+    func = expr.args[1]
+    func isa GlobalRef || return nothing
+    func.name in (:slt_int, :ult_int) || return nothing
+
+    iv_candidate = expr.args[2]
+    iv_candidate isa BlockArg || return nothing
+
+    iv_idx = findfirst(==(iv_candidate), body_args)
+    iv_idx === nothing && return nothing
+
+    upper_bound = expr.args[3]
+    (iv_candidate, iv_idx, upper_bound)
+end
+
+# Match a for-loop step: add_int(iv, step)
+# Returns Some(step) if matched, nothing otherwise (1-ary pattern needs Some)
+@active for_step_pattern(args) begin
+    (expr, iv_arg) = args
+    expr isa Expr || return nothing
+    expr.head === :call || return nothing
+    length(expr.args) >= 3 || return nothing
+
+    func = expr.args[1]
+    func isa GlobalRef || return nothing
+    func.name === :add_int || return nothing
+
+    expr.args[2] == iv_arg || return nothing
+    Some(expr.args[3])
+end
 
 #=============================================================================
  Getfield Helper Functions (for tuple+getfield loop result handling)
@@ -41,20 +85,6 @@ end
 =============================================================================#
 
 """
-    find_ifop(block::Block) -> Union{IfOp, Nothing}
-
-Find the first IfOp in a block's body.
-"""
-function find_ifop(block::Block)
-    for stmt in statements(block.body)
-        if stmt isa IfOp
-            return stmt
-        end
-    end
-    return nothing
-end
-
-"""
     find_expr_by_ssa(block::Block, ssa::SSAValue) -> Union{Tuple{Int, SSAEntry}, Nothing}
 
 Find an expression in the block whose SSA index matches the SSAValue's id.
@@ -64,36 +94,6 @@ function find_expr_by_ssa(block::Block, ssa::SSAValue)
     for (idx, entry) in block.body
         if !(entry.stmt isa ControlFlowOp) && idx == ssa.id
             return (idx, entry)
-        end
-    end
-    return nothing
-end
-
-"""
-    find_add_int_for_iv(block::Block, iv_arg::BlockArg) -> Union{Tuple{Int, SSAEntry}, Nothing}
-
-Find an expression containing `add_int(iv_arg, step)` in the block.
-Searches inside IfOp (since condition creates if structure),
-but NOT into nested LoopOp (those have their own IVs).
-Returns (idx, entry) tuple or nothing.
-"""
-function find_add_int_for_iv(block::Block, iv_arg::BlockArg)
-    for (idx, entry) in block.body
-        if entry.stmt isa IfOp
-            result = find_add_int_for_iv(entry.stmt.then_region, iv_arg)
-            result !== nothing && return result
-            result = find_add_int_for_iv(entry.stmt.else_region, iv_arg)
-            result !== nothing && return result
-        elseif !(entry.stmt isa ControlFlowOp)
-            expr = entry.stmt
-            if expr isa Expr && expr.head === :call && length(expr.args) >= 3
-                func = expr.args[1]
-                if func isa GlobalRef && func.name === :add_int
-                    if expr.args[2] == iv_arg
-                        return (idx, entry)
-                    end
-                end
-            end
         end
     end
     return nothing
@@ -143,28 +143,14 @@ defines_in_op(op::LoopOp, ssa::SSAValue) = defines(op.body, ssa)
 defines_in_op(op::ForOp, ssa::SSAValue) = defines(op.body, ssa)
 defines_in_op(op::WhileOp, ssa::SSAValue) = defines(op.before, ssa) || defines(op.after, ssa)
 
-"""
-    is_for_condition(expr) -> Bool
-
-Check if an expression is a for-loop condition pattern: slt_int or ult_int.
-"""
-function is_for_condition(expr)
-    expr isa Expr || return false
-    expr.head === :call || return false
-    length(expr.args) >= 3 || return false
-    func = expr.args[1]
-    return func isa GlobalRef && func.name in (:slt_int, :ult_int)
-end
-
 #=============================================================================
- Loop Pattern Matching (upgrade LoopOp → ForOp/WhileOp)
+ Loop Pattern Matching (WhileOp → ForOp)
 =============================================================================#
 
 """
     apply_loop_patterns!(block::Block, ctx::StructurizationContext)
 
-Upgrade LoopOp to ForOp/WhileOp where patterns match.
-Creates new ops and replaces them in the block body.
+Upgrade WhileOp to ForOp where patterns match.
 
 For ForOp upgrades:
 - The loop's key remains unchanged (no re-keying)
@@ -173,26 +159,27 @@ For ForOp upgrades:
 """
 function apply_loop_patterns!(block::Block, ctx::StructurizationContext)
     # Collect upgrades: (loop_key => (new_op, iv_getfield_idx, iv_field_idx))
-    # iv_getfield_idx: SSA index of the IV's getfield (to remove), or nothing for WhileOp
+    # iv_getfield_idx: SSA index of the IV's getfield (to remove), or nothing if no cleanup needed
     # iv_field_idx: field index of the IV in the tuple (to adjust other getfields)
     upgrades = Dict{Int, Tuple{ControlFlowOp, Union{Nothing, Int}, Int}}()
 
     for (idx, entry) in block.body
-        if entry.stmt isa LoopOp
-            result = try_upgrade_loop(entry.stmt, ctx, idx, block)
+        if entry.stmt isa WhileOp
+            # Use MLStyle pattern matching for WhileOp → ForOp
+            result = try_upgrade_while_to_for(entry.stmt, ctx, idx, block)
             if result !== nothing
                 upgrades[idx] = result
             end
         end
     end
 
-    # Apply upgrades: replace LoopOp with ForOp/WhileOp (same key!)
+    # Apply upgrades: replace WhileOp/LoopOp with ForOp (same key!)
     if !isempty(upgrades)
         new_body = SSAVector()
         for (old_key, entry) in block.body
             if haskey(upgrades, old_key)
                 new_op, _, _ = upgrades[old_key]
-                # Update result type: ForOp has one fewer result than LoopOp
+                # Update result type: ForOp has one fewer result
                 new_typ = compute_upgraded_type(entry.typ, upgrades[old_key])
                 push!(new_body, (old_key, new_op, new_typ))
             else
@@ -273,98 +260,63 @@ function adjust_getfield_indices!(block::Block, loop_key::Int, removed_field_idx
 end
 
 """
-    try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
-        -> Union{Tuple{ControlFlowOp, Union{Nothing, Int}, Int}, Nothing}
-
-Try to upgrade a LoopOp to ForOp or WhileOp.
-Returns (new_op, iv_getfield_idx, iv_field_idx) if upgraded, or nothing if not upgraded.
-- new_op: The ForOp or WhileOp
-- iv_getfield_idx: SSA index of the IV's getfield to remove (ForOp only, nothing for WhileOp)
-- iv_field_idx: Field index of the IV in the tuple (for adjusting other getfields)
-"""
-function try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
-    # Try ForOp pattern first
-    result = try_upgrade_to_for(loop, ctx, current_key, parent_block)
-    if result !== nothing
-        return result
-    end
-
-    # Try WhileOp pattern
-    while_op = try_upgrade_to_while(loop, ctx)
-    if while_op !== nothing
-        return (while_op, nothing, 0)  # WhileOp doesn't remove any getfields
-    end
-
-    return nothing
-end
-
-"""
-    try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+    try_upgrade_while_to_for(while_op::WhileOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
         -> Union{Tuple{ForOp, Union{Nothing, Int}, Int}, Nothing}
 
-Try to upgrade a LoopOp to ForOp by detecting the for-loop pattern.
+Try to upgrade a WhileOp to ForOp using MLStyle pattern matching.
 Returns (ForOp, iv_getfield_idx, iv_field_idx) if upgraded, or nothing if not upgraded.
-- ForOp: The created ForOp
-- iv_getfield_idx: SSA index of the IV's getfield statement to remove (or nothing if not found)
-- iv_field_idx: Field index of the IV in the tuple (for adjusting other getfields)
 """
-function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
-    body = loop.body::Block
-    n_init_values = length(loop.init_values)
+function try_upgrade_while_to_for(while_op::WhileOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+    before = while_op.before::Block
+    after = while_op.after::Block
+    n_init_values = length(while_op.init_values)
 
-    # Find the IfOp in the loop body - this contains the condition check
-    condition_ifop = find_ifop(body)
-    condition_ifop === nothing && return nothing
-
-    # The condition should be an SSAValue pointing to a comparison expression
-    cond_val = condition_ifop.condition
+    # Get the condition from ConditionOp terminator
+    cond_op = before.terminator
+    cond_op isa ConditionOp || return nothing
+    cond_val = cond_op.condition
     cond_val isa SSAValue || return nothing
-    cond_result = find_expr_by_ssa(body, cond_val)
-    cond_result === nothing && return nothing
-    cond_idx, cond_entry = cond_result
+
+    # Find the condition expression
+    cond_entry = find_by_ssa(before.body, cond_val.id)
+    cond_entry === nothing && return nothing
     cond_expr = cond_entry.stmt
 
-    # Check it's a for-loop condition: slt_int(iv_arg, upper_bound)
-    is_for_condition(cond_expr) || return nothing
+    # Use MLStyle pattern matching for for-loop condition
+    matched = @match (cond_expr, before.args) begin
+        for_condition_pattern(iv, iv_idx, upper) => (iv, iv_idx, upper)
+        _ => nothing
+    end
+    matched === nothing && return nothing
+    iv_arg, iv_idx, upper_bound_raw = matched
 
-    # After substitution, the IV should be a BlockArg
-    iv_arg = cond_expr.args[2]
-    iv_arg isa BlockArg || return nothing
-    upper_bound_raw = cond_expr.args[3]
+    # Verify IV is in init_values range
+    iv_idx > n_init_values && return nothing
+    lower_bound = while_op.init_values[iv_idx]
 
     # Helper to resolve BlockArg to original value from init_values
     function resolve_blockarg(arg)
         if arg isa BlockArg && arg.id <= n_init_values
-            return loop.init_values[arg.id]
+            return while_op.init_values[arg.id]
         end
         return arg
     end
 
     upper_bound = resolve_blockarg(upper_bound_raw)
 
-    # Find which index this BlockArg corresponds to
-    iv_idx = findfirst(==(iv_arg), body.args)
-    iv_idx === nothing && return nothing
-
-    # IV must be an init_value (in the init_values range)
-    iv_idx > n_init_values && return nothing
-    lower_bound = loop.init_values[iv_idx]
-
-    # Find the step: add_int(iv_arg, step)
-    step_result = find_add_int_for_iv(body, iv_arg)
+    # Find the step in the after region using MLStyle pattern
+    step_result = find_step_in_after(after, iv_arg)
     step_result === nothing && return nothing
-    step_idx, step_entry = step_result
-    step_expr = step_entry.stmt
-    step_raw = step_expr.args[3]
+    step_idx, step_raw = step_result
     step = resolve_blockarg(step_raw)
 
     # Verify upper_bound and step are loop-invariant
-    is_loop_invariant(upper_bound, body, n_init_values) || return nothing
-    is_loop_invariant(step, body, n_init_values) || return nothing
+    is_loop_invariant(upper_bound, before, n_init_values) || return nothing
+    is_loop_invariant(step, after, n_init_values) || return nothing
 
-    # Separate non-IV init_values (the new init_values for ForOp)
+    # Separate non-IV init_values
     other_init_values = IRValue[]
-    for (j, v) in enumerate(loop.init_values)
+    for (j, v) in enumerate(while_op.init_values)
         j != iv_idx && push!(other_init_values, v)
     end
 
@@ -379,107 +331,47 @@ function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_k
         end
     end
 
-    # Rebuild body block without condition structure
-    then_blk = condition_ifop.then_region::Block
+    # Build ForOp body from after region, filtering out IV-related items
     new_body = Block()
-    # Only include carried values, not IV
-    new_body.args = [arg for arg in body.args if arg !== iv_arg]
+    new_body.args = [arg for arg in after.args if arg != iv_arg]
 
-    # Extract body items, filtering out iv-related ones
-    for (idx, entry) in body.body
-        if entry.stmt isa IfOp && entry.stmt === condition_ifop
-            # Extract the continue path's body (skip condition check structure)
-            for (sub_idx, sub_entry) in then_blk.body
-                sub_idx == step_idx && continue
-                push!(new_body, sub_idx, sub_entry.stmt, sub_entry.typ)
-            end
-        elseif entry.stmt isa ControlFlowOp
-            push!(new_body, idx, entry.stmt, entry.typ)
-        else
-            idx == step_idx && continue
-            idx == cond_idx && continue
-            push!(new_body, idx, entry.stmt, entry.typ)
-        end
+    for (idx, entry) in after.body
+        idx == step_idx && continue
+        push!(new_body, idx, entry.stmt, entry.typ)
     end
 
-    # Get yield values from continue terminator, excluding the IV
+    # Get yield values from YieldOp, excluding the IV
     yield_values = IRValue[]
-    if then_blk.terminator isa ContinueOp
-        for (j, v) in enumerate(then_blk.terminator.values)
-            # Only include non-IV values
-            if j != iv_idx && j <= n_init_values
-                push!(yield_values, v)
-            end
+    if after.terminator isa YieldOp
+        for (j, v) in enumerate(after.terminator.values)
+            j != iv_idx && j <= n_init_values && push!(yield_values, v)
         end
     end
-
     new_body.terminator = ContinueOp(yield_values)
 
     # Create ForOp
     for_op = ForOp(lower_bound, upper_bound, step, iv_arg, new_body, other_init_values)
-
     return (for_op, iv_getfield_idx, iv_idx)
 end
 
 """
-    try_upgrade_to_while(loop::LoopOp, ctx::StructurizationContext) -> Union{WhileOp, Nothing}
+    find_step_in_after(block::Block, iv_arg::BlockArg) -> Union{Tuple{Int, Any}, Nothing}
 
-Try to upgrade a LoopOp to WhileOp by detecting the while-loop pattern.
-Returns WhileOp if upgraded, or nothing if not upgraded.
-
-Creates MLIR-style scf.while with before/after regions:
-- before: condition computation, ends with ConditionOp (only passes init_values)
-- after: loop body, ends with YieldOp (only yields init_values)
+Find the step expression `add_int(iv_arg, step)` in the after region.
+Returns (ssa_idx, step_value) or nothing.
 """
-function try_upgrade_to_while(loop::LoopOp, ctx::StructurizationContext)
-    body = loop.body::Block
-    n_init_values = length(loop.init_values)
-
-    # Find the IfOp in the loop body - its condition is the while condition
-    condition_ifop = find_ifop(body)
-    condition_ifop === nothing && return nothing
-
-    then_blk = condition_ifop.then_region::Block
-    else_blk = condition_ifop.else_region::Block
-
-    # Build "before" region: statements before the IfOp + ConditionOp
-    before = Block()
-    before.args = copy(body.args)
-
-    for (idx, entry) in body.body
-        if entry.stmt isa IfOp && entry.stmt === condition_ifop
-            break
-        elseif entry.stmt isa ControlFlowOp
-            push!(before, idx, entry.stmt, entry.typ)
-        else
-            push!(before, idx, entry.stmt, entry.typ)
-        end
-    end
-
-    condition_args = IRValue[before.args[i] for i in 1:n_init_values]
-
-    cond_val = condition_ifop.condition
-    before.terminator = ConditionOp(cond_val, condition_args)
-
-    after = Block()
-    for (i, arg) in enumerate(before.args)
-        push!(after.args, BlockArg(i, arg.type))
-    end
-
-    for (idx, entry) in then_blk.body
-        push!(after, idx, entry.stmt, entry.typ)
-    end
-
-    yield_values = IRValue[]
-    if then_blk.terminator isa ContinueOp
-        for (j, v) in enumerate(then_blk.terminator.values)
-            if j <= n_init_values
-                push!(yield_values, v)
+function find_step_in_after(block::Block, iv_arg::BlockArg)
+    for (idx, entry) in block.body
+        if !(entry.stmt isa ControlFlowOp)
+            matched = @match (entry.stmt, iv_arg) begin
+                for_step_pattern(step) => step
+                _ => nothing
+            end
+            if matched !== nothing
+                return (idx, matched)
             end
         end
     end
-
-    after.terminator = YieldOp(yield_values)
-
-    return WhileOp(before, after, loop.init_values)
+    return nothing
 end
+

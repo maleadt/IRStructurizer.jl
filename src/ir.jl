@@ -363,7 +363,21 @@ end
 # Other control flow ops - results are determined by iter_args count, not SSA indices
 collect_results_ssavals(::IfOp) = SSAValue[]
 collect_results_ssavals(::ForOp) = SSAValue[]
-collect_results_ssavals(::WhileOp) = SSAValue[]
+
+"""
+    collect_results_ssavals(op::WhileOp) -> Vector{SSAValue}
+
+Derive result SSAValues from a WhileOp's ConditionOp terminator.
+Used to identify loop-carried values for BlockArg creation.
+"""
+function collect_results_ssavals(op::WhileOp)
+    before = op.before::Block
+    term = before.terminator
+    if term isa ConditionOp
+        return SSAValue[v for v in term.args if v isa SSAValue]
+    end
+    return SSAValue[]
+end
 
 """
     find_break_values(block::Block) -> Vector{IRValue}
@@ -473,6 +487,12 @@ function apply_substitutions!(op::IfOp, subs::Substitutions)
 end
 
 function apply_substitutions!(op::LoopOp, subs::Substitutions)
+    for (j, v) in enumerate(op.init_values)
+        op.init_values[j] = substitute_ssa(v, subs)
+    end
+end
+
+function apply_substitutions!(op::WhileOp, subs::Substitutions)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end

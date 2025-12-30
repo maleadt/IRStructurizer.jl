@@ -373,7 +373,9 @@ end
     handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_WHILE_LOOP and REGION_NATURAL_LOOP.
-Phase 1: Creates LoopOp and generates getfield statements for result extraction.
+
+For REGION_WHILE_LOOP: Creates WhileOp directly with before/after regions.
+For REGION_NATURAL_LOOP: Creates LoopOp with internal IfOp (fallback for complex loops).
 
 The loop is keyed at a synthesized SSA index, and getfield statements are generated
 at the original phi node indices. This ensures that references like `return %2`
@@ -381,7 +383,14 @@ continue to work because getfield is placed at %2.
 """
 function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                       ctx::StructurizationContext)
-    loop_op, phi_indices, phi_types = build_loop_op(tree, code, blocks, ctx)
+    rtype = region_type(tree)
+
+    # Dispatch based on region type
+    loop_op, phi_indices, phi_types = if rtype == REGION_WHILE_LOOP
+        build_while_op(tree, code, blocks, ctx)
+    else  # REGION_NATURAL_LOOP or other cyclic regions
+        build_loop_op(tree, code, blocks, ctx)
+    end
 
     # Allocate new SSA index for loop's tuple result
     loop_result_idx = ctx.next_ssa_idx
@@ -513,6 +522,120 @@ end
 #=============================================================================
  Loop Construction
 =============================================================================#
+
+"""
+    build_while_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
+        -> Tuple{WhileOp, Vector{Int}, Vector{Any}}
+
+Build a WhileOp from a REGION_WHILE_LOOP control tree.
+Returns (while_op, phi_indices, phi_types) where:
+- while_op: The constructed WhileOp with before/after regions
+- phi_indices: SSA indices of the header phi nodes (for getfield generation)
+- phi_types: Julia types of the header phi nodes
+
+The WhileOp structure:
+- before: header statements + ConditionOp(condition, carried_args)
+- after: body statements + YieldOp(carried_values)
+
+Pure structure building - no BlockArgs or substitutions.
+BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
+"""
+function build_while_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                        ctx::StructurizationContext)
+    stmts = code.code
+    types = code.ssavaluetypes
+    header_idx = node_index(tree)
+    loop_blocks = get_loop_blocks(tree, blocks)
+
+    @assert 1 <= header_idx <= length(blocks) "Invalid header_idx from control tree: $header_idx"
+    header_block = blocks[header_idx]
+    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
+
+    # Extract phi node information: init_values (from outside loop) and carried_values (from inside loop)
+    init_values = IRValue[]
+    carried_values = IRValue[]
+    phi_indices = Int[]
+    phi_types = Any[]
+
+    for si in header_block.range
+        stmt = stmts[si]
+        if stmt isa PhiNode
+            push!(phi_indices, si)
+            push!(phi_types, types[si])
+            phi = stmt
+
+            entry_val = nothing
+            carried_val = nothing
+
+            for (edge_idx, _) in enumerate(phi.edges)
+                if isassigned(phi.values, edge_idx)
+                    val = phi.values[edge_idx]
+
+                    if val isa SSAValue
+                        val_stmt = val.id
+                        if val_stmt > 0 && val_stmt <= length(stmts)
+                            val_block = stmt_to_blk[val_stmt]
+                            if val_block ∈ loop_blocks
+                                carried_val = val
+                            else
+                                entry_val = convert_phi_value(val)
+                            end
+                        else
+                            entry_val = convert_phi_value(val)
+                        end
+                    else
+                        entry_val = convert_phi_value(val)
+                    end
+                end
+            end
+
+            entry_val !== nothing && push!(init_values, entry_val)
+            carried_val !== nothing && push!(carried_values, carried_val)
+        end
+    end
+
+    # Find the condition for loop exit
+    condition = nothing
+    for si in header_block.range
+        stmt = stmts[si]
+        if stmt isa GotoIfNot
+            condition = stmt.cond
+            break
+        end
+    end
+
+    # Build "before" region: header statements + ConditionOp
+    before = Block()
+    for si in header_block.range
+        stmt = stmts[si]
+        if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
+            push!(before, si, stmt, types[si])
+        end
+    end
+
+    # ConditionOp terminates the before block
+    # The condition args are SSAValues of the phi nodes (will be substituted to BlockArgs later)
+    condition_args = IRValue[SSAValue(idx) for idx in phi_indices]
+    cond_value = condition !== nothing ? convert_phi_value(condition) : true
+    before.terminator = ConditionOp(cond_value, condition_args)
+
+    # Build "after" region: body statements + YieldOp
+    after = Block()
+
+    # Process loop body blocks (excluding header)
+    for child in children(tree)
+        child_idx = node_index(child)
+        if child_idx != header_idx
+            handle_block_region!(after, child, code, blocks, ctx)
+        end
+    end
+
+    # YieldOp carries values back to the loop header
+    after.terminator = YieldOp(copy(carried_values))
+
+    while_op = WhileOp(before, after, init_values)
+    return while_op, phi_indices, phi_types
+end
 
 """
     build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
@@ -699,7 +822,7 @@ function apply_block_args!(block::Block, ctx::StructurizationContext,
     end
 
     for stmt in statements(block.body)
-        if stmt isa LoopOp || stmt isa IfOp
+        if stmt isa LoopOp || stmt isa IfOp || stmt isa WhileOp
             process_block_args!(stmt, ctx, defined, parent_subs)
         end
     end
@@ -748,5 +871,46 @@ function process_block_args!(if_op::IfOp, ctx::StructurizationContext,
 
     apply_block_args!(then_blk, ctx, then_defined, parent_subs)
     apply_block_args!(else_blk, ctx, else_defined, parent_subs)
+end
+
+"""
+Create BlockArgs for a WhileOp and substitute SSAValue references.
+BlockArgs are created for the before region (matching phi nodes from init_values).
+"""
+function process_block_args!(while_op::WhileOp, ctx::StructurizationContext,
+                             parent_defined::Set{Int}, parent_subs::Substitutions)
+    before = while_op.before::Block
+    after = while_op.after::Block
+    subs = Substitutions()
+    result_vars = collect_results_ssavals(while_op)
+
+    # Create BlockArgs for the before region
+    for (i, result_var) in enumerate(result_vars)
+        phi_type = ctx.ssavaluetypes[result_var.id]
+        new_arg = BlockArg(i, phi_type)
+        push!(before.args, new_arg)
+        subs[result_var.id] = new_arg
+    end
+
+    # Apply substitutions to before region
+    apply_substitutions!(before, subs)
+
+    # Create matching BlockArgs for after region (receives values from ConditionOp)
+    for (i, result_var) in enumerate(result_vars)
+        phi_type = ctx.ssavaluetypes[result_var.id]
+        new_arg = BlockArg(i, phi_type)
+        push!(after.args, new_arg)
+    end
+
+    # Apply substitutions to after region (uses same mapping)
+    apply_substitutions!(after, subs)
+
+    # Recurse into nested control flow
+    merged_subs = merge(parent_subs, subs)
+    nested_defined = Set{Int}(rv.id for rv in result_vars)
+    collect_defined_ssas!(nested_defined, before, ctx)
+    collect_defined_ssas!(nested_defined, after, ctx)
+    apply_block_args!(before, ctx, nested_defined, merged_subs)
+    apply_block_args!(after, ctx, nested_defined, merged_subs)
 end
 
