@@ -18,9 +18,6 @@ include("block_cfg.jl")
 # control tree to structured IR
 include("structure.jl")
 
-# pattern matching and loop upgrades
-include("patterns.jl")
-
 # validation and public API
 include("validation.jl")
 include("interface.jl")

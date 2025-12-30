@@ -498,6 +498,15 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
     end
 end
 
+function apply_substitutions!(op::ForOp, subs::Substitutions)
+    op.lower = substitute_ssa(op.lower, subs)
+    op.upper = substitute_ssa(op.upper, subs)
+    op.step = substitute_ssa(op.step, subs)
+    for (j, v) in enumerate(op.init_values)
+        op.init_values[j] = substitute_ssa(v, subs)
+    end
+end
+
 
 """
     substitute_terminator(term, subs::Substitutions)

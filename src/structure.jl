@@ -75,7 +75,7 @@ function tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
         handle_if_then!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_TERMINATION
         handle_termination!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
+    elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SELF_LOOP
         handle_self_loop!(block, tree, code, blocks, ctx)
@@ -139,7 +139,7 @@ function handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, 
         handle_if_then!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_TERMINATION
         handle_termination!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
+    elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SELF_LOOP
         handle_self_loop!(block, tree, code, blocks, ctx)
@@ -372,8 +372,9 @@ end
 """
     handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
-Handle REGION_WHILE_LOOP and REGION_NATURAL_LOOP.
+Handle REGION_FOR_LOOP, REGION_WHILE_LOOP, and REGION_NATURAL_LOOP.
 
+For REGION_FOR_LOOP: Creates ForOp directly using metadata from CFG analysis.
 For REGION_WHILE_LOOP: Creates WhileOp directly with before/after regions.
 For REGION_NATURAL_LOOP: Creates LoopOp with internal IfOp (fallback for complex loops).
 
@@ -386,10 +387,29 @@ function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::V
     rtype = region_type(tree)
 
     # Dispatch based on region type
-    loop_op, phi_indices, phi_types = if rtype == REGION_WHILE_LOOP
-        build_while_op(tree, code, blocks, ctx)
+    if rtype == REGION_FOR_LOOP
+        for_op, phi_indices, phi_types, is_inclusive, original_upper = build_for_op(tree, code, blocks, ctx)
+
+        # Handle inclusive bounds (Julia's for i in 1:n) by inserting add_int(upper, 1)
+        if is_inclusive
+            # Allocate SSA for adjusted upper bound
+            adj_ssa_idx = ctx.next_ssa_idx
+            ctx.next_ssa_idx += 1
+
+            # Insert add_int expression before the loop
+            adj_upper = convert_phi_value(original_upper)
+            add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, 1)
+            push!(block, adj_ssa_idx, add_int_expr, Int64)
+
+            # Update ForOp's upper bound to the adjusted value
+            for_op.upper = SSAValue(adj_ssa_idx)
+        end
+
+        loop_op = for_op
+    elseif rtype == REGION_WHILE_LOOP
+        loop_op, phi_indices, phi_types = build_while_op(tree, code, blocks, ctx)
     else  # REGION_NATURAL_LOOP or other cyclic regions
-        build_loop_op(tree, code, blocks, ctx)
+        loop_op, phi_indices, phi_types = build_loop_op(tree, code, blocks, ctx)
     end
 
     # Allocate new SSA index for loop's tuple result
@@ -764,6 +784,162 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
 end
 
 """
+    build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
+        -> Tuple{ForOp, Vector{Int}, Vector{Any}}
+
+Build a ForOp directly from a REGION_FOR_LOOP control tree using metadata from CFG analysis.
+Returns (for_op, phi_indices, phi_types) where:
+- for_op: The constructed ForOp with bounds, step, IV, and body
+- phi_indices: SSA indices of the non-IV phi nodes (for getfield generation)
+- phi_types: Julia types of the non-IV phi nodes
+
+The ForOp structure:
+- lower: Lower bound from ForLoopInfo
+- upper: Upper bound (adjusted +1 if is_inclusive)
+- step: Step value from ForLoopInfo
+- iv_arg: BlockArg for the induction variable
+- body: Loop body statements + ContinueOp with carried values
+- init_values: Non-IV loop-carried values
+
+Pure structure building - no BlockArgs or substitutions.
+BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
+"""
+function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
+                             ctx::StructurizationContext)
+    stmts = code.code
+    types = code.ssavaluetypes
+    header_idx = node_index(tree)
+    loop_blocks = get_loop_blocks(tree, blocks)
+    for_info = metadata(tree)::ForLoopInfo
+
+    @assert 1 <= header_idx <= length(blocks) "Invalid header_idx from control tree: $header_idx"
+    header_block = blocks[header_idx]
+    stmt_to_blk = stmt_to_block_map(blocks, length(stmts))
+
+    # Extract phi info: separate IV from other loop-carried variables
+    iv_phi_idx = for_info.iv_phi_idx
+    all_phi_indices = Int[]
+    all_phi_types = Any[]
+    init_values = IRValue[]
+    carried_values = IRValue[]
+
+    for si in header_block.range
+        stmt = stmts[si]
+        if stmt isa PhiNode
+            push!(all_phi_indices, si)
+            push!(all_phi_types, types[si])
+            phi = stmt
+
+            entry_val = nothing
+            carried_val = nothing
+
+            for (edge_idx, _) in enumerate(phi.edges)
+                if isassigned(phi.values, edge_idx)
+                    val = phi.values[edge_idx]
+
+                    if val isa SSAValue
+                        val_stmt = val.id
+                        if val_stmt > 0 && val_stmt <= length(stmts)
+                            val_block = stmt_to_blk[val_stmt]
+                            if val_block ∈ loop_blocks
+                                carried_val = val
+                            else
+                                entry_val = convert_phi_value(val)
+                            end
+                        else
+                            entry_val = convert_phi_value(val)
+                        end
+                    else
+                        entry_val = convert_phi_value(val)
+                    end
+                end
+            end
+
+            # Skip IV for init_values and carried_values, handle separately
+            if si != iv_phi_idx
+                entry_val !== nothing && push!(init_values, entry_val)
+                carried_val !== nothing && push!(carried_values, carried_val)
+            end
+        end
+    end
+
+    # Build result phi_indices and phi_types (excluding IV)
+    phi_indices = Int[]
+    phi_types = Any[]
+    for (idx, typ) in zip(all_phi_indices, all_phi_types)
+        if idx != iv_phi_idx
+            push!(phi_indices, idx)
+            push!(phi_types, typ)
+        end
+    end
+
+    # Get IV type
+    iv_type = types[iv_phi_idx]
+
+    # Create a placeholder BlockArg for IV (will be properly created in apply_block_args!)
+    # For now, use a BlockArg with id=1 (IV is always first in ForOp's implicit args)
+    iv_arg = BlockArg(1, iv_type)
+
+    # Build the body block
+    body = Block()
+
+    # Collect header statements (excluding phi nodes and control flow)
+    for si in header_block.range
+        stmt = stmts[si]
+        if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
+            push!(body, si, stmt, types[si])
+        end
+    end
+
+    # Process loop body blocks (excluding header)
+    for child in children(tree)
+        child_idx = node_index(child)
+        if child_idx != header_idx
+            handle_block_region!(body, child, code, blocks, ctx)
+        end
+    end
+
+    # ContinueOp with non-IV carried values
+    body.terminator = ContinueOp(copy(carried_values))
+
+    # Build ForOp with bounds from ForLoopInfo
+    lower = convert_phi_value(for_info.lower)
+    upper = convert_phi_value(for_info.upper)
+    step = convert_phi_value(for_info.step)
+
+    # If is_inclusive (Julia's 1:n), we need upper+1 for exclusive semantics
+    # This is handled by inserting add_int in the parent block during handle_loop!
+    # For now, store the upper bound as-is; the adjustment will be made in
+    # apply_loop_patterns! replacement or a post-processing step
+
+    # Actually, since we're building directly, let's handle inclusive bounds here
+    # by allocating an SSA for add_int(upper, 1) if needed
+    if for_info.is_inclusive
+        # Allocate a synthesized SSA for the adjusted upper bound
+        adj_ssa_idx = ctx.next_ssa_idx
+        ctx.next_ssa_idx += 1
+
+        # The actual add_int expression will be inserted before ForOp
+        # For now, use SSAValue reference to the adjustment
+        upper = SSAValue(adj_ssa_idx)
+
+        # Store info for later (we'll handle this in handle_loop! by special-casing)
+        # Actually, let's just return a marker struct or modify the flow...
+
+        # Simpler approach: store the adjustment info and let handle_loop! insert it
+        # For now, we'll store the original upper and mark is_inclusive
+        # The adjustment can be done in handle_loop! before pushing the ForOp
+        # Let me reconsider...
+    end
+
+    for_op = ForOp(lower, for_info.is_inclusive ? for_info.upper : upper, step, iv_arg, body, init_values)
+
+    # Return the op along with a flag for is_inclusive handling
+    # Actually, we need to handle is_inclusive in handle_loop!, let me modify that instead
+    return for_op, phi_indices, phi_types, for_info.is_inclusive, for_info.upper
+end
+
+"""
     collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
 
 Collect all SSA indices defined by statements in the block (recursively).
@@ -822,7 +998,7 @@ function apply_block_args!(block::Block, ctx::StructurizationContext,
     end
 
     for stmt in statements(block.body)
-        if stmt isa LoopOp || stmt isa IfOp || stmt isa WhileOp
+        if stmt isa LoopOp || stmt isa IfOp || stmt isa WhileOp || stmt isa ForOp
             process_block_args!(stmt, ctx, defined, parent_subs)
         end
     end
@@ -912,5 +1088,44 @@ function process_block_args!(while_op::WhileOp, ctx::StructurizationContext,
     collect_defined_ssas!(nested_defined, after, ctx)
     apply_block_args!(before, ctx, nested_defined, merged_subs)
     apply_block_args!(after, ctx, nested_defined, merged_subs)
+end
+
+"""
+Create BlockArgs for a ForOp and substitute SSAValue references.
+
+ForOp has:
+- iv_arg: Induction variable BlockArg (already created in build_for_op)
+- body.args: BlockArgs for non-IV loop-carried values (created here)
+
+The IV is substituted specially; other loop-carried values follow the standard pattern.
+"""
+function process_block_args!(for_op::ForOp, ctx::StructurizationContext,
+                             parent_defined::Set{Int}, parent_subs::Substitutions)
+    body = for_op.body::Block
+    subs = Substitutions()
+
+    # ForOp's non-IV results are from init_values/ContinueOp
+    # The IV is handled separately and already has a BlockArg in for_op.iv_arg
+
+    # Create BlockArgs for non-IV loop-carried values
+    # These start at index 2 (index 1 is the IV)
+    for (i, init_val) in enumerate(for_op.init_values)
+        # Determine the type from the init value
+        phi_type = if init_val isa SSAValue
+            ctx.ssavaluetypes[init_val.id]
+        else
+            typeof(init_val)
+        end
+        new_arg = BlockArg(i + 1, phi_type)  # +1 because IV is at index 1
+        push!(body.args, new_arg)
+    end
+
+    # Apply parent substitutions to body
+    apply_substitutions!(body, parent_subs)
+
+    # Recurse into nested control flow
+    nested_defined = Set{Int}()
+    collect_defined_ssas!(nested_defined, body, ctx)
+    apply_block_args!(body, ctx, nested_defined, parent_subs)
 end
 

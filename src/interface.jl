@@ -3,7 +3,7 @@
 export code_structured, structurize!, StructuredCodeInfo
 
 """
-    code_structured(f, argtypes; validate=true, loop_patterning=true, kwargs...) -> StructuredCodeInfo
+    code_structured(f, argtypes; validate=true, kwargs...) -> StructuredCodeInfo
 
 Get the structured IR for a function with the given argument types.
 
@@ -15,11 +15,12 @@ control flow restructured into nested SCF-style operations (if/for/while).
 - `argtypes`: Argument types as a tuple of types (e.g., `(Int, Float64)`)
 - `validate`: Whether to validate that all control flow was properly structured (default: true).
   When `true`, throws `UnstructuredControlFlowError` if any unstructured control flow remains.
-- `loop_patterning`: Whether to apply loop pattern detection (default: true).
-  When `true`, WhileOp (condition-based) may be upgraded to ForOp (bounded counters) if patterns match.
-  When `false`, loops remain as WhileOp (for REGION_WHILE_LOOP) or LoopOp (for REGION_NATURAL_LOOP).
 
 Other keyword arguments are passed to `code_typed`.
+
+ForOp is created directly during CFG analysis for loops that match counting patterns
+(while i < n with i += step, or for i in 1:n). WhileOp is used for condition-at-header
+loops that don't match counting patterns. LoopOp is used for general cyclic regions.
 
 # Returns
 A `StructuredCodeInfo` that displays with MLIR SCF-style syntax showing
@@ -43,19 +44,18 @@ StructuredCodeInfo {
 }
 
 julia> code_structured(f, Tuple{Int}; validate=false)  # skip validation
-julia> code_structured(f, Tuple{Int}; loop_patterning=false)  # all loops as LoopOp
 ```
 """
 function code_structured(@nospecialize(f), @nospecialize(argtypes);
-                         validate::Bool=true, loop_patterning::Bool=true, kwargs...)
+                         validate::Bool=true, kwargs...)
     ci, _ = only(code_typed(f, argtypes; kwargs...))
     sci = StructuredCodeInfo(ci)
-    structurize!(sci; validate, loop_patterning)
+    structurize!(sci; validate)
     return sci
 end
 
 """
-    structurize!(sci::StructuredCodeInfo; validate=true, loop_patterning=true) -> StructuredCodeInfo
+    structurize!(sci::StructuredCodeInfo; validate=true) -> StructuredCodeInfo
 
 Convert unstructured control flow in `sci` to structured control flow operations
 (IfOp, ForOp, WhileOp, LoopOp) in-place.
@@ -63,13 +63,12 @@ Convert unstructured control flow in `sci` to structured control flow operations
 This transforms GotoNode and GotoIfNot statements into nested structured ops
 that can be traversed hierarchically.
 
-When `loop_patterning=true` (default), WhileOp may be upgraded to ForOp if bounded counter
-patterns are detected. When `false`, loops remain as WhileOp (for simple while loops) or
-LoopOp (for complex cyclic regions).
+ForOp is created directly during CFG analysis for loops matching counting patterns.
+WhileOp is used for condition-at-header loops. LoopOp is used for general cyclic regions.
 
 Returns `sci` for convenience (allows chaining).
 """
-function structurize!(sci::StructuredCodeInfo; validate::Bool=true, loop_patterning::Bool=true)
+function structurize!(sci::StructuredCodeInfo; validate::Bool=true)
     code = sci.code
     stmts = code.code
     types = code.ssavaluetypes
@@ -79,19 +78,15 @@ function structurize!(sci::StructuredCodeInfo; validate::Bool=true, loop_pattern
 
     ctx = StructurizationContext(types, n + 1)
 
-    # Build block-level CFG
+    # Build block-level CFG and convert to control tree
     blocks, cfg = build_block_cfg(code)
+    ctree = ControlTree(cfg, code, blocks)
 
-    ctree = ControlTree(cfg)
+    # Build structured IR
     entry = control_tree_to_structured_ir(ctree, code, blocks, ctx)
     validate && validate_scf(entry)
     apply_block_args!(entry, ctx)
     validate && validate_no_phis(entry)
-
-    if loop_patterning
-        apply_loop_patterns!(entry, ctx)
-    end
-
     sci.entry = entry
 
     return sci
