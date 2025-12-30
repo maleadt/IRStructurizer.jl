@@ -1,6 +1,42 @@
 # Pattern matching and loop upgrades (LoopOp → ForOp/WhileOp)
 
 #=============================================================================
+ Getfield Helper Functions (for tuple+getfield loop result handling)
+=============================================================================#
+
+"""
+    find_getfields_for(block::Block, loop_ssa::SSAValue) -> Vector{NamedTuple}
+
+Find all getfield expressions in the block that reference the given loop SSA value.
+Returns a vector of (ssa_idx, field_idx) named tuples.
+"""
+function find_getfields_for(block::Block, loop_ssa::SSAValue)
+    getfields = NamedTuple{(:ssa_idx, :field_idx), Tuple{Int, Int}}[]
+    for (idx, entry) in block.body
+        expr = entry.stmt
+        if expr isa Expr && expr.head === :call &&
+           length(expr.args) >= 3 && expr.args[1] === Core.getfield &&
+           expr.args[2] == loop_ssa
+            push!(getfields, (ssa_idx=idx, field_idx=expr.args[3]))
+        end
+    end
+    return getfields
+end
+
+"""
+    remove_stmt!(block::Block, ssa_idx::Int)
+
+Remove a statement from the block by its SSA index.
+"""
+function remove_stmt!(block::Block, ssa_idx::Int)
+    new_body = SSAVector()
+    for (idx, entry) in block.body
+        idx == ssa_idx || push!(new_body, (idx, entry.stmt, entry.typ))
+    end
+    block.body = new_body
+end
+
+#=============================================================================
  Helper Functions (Pattern matching on structured IR)
 =============================================================================#
 
@@ -129,34 +165,50 @@ end
 
 Upgrade LoopOp to ForOp/WhileOp where patterns match.
 Creates new ops and replaces them in the block body.
-When upgrading to ForOp, re-keys the op if the IV was the first result.
+
+For ForOp upgrades:
+- The loop's key remains unchanged (no re-keying)
+- The IV's getfield statement is removed from the parent block
+- Remaining getfield indices are adjusted to account for the removed IV
 """
 function apply_loop_patterns!(block::Block, ctx::StructurizationContext)
-    # Collect replacements: (old_idx => (new_op, new_key))
-    replacements = Dict{Int, Tuple{ControlFlowOp, Int}}()
+    # Collect upgrades: (loop_key => (new_op, iv_getfield_idx, iv_field_idx))
+    # iv_getfield_idx: SSA index of the IV's getfield (to remove), or nothing for WhileOp
+    # iv_field_idx: field index of the IV in the tuple (to adjust other getfields)
+    upgrades = Dict{Int, Tuple{ControlFlowOp, Union{Nothing, Int}, Int}}()
 
     for (idx, entry) in block.body
         if entry.stmt isa LoopOp
-            result = try_upgrade_loop(entry.stmt, ctx, idx)
+            result = try_upgrade_loop(entry.stmt, ctx, idx, block)
             if result !== nothing
-                new_op, new_key = result
-                replacements[idx] = (new_op, new_key)
+                upgrades[idx] = result
             end
         end
     end
 
-    # Apply replacements and recurse
-    if !isempty(replacements)
+    # Apply upgrades: replace LoopOp with ForOp/WhileOp (same key!)
+    if !isempty(upgrades)
         new_body = SSAVector()
         for (old_key, entry) in block.body
-            if haskey(replacements, old_key)
-                new_op, new_key = replacements[old_key]
-                push!(new_body, (new_key, new_op, entry.typ))
+            if haskey(upgrades, old_key)
+                new_op, _, _ = upgrades[old_key]
+                # Update result type: ForOp has one fewer result than LoopOp
+                new_typ = compute_upgraded_type(entry.typ, upgrades[old_key])
+                push!(new_body, (old_key, new_op, new_typ))
             else
                 push!(new_body, (old_key, entry.stmt, entry.typ))
             end
         end
         block.body = new_body
+
+        # Remove IV getfields and adjust remaining getfield indices
+        for (loop_key, (new_op, iv_getfield_idx, iv_field_idx)) in upgrades
+            if new_op isa ForOp && iv_getfield_idx !== nothing
+                remove_stmt!(block, iv_getfield_idx)
+                # Adjust remaining getfield indices for this loop
+                adjust_getfield_indices!(block, loop_key, iv_field_idx)
+            end
+        end
     end
 
     # Recurse into all control flow ops (including newly created ones)
@@ -176,14 +228,63 @@ function apply_loop_patterns!(block::Block, ctx::StructurizationContext)
 end
 
 """
-    try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int) -> Union{Tuple{ControlFlowOp, Int}, Nothing}
+    compute_upgraded_type(old_typ, upgrade_info) -> Type
+
+Compute the new result type after ForOp upgrade (one fewer result due to IV removal).
+Always returns a Tuple type (uniform handling in codegen).
+"""
+function compute_upgraded_type(@nospecialize(old_typ), upgrade_info)
+    new_op, _, iv_field_idx = upgrade_info
+
+    # WhileOp keeps all results
+    !(new_op isa ForOp) && return old_typ
+
+    # Must be a Tuple type (uniform loop result handling)
+    @assert old_typ <: Tuple "Expected Tuple type for loop results, got $old_typ"
+
+    # Remove the IV's type from the tuple
+    params = collect(old_typ.parameters)
+    deleteat!(params, iv_field_idx)
+
+    # Always return Tuple (may be empty Tuple{})
+    return Tuple{params...}
+end
+
+"""
+    adjust_getfield_indices!(block::Block, loop_key::Int, removed_field_idx::Int)
+
+Adjust getfield field indices after removing the IV's getfield.
+All getfields referencing the loop with field index > removed_field_idx
+have their field index decremented.
+"""
+function adjust_getfield_indices!(block::Block, loop_key::Int, removed_field_idx::Int)
+    loop_ssa = SSAValue(loop_key)
+    for (idx, entry) in block.body
+        expr = entry.stmt
+        if expr isa Expr && expr.head === :call &&
+           length(expr.args) >= 3 && expr.args[1] === Core.getfield &&
+           expr.args[2] == loop_ssa
+            old_field = expr.args[3]
+            if old_field > removed_field_idx
+                expr.args[3] = old_field - 1
+            end
+        end
+    end
+end
+
+"""
+    try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+        -> Union{Tuple{ControlFlowOp, Union{Nothing, Int}, Int}, Nothing}
 
 Try to upgrade a LoopOp to ForOp or WhileOp.
-Returns (new_op, new_key) if upgraded, or nothing if not upgraded.
+Returns (new_op, iv_getfield_idx, iv_field_idx) if upgraded, or nothing if not upgraded.
+- new_op: The ForOp or WhileOp
+- iv_getfield_idx: SSA index of the IV's getfield to remove (ForOp only, nothing for WhileOp)
+- iv_field_idx: Field index of the IV in the tuple (for adjusting other getfields)
 """
-function try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int)
+function try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
     # Try ForOp pattern first
-    result = try_upgrade_to_for(loop, ctx, current_key)
+    result = try_upgrade_to_for(loop, ctx, current_key, parent_block)
     if result !== nothing
         return result
     end
@@ -191,24 +292,25 @@ function try_upgrade_loop(loop::LoopOp, ctx::StructurizationContext, current_key
     # Try WhileOp pattern
     while_op = try_upgrade_to_while(loop, ctx)
     if while_op !== nothing
-        return (while_op, current_key)  # WhileOp doesn't change keying
+        return (while_op, nothing, 0)  # WhileOp doesn't remove any getfields
     end
 
     return nothing
 end
 
 """
-    try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int) -> Union{Tuple{ForOp, Int}, Nothing}
+    try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
+        -> Union{Tuple{ForOp, Union{Nothing, Int}, Int}, Nothing}
 
 Try to upgrade a LoopOp to ForOp by detecting the for-loop pattern.
-Returns (ForOp, new_key) if upgraded, or nothing if not upgraded.
-The new key is the first non-IV result's SSA index (needed for correct result storage in codegen).
+Returns (ForOp, iv_getfield_idx, iv_field_idx) if upgraded, or nothing if not upgraded.
+- ForOp: The created ForOp
+- iv_getfield_idx: SSA index of the IV's getfield statement to remove (or nothing if not found)
+- iv_field_idx: Field index of the IV in the tuple (for adjusting other getfields)
 """
-function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int)
+function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_key::Int, parent_block::Block)
     body = loop.body::Block
     n_iter_args = length(loop.iter_args)
-
-    original_result_indices = derive_result_vars(loop)
 
     # Find the IfOp in the loop body - this contains the condition check
     condition_ifop = find_ifop(body)
@@ -266,12 +368,13 @@ function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_k
         j != iv_idx && push!(other_iter_args, v)
     end
 
-    # Compute the new key: first non-IV result's SSA index
-    # If no non-IV results, keep the current key
-    new_key = current_key
-    for (j, rv) in enumerate(original_result_indices)
-        if j != iv_idx
-            new_key = rv.id
+    # Find the IV's getfield in the parent block
+    loop_ssa = SSAValue(current_key)
+    getfields = find_getfields_for(parent_block, loop_ssa)
+    iv_getfield_idx = nothing
+    for gf in getfields
+        if gf.field_idx == iv_idx
+            iv_getfield_idx = gf.ssa_idx
             break
         end
     end
@@ -315,7 +418,7 @@ function try_upgrade_to_for(loop::LoopOp, ctx::StructurizationContext, current_k
     # Create ForOp
     for_op = ForOp(lower_bound, upper_bound, step, iv_arg, new_body, other_iter_args)
 
-    return (for_op, new_key)
+    return (for_op, iv_getfield_idx, iv_idx)
 end
 
 """

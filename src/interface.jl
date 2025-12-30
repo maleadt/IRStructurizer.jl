@@ -76,7 +76,7 @@ function structurize!(sci::StructuredCodeInfo; validate::Bool=true, loop_pattern
 
     n == 0 && return sci
 
-    ctx = StructurizationContext(types)
+    ctx = StructurizationContext(types, n + 1)
 
     # Build block-level CFG
     blocks, cfg = build_block_cfg(code)

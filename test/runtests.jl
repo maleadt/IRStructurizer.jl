@@ -439,20 +439,20 @@ end
     sci = code_structured(nested_count, Tuple{Int, Int})
     @test sci isa StructuredCodeInfo
 
-    # Entry: [init_expr, outer_ForOp]
-    @test length(sci.entry.body) == 2
-    @test !(sci.entry.body[1].stmt isa ControlFlowOp)
-    @test sci.entry.body[2].stmt isa ForOp
+    # Entry: [init_expr, outer_ForOp, getfield(s)...]
+    # Find the outer ForOp
+    outer_loop_idx = findfirst(stmt -> stmt isa ForOp, collect(statements(sci.entry.body)))
+    @test outer_loop_idx !== nothing
 
-    outer_loop = sci.entry.body[2].stmt
+    outer_loop = collect(statements(sci.entry.body))[outer_loop_idx]
     outer_body = outer_loop.body
 
-    # Outer body: [init_expr, inner_ForOp]
-    @test length(outer_body.body) == 2
-    @test !(outer_body.body[1].stmt isa ControlFlowOp)
-    @test outer_body.body[2].stmt isa ForOp
+    # Outer body: [init_expr, inner_ForOp, getfield(s)...]
+    # Find the inner ForOp
+    inner_loop_idx = findfirst(stmt -> stmt isa ForOp, collect(statements(outer_body.body)))
+    @test inner_loop_idx !== nothing
 
-    inner_loop = outer_body.body[2].stmt
+    inner_loop = collect(statements(outer_body.body))[inner_loop_idx]
     inner_body = inner_loop.body
 
     # Inner loop has its own structure
@@ -513,11 +513,11 @@ end
     sci = code_structured(countdown, Tuple{Int})
     @test sci isa StructuredCodeInfo
 
-    # Entry should have items, last is a loop op
+    # Entry should have items, find the loop op
     @test !isempty(sci.entry.body)
-    loop_op = sci.entry.body[length(sci.entry.body)].stmt
-    # Could be :for, :while, or :loop depending on pattern detection
-    @test loop_op isa ForOp || loop_op isa WhileOp || loop_op isa LoopOp
+    # Find any loop op in the body (could be followed by getfield statements)
+    loop_ops = filter(x -> x isa ForOp || x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
+    @test !isempty(loop_ops)
 end
 
 end  # WhileOp detection
@@ -749,9 +749,9 @@ end
     while_idx = findfirst(stmt -> stmt isa WhileOp, collect(statements(sci.entry.body)))
 
     if while_idx !== nothing
-        # Check that the result type is Nothing (no results), not Int (outer capture type)
+        # Check that the result type is Tuple{} (no results), not Int (outer capture type)
         result_type = sci.entry.body[while_idx].typ
-        @test result_type === Nothing
+        @test result_type === Tuple{}
     end
 end
 

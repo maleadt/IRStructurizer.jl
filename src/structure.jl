@@ -205,20 +205,27 @@ function handle_if_then_else!(block::Block, tree::ControlTree, code::CodeInfo, b
 
     if_op = IfOp(cond_value, then_blk, else_blk)
 
-    # Key by first merge phi's SSA index if available, else by GotoIfNot
+    # Allocate synthesized SSA index for IfOp
+    if_result_idx = ctx.next_ssa_idx
+    ctx.next_ssa_idx += 1
+
+    # Always use Tuple type for IfOp results (uniform handling in codegen)
     if !isempty(merge_phis)
-        result_idx = merge_phis[1].ssa_idx
-        result_types = [ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
-        if length(result_types) == 1
-            result_type = result_types[1]
-        else
-            result_type = Tuple{result_types...}
+        phi_types = [ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
+        result_type = Tuple{phi_types...}
+        push!(block, if_result_idx, if_op, result_type)
+
+        # Generate getfield statements at original phi indices
+        # This preserves SSA reference semantics: `return %7` still works because getfield is at %7
+        for (i, phi) in enumerate(merge_phis)
+            getfield_expr = Expr(:call, Core.getfield, SSAValue(if_result_idx), i)
+            push!(block, phi.ssa_idx, getfield_expr, phi_types[i])
         end
     else
-        result_idx = gotoifnot_idx !== nothing ? gotoifnot_idx : last(blocks[cond_idx].range)
-        result_type = Nothing
+        # No results - still use Tuple{} for uniformity
+        result_type = Tuple{}
+        push!(block, if_result_idx, if_op, result_type)
     end
-    push!(block, result_idx, if_op, result_type)
 end
 
 """
@@ -366,21 +373,32 @@ end
     handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
 Handle REGION_WHILE_LOOP and REGION_NATURAL_LOOP.
-Phase 1: Always creates LoopOp with metadata. Pattern matching happens in Phase 3.
+Phase 1: Creates LoopOp and generates getfield statements for result extraction.
+
+The loop is keyed at a synthesized SSA index, and getfield statements are generated
+at the original phi node indices. This ensures that references like `return %2`
+continue to work because getfield is placed at %2.
 """
 function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                       ctx::StructurizationContext)
-    loop_op = build_loop_op(tree, code, blocks, ctx)
-    results = derive_result_vars(loop_op)
-    if !isempty(results)
-        # Key by first result phi's SSA index
-        push!(block, results[1].id, loop_op, Nothing)
-    else
-        # Spin loops with no loop-carried variables have no result phis.
-        # Use the header's last statement (typically GotoIfNot) as the key.
-        header_idx = node_index(tree)
-        @assert 1 <= header_idx <= length(blocks) "Invalid header index: $header_idx"
-        push!(block, last(blocks[header_idx].range), loop_op, Nothing)
+    loop_op, phi_indices, phi_types = build_loop_op(tree, code, blocks, ctx)
+
+    # Allocate new SSA index for loop's tuple result
+    loop_result_idx = ctx.next_ssa_idx
+    ctx.next_ssa_idx += 1
+
+    # Always use Tuple type for loop results (uniform handling in codegen)
+    # Empty phi_indices produces Tuple{} which is fine
+    result_type = Tuple{phi_types...}
+
+    # Push loop op at synthesized index
+    push!(block, loop_result_idx, loop_op, result_type)
+
+    # Generate getfield statements at original phi indices
+    # This preserves SSA reference semantics: `return %2` still works because getfield is at %2
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+        getfield_expr = Expr(:call, Core.getfield, SSAValue(loop_result_idx), i)
+        push!(block, phi_idx, getfield_expr, phi_type)
     end
 end
 
@@ -497,13 +515,20 @@ end
 =============================================================================#
 
 """
-    build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext) -> LoopOp
+    build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
+        -> Tuple{LoopOp, Vector{Int}, Vector{Any}}
 
-Build a LoopOp from a control tree. Pure structure building - no BlockArgs or substitutions.
+Build a LoopOp from a control tree and return phi node information.
+Returns (loop_op, phi_indices, phi_types) where:
+- loop_op: The constructed LoopOp
+- phi_indices: SSA indices of the header phi nodes (for getfield generation)
+- phi_types: Julia types of the header phi nodes
+
+Pure structure building - no BlockArgs or substitutions.
 BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
 """
 function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
-                              ctx::StructurizationContext)
+                                     ctx::StructurizationContext)
     stmts = code.code
     types = code.ssavaluetypes
     header_idx = node_index(tree)
@@ -515,12 +540,14 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
 
     iter_args = IRValue[]
     carried_values = IRValue[]
-    result_ssa_indices = SSAValue[]
+    phi_indices = Int[]
+    phi_types = Any[]
 
     for si in header_block.range
         stmt = stmts[si]
         if stmt isa PhiNode
-            push!(result_ssa_indices, SSAValue(si))
+            push!(phi_indices, si)
+            push!(phi_types, types[si])
             phi = stmt
 
             entry_val = nothing
@@ -591,7 +618,9 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
         then_blk.terminator = ContinueOp(copy(carried_values))
 
         else_blk = Block()
-        else_blk.terminator = BreakOp(IRValue[rv for rv in result_ssa_indices])
+        # BreakOp carries SSAValues of the phi nodes - these will be substituted to
+        # BlockArgs later by apply_block_args! (since substitute_terminator now handles BreakOp)
+        else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
 
         if_op = IfOp(cond_value, then_blk, else_blk)
         push!(body, condition_idx, if_op, Nothing)
@@ -608,7 +637,7 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
 
     # Create loop op with iter_args
     loop_op = LoopOp(body, iter_args)
-    return loop_op
+    return loop_op, phi_indices, phi_types
 end
 
 """
@@ -620,6 +649,9 @@ Also includes results from control flow ops (phi nodes define SSAValues).
 function collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
     for (idx, entry) in block.body
         if entry.stmt isa ControlFlowOp
+            # Add the control flow op's own index (e.g., loop's synthesized index)
+            push!(defined, idx)
+            # Add any additional result indices (phi indices from derive_result_vars)
             for rv in derive_result_vars(entry.stmt)
                 push!(defined, rv.id)
             end

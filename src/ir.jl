@@ -257,9 +257,11 @@ Base.eltype(::Type{Block}) = Tuple{Int,Any,Any}
 Context for IR construction (Phases 1-5). Holds metadata that shouldn't be part
 of the IR node types themselves:
 - ssavaluetypes: Julia types for each SSA value (from CodeInfo)
+- next_ssa_idx: Next available SSA index for synthesized values (e.g., loop tuples)
 """
-struct StructurizationContext
+mutable struct StructurizationContext
     ssavaluetypes::Any  # Vector of types (from CodeInfo.ssavaluetypes)
+    next_ssa_idx::Int   # Next available SSA index for synthesized values
 end
 
 #=============================================================================
@@ -491,7 +493,8 @@ function substitute_terminator(term::ContinueOp, subs::Substitutions)
 end
 
 function substitute_terminator(term::BreakOp, subs::Substitutions)
-    return term
+    new_values = [substitute_ssa(v, subs) for v in term.values]
+    return BreakOp(new_values)
 end
 
 function substitute_terminator(term::ConditionOp, subs::Substitutions)
@@ -1034,9 +1037,9 @@ function print_block_body(p::IRPrinter, block::Block; inside_region::Bool=false,
             if is_last && is_last_region
                 # Cascade the closing - don't use └── here (is_last=false), and increment cascade_depth
                 # so the nested op knows to close this level too
-                print_control_flow(p, item[3], item[2]; is_last=false, cascade_depth=cascade_depth + 1)
+                print_control_flow(p, item[3], item[2], item[4]; is_last=false, cascade_depth=cascade_depth + 1)
             else
-                print_control_flow(p, item[3], item[2]; is_last=is_last, cascade_depth=cascade_depth)
+                print_control_flow(p, item[3], item[2], item[4]; is_last=is_last, cascade_depth=cascade_depth)
             end
         else  # :term
             if inside_region
@@ -1159,12 +1162,12 @@ function print_terminator_values(p::IRPrinter, values)
 end
 
 # Print ControlFlowOp (final type, dispatches via multiple dispatch)
-print_control_flow(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_if_op_final(p, op, pos; is_last, cascade_depth)
-print_control_flow(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_for_op_final(p, op, pos; is_last, cascade_depth)
-print_control_flow(p::IRPrinter, op::WhileOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_while_op_final(p, op, pos; is_last, cascade_depth)
-print_control_flow(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0) = print_loop_op_final(p, op, pos; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0) = print_if_op_final(p, op, pos, result_type; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0) = print_for_op_final(p, op, pos, result_type; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0) = print_while_op_final(p, op, pos, result_type; is_last, cascade_depth)
+print_control_flow(p::IRPrinter, op::LoopOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0) = print_loop_op_final(p, op, pos, result_type; is_last, cascade_depth)
 
-function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0)
     # When cascade_depth > 0, keep │ going (don't use └──) so inner content can close it
     use_closing = is_last && cascade_depth == 0
     prefix = use_closing ? "└──" : "├──"
@@ -1181,6 +1184,13 @@ function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false
 
     print(p.io, "if ")
     print_value(p, op.condition)
+
+    # Show return type annotation
+    if result_type !== nothing
+        print_colored(p, " -> ", :light_black)
+        print_colored(p, string(result_type), :cyan)
+    end
+
     println(p.io)
 
     # Print "then:" region header
@@ -1199,7 +1209,7 @@ function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int; is_last::Bool=false
     print_block_body(else_body_p, op.else_region; inside_region=true, is_last_region=true, cascade_depth=cascade_depth)
 end
 
-function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0)
     # When cascade_depth > 0, keep │ going so inner content can close it
     use_closing = is_last && cascade_depth == 0
     prefix = use_closing ? "└──" : "├──"
@@ -1226,6 +1236,12 @@ function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=fal
         print_loop_args(p, op.body.args, op.iter_args)
     end
 
+    # Show return type annotation
+    if result_type !== nothing
+        print_colored(p, " -> ", :light_black)
+        print_colored(p, string(result_type), :cyan)
+    end
+
     println(p.io)
 
     # Body is inline (no region header for single-region ops)
@@ -1235,7 +1251,7 @@ function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int; is_last::Bool=fal
     print_block_body(body_p, op.body; is_last_region=true, cascade_depth=cascade_depth)
 end
 
-function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0)
     # When cascade_depth > 0, keep │ going so inner content can close it
     use_closing = is_last && cascade_depth == 0
     prefix = use_closing ? "└──" : "├──"
@@ -1252,6 +1268,11 @@ function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=f
 
     print_colored(p, "loop", :yellow)
     print_loop_args(p, op.body.args, op.iter_args)
+    # Show return type annotation
+    if result_type !== nothing
+        print_colored(p, " -> ", :light_black)
+        print_colored(p, string(result_type), :cyan)
+    end
     println(p.io)
 
     # Body is inline (no region header for single-region ops)
@@ -1261,7 +1282,7 @@ function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int; is_last::Bool=f
     print_block_body(body_p, op.body; is_last_region=true, cascade_depth=cascade_depth)
 end
 
-function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int; is_last::Bool=false, cascade_depth::Int=0)
+function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize(result_type); is_last::Bool=false, cascade_depth::Int=0)
     # When cascade_depth > 0, keep │ going so inner content can close it
     use_closing = is_last && cascade_depth == 0
     prefix = use_closing ? "└──" : "├──"
@@ -1278,6 +1299,11 @@ function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int; is_last::Bool
 
     print_colored(p, "while", :yellow)
     print_loop_args(p, op.before.args, op.iter_args)
+    # Show return type annotation
+    if result_type !== nothing
+        print_colored(p, " -> ", :light_black)
+        print_colored(p, string(result_type), :cyan)
+    end
     println(p.io)
 
     # Print "before" region header
