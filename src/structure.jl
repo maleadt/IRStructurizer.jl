@@ -77,10 +77,6 @@ function tree_to_block(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
         handle_termination!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_SELF_LOOP
-        handle_self_loop!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_PROPER
-        handle_proper_region!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SWITCH
         handle_switch!(block, tree, code, blocks, ctx)
     else
@@ -141,10 +137,6 @@ function handle_nested_region!(block::Block, tree::ControlTree, code::CodeInfo, 
         handle_termination!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_SELF_LOOP
-        handle_self_loop!(block, tree, code, blocks, ctx)
-    elseif rtype == REGION_PROPER
-        handle_proper_region!(block, tree, code, blocks, ctx)
     elseif rtype == REGION_SWITCH
         handle_switch!(block, tree, code, blocks, ctx)
     else
@@ -429,34 +421,6 @@ function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::V
         getfield_expr = Expr(:call, Core.getfield, SSAValue(loop_result_idx), i)
         push!(block, phi_idx, getfield_expr, phi_type)
     end
-end
-
-"""
-    handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
-
-Handle REGION_SELF_LOOP.
-"""
-function handle_self_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
-                           ctx::StructurizationContext)
-    idx = node_index(tree)
-    @assert 1 <= idx <= length(blocks) "Invalid block index from control tree: $idx"
-
-    body_blk = Block()
-    collect_block_statements!(body_blk, blocks[idx], code)
-
-    loop_op = LoopOp(body_blk, IRValue[])
-    push!(block, last(blocks[idx].range), loop_op, Nothing)
-end
-
-"""
-    handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
-
-Handle REGION_PROPER - acyclic region not matching other patterns.
-"""
-function handle_proper_region!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
-                               ctx::StructurizationContext)
-    # Process as a sequence of blocks
-    handle_block_region!(block, tree, code, blocks, ctx)
 end
 
 """

@@ -17,12 +17,9 @@ Single-entry control-flow structure which is classified according to well-specif
     REGION_IF_THEN_ELSE
     REGION_SWITCH
     REGION_TERMINATION
-    REGION_PROPER
-    REGION_SELF_LOOP
     REGION_FOR_LOOP
     REGION_WHILE_LOOP
     REGION_NATURAL_LOOP
-    REGION_IMPROPER
 end
 
 "Sequence of blocks `u` ─→ [`v`, `vs...`] ─→ `w`"
@@ -38,16 +35,10 @@ Acyclic region which contains a block `v` with multiple branches, including one 
 The region is composed of `v` and all the `wᵢ`.
 """
 REGION_TERMINATION
-"Acyclic region which does not match any other acyclic patterns."
-REGION_PROPER
-"Single node region which exhibits a self-loop."
-REGION_SELF_LOOP
 "Simple cycling region made of a condition block `u`, a loop body block `v` and a merge block `w` such that `v` ⇆ `u` ─→ `w`."
 REGION_WHILE_LOOP
 "Single-entry cyclic region with varying complexity such that the entry point dominates all nodes in the cyclic structure."
 REGION_NATURAL_LOOP
-"Single-entry region containing a multiple-entry cyclic region, such that the single entry is the least common dominator of all cycle entry nodes."
-REGION_IMPROPER
 
 # Define active patterns for use in pattern matching with MLStyle.
 
@@ -78,11 +69,6 @@ REGION_IMPROPER
     end
     length(vs) == 1 && return nothing
     Some(vs)
-end
-
-@active self_loop(args) begin
-    (g, v) = args
-    in(v, outneighbors(g, v))
 end
 
 @active if_then_region(args) begin
@@ -482,7 +468,6 @@ end
 function cyclic_region!(sccs, g, v, ec, doms, domtrees, backedges, code, blocks)
     # Try to match while-loop pattern first
     matched = @match (g, v) begin
-        self_loop() => (REGION_SELF_LOOP, eltype(g)[], nothing)
         while_loop(cond, body, merge) => begin
             # Try for-loop detection on while-loop structure
             for_info = try_detect_for_loop_while(cond, body, code, blocks)
@@ -516,23 +501,8 @@ function cyclic_region!(sccs, g, v, ec, doms, domtrees, backedges, code, blocks)
         end
     end
 
-    # Improper region.
-    length(entry_edges) < 2 && return nothing
-    entry_points = unique!(map(e -> e.src, collect(entry_edges)))
-    entry = common_ancestor(domtrees[v], [domtrees[ep] for ep in entry_points])
-    @assert !isnothing(entry) "Multiple-entry cyclic region encountered with no single dominator"
-    entry_node_v = node_index(entry)
-    vs = [entry_node_v]
-    exclude_vertices = [entry_node_v]
-    mec_entries = unique!(map(e -> e.dst, collect(entry_edges)))
-    for v in vertices(g)
-        v == entry_node_v && continue
-        !has_path(g, entry_node_v, v) && continue
-        any(has_path(g, v, ep; exclude_vertices) for ep in mec_entries) && push!(vs, v)
-    end
-    # XXX: Might be that vertices are not topologically sorted.
-    # If so, we may need to come up with one possible post-order traversal.
-    (REGION_IMPROPER, vs, nothing)
+    # Irreducible control flow - not supported
+    return nothing
 end
 
 function acyclic_region(g, v)
@@ -643,27 +613,23 @@ function ControlTree(cfg::AbstractGraph{T}, code::CodeInfo, blocks) where {T}
         update_control_tree!(control_trees, v, ws, region_type, region_meta)
 
         # Merge region vertices.
-        if region_type ≠ REGION_SELF_LOOP
-            for w in ws
-                delete!(control_trees, w)
+        for w in ws
+            delete!(control_trees, w)
 
-                # Adjust back-edges and retreating edges.
-                for w′ in outneighbors(abstract_graph, w)
-                    e = Edge(w, w′)
-                    if in(e, bedges)
-                        delete!(bedges, e)
-                        push!(bedges, Edge(v, w′))
-                    end
-                    if in(e, ec.retreating_edges)
-                        delete!(ec.retreating_edges, e)
-                        push!(ec.retreating_edges, Edge(v, w′))
-                    end
+            # Adjust back-edges and retreating edges.
+            for w′ in outneighbors(abstract_graph, w)
+                e = Edge(w, w′)
+                if in(e, bedges)
+                    delete!(bedges, e)
+                    push!(bedges, Edge(v, w′))
                 end
-
-                merge_vertices!(abstract_graph, v, w)
-                rem_edge!(abstract_graph, v, v)
+                if in(e, ec.retreating_edges)
+                    delete!(ec.retreating_edges, e)
+                    push!(ec.retreating_edges, Edge(v, w′))
+                end
             end
-        else
+
+            merge_vertices!(abstract_graph, v, w)
             rem_edge!(abstract_graph, v, v)
         end
 
@@ -705,12 +671,8 @@ function compact_blocks(control_trees, v, ws, region, region_meta=nothing)
     ControlTree(ControlNode(v, region, region_meta), nodes)
 end
 
-function is_structured(ctree::ControlTree)
-    all(PreOrderDFS(ctree)) do tree
-        node = nodevalue(tree)
-        !in(node.region_type, (REGION_PROPER, REGION_IMPROPER, REGION_SELF_LOOP))
-    end
-end
+"All remaining region types are structured (unstructured types were removed)."
+is_structured(::ControlTree) = true
 
 function outermost_tree(ctree::ControlTree, v::Integer)
     for subtree in PreOrderDFS(ctree)
