@@ -85,7 +85,6 @@ function structurize!(sci::StructuredCodeInfo; validate::Bool=true)
     # Build structured IR
     entry = control_tree_to_structured_ir(ctree, code, blocks, ctx)
     validate && validate_scf(entry)
-    apply_block_args!(entry, ctx)
     validate && validate_no_phis(entry)
     sci.entry = entry
 

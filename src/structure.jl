@@ -520,9 +520,6 @@ Returns (while_op, phi_indices, phi_types) where:
 The WhileOp structure:
 - before: header statements + ConditionOp(condition, carried_args)
 - after: body statements + YieldOp(carried_values)
-
-Pure structure building - no BlockArgs or substitutions.
-BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
 """
 function build_while_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                         ctx::StructurizationContext)
@@ -617,6 +614,17 @@ function build_while_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockI
     # YieldOp carries values back to the loop header
     after.terminator = YieldOp(copy(carried_values))
 
+    # Create BlockArgs and apply substitutions immediately
+    subs = Substitutions()
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+        arg = BlockArg(i, phi_type)
+        push!(before.args, arg)
+        push!(after.args, BlockArg(i, phi_type))  # Matching BlockArg for after region
+        subs[phi_idx] = arg
+    end
+    apply_substitutions!(before, subs)
+    apply_substitutions!(after, subs)
+
     while_op = WhileOp(before, after, init_values)
     return while_op, phi_indices, phi_types
 end
@@ -630,9 +638,6 @@ Returns (loop_op, phi_indices, phi_types) where:
 - loop_op: The constructed LoopOp
 - phi_indices: SSA indices of the header phi nodes (for getfield generation)
 - phi_types: Julia types of the header phi nodes
-
-Pure structure building - no BlockArgs or substitutions.
-BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
 """
 function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                                      ctx::StructurizationContext)
@@ -725,8 +730,6 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
         then_blk.terminator = ContinueOp(copy(carried_values))
 
         else_blk = Block()
-        # BreakOp carries SSAValues of the phi nodes - these will be substituted to
-        # BlockArgs later by apply_block_args! (since substitute_terminator now handles BreakOp)
         else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
 
         if_op = IfOp(cond_value, then_blk, else_blk)
@@ -741,6 +744,15 @@ function build_loop_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockIn
         end
         body.terminator = ContinueOp(copy(carried_values))
     end
+
+    # Create BlockArgs and apply substitutions immediately
+    subs = Substitutions()
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+        arg = BlockArg(i, phi_type)
+        push!(body.args, arg)
+        subs[phi_idx] = arg
+    end
+    apply_substitutions!(body, subs)
 
     # Create loop op with init_values
     loop_op = LoopOp(body, init_values)
@@ -764,9 +776,6 @@ The ForOp structure:
 - iv_arg: BlockArg for the induction variable
 - body: Loop body statements + ContinueOp with carried values
 - init_values: Non-IV loop-carried values
-
-Pure structure building - no BlockArgs or substitutions.
-BlockArg creation and SSA→BlockArg substitution happens later in apply_block_args!.
 """
 function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                              ctx::StructurizationContext)
@@ -840,8 +849,7 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
     # Get IV type
     iv_type = types[iv_phi_idx]
 
-    # Create a placeholder BlockArg for IV (will be properly created in apply_block_args!)
-    # For now, use a BlockArg with id=1 (IV is always first in ForOp's implicit args)
+    # Create BlockArg for IV (id=1, first in ForOp's block args)
     iv_arg = BlockArg(1, iv_type)
 
     # Build the body block
@@ -896,200 +904,21 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
         # Let me reconsider...
     end
 
-    for_op = ForOp(lower, for_info.is_inclusive ? for_info.upper : upper, step, iv_arg, body, init_values)
-
-    # Return the op along with a flag for is_inclusive handling
-    # Actually, we need to handle is_inclusive in handle_loop!, let me modify that instead
-    return for_op, phi_indices, phi_types, for_info.is_inclusive, for_info.upper
-end
-
-"""
-    collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
-
-Collect all SSA indices defined by statements in the block (recursively).
-Also includes results from control flow ops (phi nodes define SSAValues).
-"""
-function collect_defined_ssas!(defined::Set{Int}, block::Block, ctx::StructurizationContext)
-    for (idx, entry) in block.body
-        if entry.stmt isa ControlFlowOp
-            # Add the control flow op's own index (e.g., loop's synthesized index)
-            push!(defined, idx)
-            # Add any additional result indices (phi indices from collect_results_ssavals)
-            for rv in collect_results_ssavals(entry.stmt)
-                push!(defined, rv.id)
-            end
-            if entry.stmt isa LoopOp
-                collect_defined_ssas!(defined, entry.stmt.body, ctx)
-            elseif entry.stmt isa IfOp
-                collect_defined_ssas!(defined, entry.stmt.then_region, ctx)
-                collect_defined_ssas!(defined, entry.stmt.else_region, ctx)
-            elseif entry.stmt isa WhileOp
-                collect_defined_ssas!(defined, entry.stmt.before, ctx)
-                collect_defined_ssas!(defined, entry.stmt.after, ctx)
-            elseif entry.stmt isa ForOp
-                collect_defined_ssas!(defined, entry.stmt.body, ctx)
-            end
-        else
-            push!(defined, idx)
-        end
-    end
-end
-
-#=============================================================================
- Phase 2: Apply Block Arguments
-=============================================================================#
-
-"""
-    apply_block_args!(block::Block, ctx::StructurizationContext, defined::Set{Int}=Set{Int}(), parent_subs::Substitutions=Substitutions())
-
-Single pass that creates BlockArgs and substitutes SSAValue references.
-
-Phase 2 of structurization - called after control_tree_to_structured_ir.
-For each :loop op: creates BlockArgs for phi nodes (init_values).
-For :if ops: no BlockArgs needed (outer refs are accessed directly).
-Substitutes phi refs → BlockArg references throughout.
-
-The parent_subs parameter carries substitutions from outer scopes, so nested
-control flow ops can convert phi refs to the correct BlockArgs.
-"""
-function apply_block_args!(block::Block, ctx::StructurizationContext,
-                           defined::Set{Int}=Set{Int}(), parent_subs::Substitutions=Substitutions())
-    defined = copy(defined)
-    for (idx, entry) in block.body
-        if !(entry.stmt isa ControlFlowOp)
-            push!(defined, idx)
-        end
-    end
-
-    for stmt in statements(block.body)
-        if stmt isa LoopOp || stmt isa IfOp || stmt isa WhileOp || stmt isa ForOp
-            process_block_args!(stmt, ctx, defined, parent_subs)
-        end
-    end
-end
-
-"""
-Create BlockArgs for a LoopOp and substitute SSAValue references.
-init_values substitution is handled by apply_substitutions! in the parent block.
-"""
-function process_block_args!(loop::LoopOp, ctx::StructurizationContext,
-                             parent_defined::Set{Int}, parent_subs::Substitutions)
-    body = loop.body::Block
+    # Create BlockArgs and apply substitutions immediately
     subs = Substitutions()
-    result_vars = collect_results_ssavals(loop)
+    subs[iv_phi_idx] = iv_arg  # IV at index 1
 
-    for (i, result_var) in enumerate(result_vars)
-        phi_type = ctx.ssavaluetypes[result_var.id]
-        new_arg = BlockArg(i, phi_type)
-        push!(body.args, new_arg)
-        subs[result_var.id] = new_arg
+    # Non-IV loop-carried values at indices 2, 3, ...
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+        arg = BlockArg(i + 1, phi_type)
+        push!(body.args, arg)
+        subs[phi_idx] = arg
     end
 
     apply_substitutions!(body, subs)
 
-    merged_subs = merge(parent_subs, subs)
-    nested_defined = Set{Int}(rv.id for rv in result_vars)
-    collect_defined_ssas!(nested_defined, body, ctx)
-    apply_block_args!(body, ctx, nested_defined, merged_subs)
-end
+    for_op = ForOp(lower, for_info.is_inclusive ? for_info.upper : upper, step, iv_arg, body, init_values)
 
-"""
-Apply parent substitutions to IfOp branches and recurse.
-"""
-function process_block_args!(if_op::IfOp, ctx::StructurizationContext,
-                             parent_defined::Set{Int}, parent_subs::Substitutions)
-    then_blk = if_op.then_region::Block
-    else_blk = if_op.else_region::Block
-
-    apply_substitutions!(then_blk, parent_subs)
-    apply_substitutions!(else_blk, parent_subs)
-
-    then_defined = copy(parent_defined)
-    else_defined = copy(parent_defined)
-    collect_defined_ssas!(then_defined, then_blk, ctx)
-    collect_defined_ssas!(else_defined, else_blk, ctx)
-
-    apply_block_args!(then_blk, ctx, then_defined, parent_subs)
-    apply_block_args!(else_blk, ctx, else_defined, parent_subs)
-end
-
-"""
-Create BlockArgs for a WhileOp and substitute SSAValue references.
-BlockArgs are created for the before region (matching phi nodes from init_values).
-"""
-function process_block_args!(while_op::WhileOp, ctx::StructurizationContext,
-                             parent_defined::Set{Int}, parent_subs::Substitutions)
-    before = while_op.before::Block
-    after = while_op.after::Block
-    subs = Substitutions()
-    result_vars = collect_results_ssavals(while_op)
-
-    # Create BlockArgs for the before region
-    for (i, result_var) in enumerate(result_vars)
-        phi_type = ctx.ssavaluetypes[result_var.id]
-        new_arg = BlockArg(i, phi_type)
-        push!(before.args, new_arg)
-        subs[result_var.id] = new_arg
-    end
-
-    # Apply substitutions to before region
-    apply_substitutions!(before, subs)
-
-    # Create matching BlockArgs for after region (receives values from ConditionOp)
-    for (i, result_var) in enumerate(result_vars)
-        phi_type = ctx.ssavaluetypes[result_var.id]
-        new_arg = BlockArg(i, phi_type)
-        push!(after.args, new_arg)
-    end
-
-    # Apply substitutions to after region (uses same mapping)
-    apply_substitutions!(after, subs)
-
-    # Recurse into nested control flow
-    merged_subs = merge(parent_subs, subs)
-    nested_defined = Set{Int}(rv.id for rv in result_vars)
-    collect_defined_ssas!(nested_defined, before, ctx)
-    collect_defined_ssas!(nested_defined, after, ctx)
-    apply_block_args!(before, ctx, nested_defined, merged_subs)
-    apply_block_args!(after, ctx, nested_defined, merged_subs)
-end
-
-"""
-Create BlockArgs for a ForOp and substitute SSAValue references.
-
-ForOp has:
-- iv_arg: Induction variable BlockArg (already created in build_for_op)
-- body.args: BlockArgs for non-IV loop-carried values (created here)
-
-The IV is substituted specially; other loop-carried values follow the standard pattern.
-"""
-function process_block_args!(for_op::ForOp, ctx::StructurizationContext,
-                             parent_defined::Set{Int}, parent_subs::Substitutions)
-    body = for_op.body::Block
-    subs = Substitutions()
-
-    # ForOp's non-IV results are from init_values/ContinueOp
-    # The IV is handled separately and already has a BlockArg in for_op.iv_arg
-
-    # Create BlockArgs for non-IV loop-carried values
-    # These start at index 2 (index 1 is the IV)
-    for (i, init_val) in enumerate(for_op.init_values)
-        # Determine the type from the init value
-        phi_type = if init_val isa SSAValue
-            ctx.ssavaluetypes[init_val.id]
-        else
-            typeof(init_val)
-        end
-        new_arg = BlockArg(i + 1, phi_type)  # +1 because IV is at index 1
-        push!(body.args, new_arg)
-    end
-
-    # Apply parent substitutions to body
-    apply_substitutions!(body, parent_subs)
-
-    # Recurse into nested control flow
-    nested_defined = Set{Int}()
-    collect_defined_ssas!(nested_defined, body, ctx)
-    apply_block_args!(body, ctx, nested_defined, parent_subs)
+    return for_op, phi_indices, phi_types, for_info.is_inclusive, for_info.upper
 end
 
