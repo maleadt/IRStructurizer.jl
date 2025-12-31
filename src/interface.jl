@@ -72,10 +72,9 @@ function structurize!(sci::StructuredCodeInfo; validate::Bool=true)
     code = sci.code
     stmts = code.code
     types = code.ssavaluetypes
+
     n = length(stmts)
-
     n == 0 && return sci
-
     ctx = StructurizationContext(types, n + 1)
 
     # Build block-level CFG and convert to control tree
