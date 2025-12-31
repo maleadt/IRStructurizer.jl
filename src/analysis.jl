@@ -210,202 +210,204 @@ end
  For-Loop Detection During CFG Analysis
 =============================================================================#
 
+#=
+Julia's iteration protocol for ranges (after type inference) produces:
+- Phi node with entry value (start) and carried value (next iteration)
+- Equality check `===(i, stop)` for termination (canonical pattern)
+- Increment via `add_int(i, step)`
+
+The detection below uses a unified approach with pluggable condition patterns
+to handle both Julia's canonical `for i in 1:n` lowering and explicit `while i < n`.
+=#
+
 """
-    try_detect_for_loop_while(header_idx::Int, body_idx::Int, code::CodeInfo, blocks)
+    PhiAnalysisResult
 
-Try to detect a for-loop pattern in a while-loop structure.
-Returns ForLoopInfo if found, nothing otherwise.
-
-Matches: while iv < bound; ...; iv = iv + step; end
-- Condition: slt_int(iv, bound) or ult_int(iv, bound)
-- Step: add_int(iv, step) in body
+Result of analyzing a phi node in a loop header.
 """
-function try_detect_for_loop_while(header_idx::Int, body_idx::Int, code::CodeInfo, blocks)
-    stmts = code.code
+struct PhiAnalysisResult
+    phi_idx::Int        # SSA index of the phi node
+    entry_val::Any      # Value from loop entry edge
+    carried_val::Any    # Value from back-edge (loop body)
+end
 
-    # Check bounds
-    (1 <= header_idx <= length(blocks) && 1 <= body_idx <= length(blocks)) || return nothing
+"""
+    analyze_header_phis(header_block, stmts) -> Dict{Int, PhiAnalysisResult}
 
-    header_block = blocks[header_idx]
-    body_block = blocks[body_idx]
+Analyze phi nodes in a loop header block, extracting entry and carried values.
 
-    # Find phi nodes in header (loop-carried variables)
-    # Use phi edge position to distinguish entry vs carried values:
-    # - Entry edges come from before the header (loop entry)
-    # - Carried edges come from after the header (back-edge from loop body)
-    phi_info = Dict{Int, NamedTuple{(:entry_val, :carried_val), Tuple{Any, Any}}}()
+Uses edge position (not value definition location) to classify:
+- Entry edges: come from before the header block
+- Carried edges: come from after the header block (back-edge)
+"""
+function analyze_header_phis(header_block, stmts)
+    phi_info = Dict{Int, PhiAnalysisResult}()
+
     for si in header_block.range
         stmt = stmts[si]
-        if stmt isa PhiNode
-            entry_val = nothing
-            carried_val = nothing
-            for (edge_idx, edge) in enumerate(stmt.edges)
-                if isassigned(stmt.values, edge_idx)
-                    val = stmt.values[edge_idx]
-                    # Check where control flow comes from, not where value is defined
-                    if edge > header_block.range.stop
-                        carried_val = val
-                    elseif edge < header_block.range.start
-                        entry_val = val
-                    end
-                end
+        stmt isa PhiNode || continue
+
+        entry_val = nothing
+        carried_val = nothing
+
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            isassigned(stmt.values, edge_idx) || continue
+            val = stmt.values[edge_idx]
+
+            # Classify by edge position relative to header
+            if edge > header_block.range.stop
+                carried_val = val
+            elseif edge < header_block.range.start
+                entry_val = val
             end
-            if entry_val !== nothing && carried_val !== nothing
-                phi_info[si] = (entry_val=entry_val, carried_val=carried_val)
-            end
+        end
+
+        if entry_val !== nothing && carried_val !== nothing
+            phi_info[si] = PhiAnalysisResult(si, entry_val, carried_val)
         end
     end
 
-    isempty(phi_info) && return nothing
+    return phi_info
+end
 
-    # Find the condition: GotoIfNot with slt_int/ult_int
-    condition_ssa = nothing
+"""
+    extract_loop_condition(header_block, stmts) -> (SSAValue, Expr) | nothing
+
+Extract the loop condition from a GotoIfNot in the header block.
+"""
+function extract_loop_condition(header_block, stmts)
     for si in header_block.range
         stmt = stmts[si]
-        if stmt isa GotoIfNot
-            condition_ssa = stmt.cond
-            break
+        if stmt isa GotoIfNot && stmt.cond isa SSAValue
+            cond_stmt = stmts[stmt.cond.id]
+            if cond_stmt isa Expr && cond_stmt.head === :call
+                return (stmt.cond, cond_stmt)
+            end
         end
     end
-    condition_ssa isa SSAValue || return nothing
+    return nothing
+end
 
-    # Get the condition expression
-    cond_stmt = stmts[condition_ssa.id]
-    cond_stmt isa Expr || return nothing
-    cond_stmt.head === :call || return nothing
-    length(cond_stmt.args) >= 3 || return nothing
+"""
+    is_loop_invariant(value, header_block) -> Bool
 
-    func = cond_stmt.args[1]
+Check if a value is loop-invariant (defined before the loop header).
+"""
+function is_loop_invariant(value, header_block)
+    if value isa SSAValue
+        return value.id < header_block.range.start
+    end
+    # Arguments, constants, etc. are loop-invariant
+    return true
+end
+
+#=============================================================================
+ Condition Pattern Matching
+=============================================================================#
+
+"""
+    ConditionMatch
+
+Result of matching a loop condition pattern.
+"""
+struct ConditionMatch
+    iv_phi_idx::Int     # SSA index of induction variable phi
+    bound::Any          # Loop bound
+    is_inclusive::Bool  # Whether bound is inclusive (true for `===` pattern)
+end
+
+"""
+Abstract type for loop condition patterns.
+Implementations define how to recognize specific loop condition forms.
+"""
+abstract type ConditionPattern end
+
+"""
+    match_condition(pattern, cond_expr, phi_info) -> ConditionMatch | nothing
+
+Try to match a condition expression against a pattern.
+"""
+function match_condition end
+
+"""
+Matches Julia's iteration protocol equality check: `===(iv, bound)`
+This is the canonical pattern from `for i in 1:n` after type inference.
+"""
+struct EqualityPattern <: ConditionPattern end
+
+function match_condition(::EqualityPattern, cond_expr::Expr, phi_info::Dict)
+    length(cond_expr.args) >= 3 || return nothing
+
+    func = cond_expr.args[1]
+    is_equality = (func isa GlobalRef && func.name === :(===)) || func === :(===)
+    is_equality || return nothing
+
+    iv_candidate = cond_expr.args[2]
+    bound = cond_expr.args[3]
+
+    iv_candidate isa SSAValue || return nothing
+    haskey(phi_info, iv_candidate.id) || return nothing
+
+    return ConditionMatch(iv_candidate.id, bound, true)  # inclusive bound
+end
+
+"""
+Matches while-style less-than: `slt_int(iv, bound)` or `ult_int(iv, bound)`
+From explicit `while i < n` code.
+"""
+struct LessThanPattern <: ConditionPattern end
+
+function match_condition(::LessThanPattern, cond_expr::Expr, phi_info::Dict)
+    length(cond_expr.args) >= 3 || return nothing
+
+    func = cond_expr.args[1]
     func isa GlobalRef || return nothing
     func.name in (:slt_int, :ult_int) || return nothing
 
-    # Extract IV candidate and upper bound from condition
-    iv_candidate = cond_stmt.args[2]
-    upper_bound = cond_stmt.args[3]
+    iv_candidate = cond_expr.args[2]
+    bound = cond_expr.args[3]
 
-    # IV must be an SSAValue pointing to a phi node in header
     iv_candidate isa SSAValue || return nothing
-    iv_phi_idx = iv_candidate.id
-    haskey(phi_info, iv_phi_idx) || return nothing
+    haskey(phi_info, iv_candidate.id) || return nothing
 
-    # Find step expression by tracing data flow from carried value
-    # (handles nested control flow where add_int may not be in immediate body block)
-    step = find_step_from_carried_value(stmts, phi_info[iv_phi_idx].carried_val, iv_candidate)
-    step === nothing && return nothing
-
-    # Get lower bound from phi entry value
-    lower_bound = phi_info[iv_phi_idx].entry_val
-
-    # Check if upper bound is loop-invariant (should be defined before header)
-    if upper_bound isa SSAValue && upper_bound.id >= header_block.range.start
-        return nothing
-    end
-
-    return ForLoopInfo(iv_phi_idx, lower_bound, upper_bound, step, false)
+    return ConditionMatch(iv_candidate.id, bound, false)  # exclusive bound
 end
 
 """
-    try_detect_for_loop_natural(header_idx::Int, cycle::Vector{Int}, code::CodeInfo, blocks)
-
-Try to detect a for-loop pattern in a natural loop (Julia's `for i in 1:n`).
-Returns ForLoopInfo if found, nothing otherwise.
-
-Matches: for i in 1:n ... end
-- Condition: ===(iv, bound) (equality check at end of range)
-- Step: add_int(iv, 1) typically
-
-Note: Uses data-flow tracing rather than cycle blocks to find the step expression,
-because inner control flow may be collapsed before loop detection.
+Matches while-style less-equal: `sle_int(iv, bound)`
+From explicit `while i <= n` code.
 """
-function try_detect_for_loop_natural(header_idx::Int, cycle::Vector{Int}, code::CodeInfo, blocks)
-    stmts = code.code
+struct LessEqualPattern <: ConditionPattern end
 
-    (1 <= header_idx <= length(blocks)) || return nothing
-    header_block = blocks[header_idx]
+function match_condition(::LessEqualPattern, cond_expr::Expr, phi_info::Dict)
+    length(cond_expr.args) >= 3 || return nothing
 
-    # Find phi nodes in header by tracing carried values through data flow
-    # We can't rely on cycle blocks because inner control flow may be collapsed
-    phi_info = Dict{Int, NamedTuple{(:entry_val, :carried_val), Tuple{Any, Any}}}()
+    func = cond_expr.args[1]
+    func isa GlobalRef || return nothing
+    func.name === :sle_int || return nothing
 
-    for si in header_block.range
-        stmt = stmts[si]
-        if stmt isa PhiNode
-            entry_val = nothing
-            carried_val = nothing
-            for (edge_idx, edge) in enumerate(stmt.edges)
-                if isassigned(stmt.values, edge_idx)
-                    val = stmt.values[edge_idx]
-                    # Check where control flow comes from, not where value is defined
-                    if edge > header_block.range.stop
-                        carried_val = val
-                    elseif edge < header_block.range.start
-                        entry_val = val
-                    end
-                end
-            end
-            if entry_val !== nothing && carried_val !== nothing
-                phi_info[si] = (entry_val=entry_val, carried_val=carried_val)
-            end
-        end
-    end
-
-    isempty(phi_info) && return nothing
-
-    # Find the condition: GotoIfNot with === (equality check)
-    condition_ssa = nothing
-    for si in header_block.range
-        stmt = stmts[si]
-        if stmt isa GotoIfNot
-            condition_ssa = stmt.cond
-            break
-        end
-    end
-    condition_ssa isa SSAValue || return nothing
-
-    # Get the condition expression
-    cond_stmt = stmts[condition_ssa.id]
-    cond_stmt isa Expr || return nothing
-    cond_stmt.head === :call || return nothing
-    length(cond_stmt.args) >= 3 || return nothing
-
-    func = cond_stmt.args[1]
-    # Match === (either as GlobalRef or direct symbol)
-    is_equality = if func isa GlobalRef
-        func.name === :(===)
-    elseif func === :(===)
-        true
-    else
-        false
-    end
-    is_equality || return nothing
-
-    # Extract IV candidate and upper bound
-    iv_candidate = cond_stmt.args[2]
-    upper_bound = cond_stmt.args[3]
+    iv_candidate = cond_expr.args[2]
+    bound = cond_expr.args[3]
 
     iv_candidate isa SSAValue || return nothing
-    iv_phi_idx = iv_candidate.id
-    haskey(phi_info, iv_phi_idx) || return nothing
+    haskey(phi_info, iv_candidate.id) || return nothing
 
-    # Find step expression by following data flow from carried value
-    # Trace: iv_phi -> carried_val -> (possibly through phis) -> add_int
-    step = find_step_from_carried_value(stmts, phi_info[iv_phi_idx].carried_val, iv_candidate)
-
-    step === nothing && return nothing
-
-    lower_bound = phi_info[iv_phi_idx].entry_val
-
-    # Check loop invariance of upper bound (should be defined before header)
-    if upper_bound isa SSAValue && upper_bound.id >= header_block.range.start
-        return nothing
-    end
-
-    # is_inclusive=true for Julia's 1:n pattern (needs upper+1 adjustment)
-    return ForLoopInfo(iv_phi_idx, lower_bound, upper_bound, step, true)
+    return ConditionMatch(iv_candidate.id, bound, true)  # inclusive bound
 end
 
+# Default patterns to try, in order (canonical Julia iteration first)
+const DEFAULT_CONDITION_PATTERNS = (
+    EqualityPattern(),      # === (Julia's for i in 1:n)
+    LessThanPattern(),      # slt_int/ult_int (while i < n)
+    LessEqualPattern(),     # sle_int (while i <= n)
+)
+
+#=============================================================================
+ Unified For-Loop Detection
+=============================================================================#
+
 """
-    find_step_from_carried_value(stmts, carried_val, iv_candidate) -> Union{Any, Nothing}
+    find_step_from_carried_value(stmts, carried_val, iv_candidate, depth=0) -> Any | nothing
 
 Follow data flow from a phi's carried value to find an add_int step expression.
 Handles Julia's pattern where carried value goes through intermediate phi nodes.
@@ -444,6 +446,57 @@ function find_step_from_carried_value(stmts, carried_val, iv_candidate, depth=0)
     return nothing
 end
 
+"""
+    try_detect_for_loop(header_idx, code, blocks; patterns=DEFAULT_CONDITION_PATTERNS)
+
+Unified for-loop detection using pluggable condition patterns.
+
+Analyzes the loop header to detect counting for-loop patterns:
+1. Extract phi node information (entry/carried values)
+2. Extract loop condition expression
+3. Try each condition pattern until one matches
+4. Verify step expression (add_int pattern)
+5. Check loop-invariance of bounds
+
+Returns ForLoopInfo if a for-loop pattern is detected, nothing otherwise.
+"""
+function try_detect_for_loop(header_idx::Int, code::CodeInfo, blocks;
+                             patterns=DEFAULT_CONDITION_PATTERNS)
+    stmts = code.code
+
+    # Bounds check
+    (1 <= header_idx <= length(blocks)) || return nothing
+    header_block = blocks[header_idx]
+
+    # Step 1: Analyze phi nodes
+    phi_info = analyze_header_phis(header_block, stmts)
+    isempty(phi_info) && return nothing
+
+    # Step 2: Extract condition
+    cond_result = extract_loop_condition(header_block, stmts)
+    cond_result === nothing && return nothing
+    (_, cond_expr) = cond_result
+
+    # Step 3: Try condition patterns
+    match = nothing
+    for pattern in patterns
+        match = match_condition(pattern, cond_expr, phi_info)
+        match !== nothing && break
+    end
+    match === nothing && return nothing
+
+    # Step 4: Find step expression
+    phi = phi_info[match.iv_phi_idx]
+    step = find_step_from_carried_value(stmts, phi.carried_val, SSAValue(match.iv_phi_idx))
+    step === nothing && return nothing
+
+    # Step 5: Check loop-invariance of bound
+    is_loop_invariant(match.bound, header_block) || return nothing
+
+    # Success: construct ForLoopInfo
+    return ForLoopInfo(match.iv_phi_idx, phi.entry_val, match.bound, step, match.is_inclusive)
+end
+
 #=============================================================================
  Cyclic Region Detection
 =============================================================================#
@@ -452,8 +505,8 @@ function cyclic_region!(sccs, g, v, ec, doms, domtrees, backedges, code, blocks)
     # Try to match while-loop pattern first
     matched = @match (g, v) begin
         while_loop(cond, body, merge) => begin
-            # Try for-loop detection on while-loop structure
-            for_info = try_detect_for_loop_while(cond, body, code, blocks)
+            # Try unified for-loop detection
+            for_info = try_detect_for_loop(cond, code, blocks)
             if for_info !== nothing
                 (REGION_FOR_LOOP, [cond, body], for_info)
             else
@@ -474,9 +527,9 @@ function cyclic_region!(sccs, g, v, ec, doms, domtrees, backedges, code, blocks)
     entry_edges = filter(e -> in(e.dst, cycle) && !in(e.src, cycle), edges(g))
 
     if any(u -> in(Edge(u, v), backedges), inneighbors(g, v))
-        # Natural loop - try for-loop detection
+        # Natural loop - try unified for-loop detection
         if all(==(v) ∘ (e -> e.dst), entry_edges)
-            for_info = try_detect_for_loop_natural(v, cycle, code, blocks)
+            for_info = try_detect_for_loop(v, code, blocks)
             if for_info !== nothing
                 return (REGION_FOR_LOOP, cycle, for_info)
             end
