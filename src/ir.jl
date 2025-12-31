@@ -484,18 +484,23 @@ end
 
 function apply_substitutions!(op::IfOp, subs::Substitutions)
     op.condition = substitute_ssa(op.condition, subs)
+    apply_substitutions!(op.then_region, subs)
+    apply_substitutions!(op.else_region, subs)
 end
 
 function apply_substitutions!(op::LoopOp, subs::Substitutions)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
+    apply_substitutions!(op.body, subs)
 end
 
 function apply_substitutions!(op::WhileOp, subs::Substitutions)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
+    apply_substitutions!(op.before, subs)
+    apply_substitutions!(op.after, subs)
 end
 
 function apply_substitutions!(op::ForOp, subs::Substitutions)
@@ -505,6 +510,7 @@ function apply_substitutions!(op::ForOp, subs::Substitutions)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
+    apply_substitutions!(op.body, subs)
 end
 
 
