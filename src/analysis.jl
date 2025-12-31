@@ -230,22 +230,22 @@ function try_detect_for_loop_while(header_idx::Int, body_idx::Int, code::CodeInf
     body_block = blocks[body_idx]
 
     # Find phi nodes in header (loop-carried variables)
-    # Use SSA index position to distinguish entry vs carried values:
-    # - Entry values come from before the header (lower SSA indices)
-    # - Carried values come from within the loop body (higher SSA indices)
+    # Use phi edge position to distinguish entry vs carried values:
+    # - Entry edges come from before the header (loop entry)
+    # - Carried edges come from after the header (back-edge from loop body)
     phi_info = Dict{Int, NamedTuple{(:entry_val, :carried_val), Tuple{Any, Any}}}()
     for si in header_block.range
         stmt = stmts[si]
         if stmt isa PhiNode
             entry_val = nothing
             carried_val = nothing
-            for (edge_idx, _) in enumerate(stmt.edges)
+            for (edge_idx, edge) in enumerate(stmt.edges)
                 if isassigned(stmt.values, edge_idx)
                     val = stmt.values[edge_idx]
-                    # Carried value comes from after header, entry from before
-                    if val isa SSAValue && val.id > header_block.range.stop
+                    # Check where control flow comes from, not where value is defined
+                    if edge > header_block.range.stop
                         carried_val = val
-                    elseif !(val isa SSAValue) || val.id < header_block.range.start
+                    elseif edge < header_block.range.start
                         entry_val = val
                     end
                 end
@@ -332,13 +332,13 @@ function try_detect_for_loop_natural(header_idx::Int, cycle::Vector{Int}, code::
         if stmt isa PhiNode
             entry_val = nothing
             carried_val = nothing
-            for (edge_idx, _) in enumerate(stmt.edges)
+            for (edge_idx, edge) in enumerate(stmt.edges)
                 if isassigned(stmt.values, edge_idx)
                     val = stmt.values[edge_idx]
-                    # Carried value comes from after header, entry from before
-                    if val isa SSAValue && val.id > header_block.range.stop
+                    # Check where control flow comes from, not where value is defined
+                    if edge > header_block.range.stop
                         carried_val = val
-                    elseif !(val isa SSAValue) || val.id < header_block.range.start
+                    elseif edge < header_block.range.start
                         entry_val = val
                     end
                 end
