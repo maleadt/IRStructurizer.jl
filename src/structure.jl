@@ -417,7 +417,7 @@ end
 """
     handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo}, ctx::StructurizationContext)
 
-Handle REGION_SWITCH.
+Handle REGION_SWITCH by treating it as a nested if-else chain.
 """
 function handle_switch!(block::Block, tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInfo},
                         ctx::StructurizationContext)

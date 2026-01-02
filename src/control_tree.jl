@@ -7,7 +7,21 @@ using Graphs: AbstractGraph, SimpleDiGraph, Edge, vertices, edges, nv, ne,
 using AbstractTrees: PreOrderDFS, PostOrderDFS
 
 """
-Single-entry control-flow structure which is classified according to well-specified pattern structures.
+    RegionType
+
+Single-entry control-flow region classification for pattern-based structurization.
+
+Acyclic regions:
+- `REGION_BLOCK`: Linear sequence of blocks `u` ─→ [`v`, `vs...`] ─→ `w`
+- `REGION_IF_THEN`: Conditional with one branch `u` ─→ `v` and one merge block reachable by `u` ─→ `w` or `v` ─→ `w`
+- `REGION_IF_THEN_ELSE`: Conditional with two symmetric branches `u` ─→ `v` and `u` ─→ `w` and a single merge block reachable by `v` ─→ x or `w` ─→ x
+- `REGION_SWITCH`: Conditional with any number of branches [`u` ─→ `vᵢ`, `u` ─→ `vᵢ₊₁`, ...] and a single merge block reachable by [`vᵢ` ─→ `w`, `vᵢ₊₁` ─→ `w`, ...]
+- `REGION_TERMINATION`: Acyclic region which contains a block `v` with multiple branches, including one or multiple branches to blocks `wᵢ` which end with a function termination instruction. The region is composed of `v` and all the `wᵢ`.
+
+Cyclic regions:
+- `REGION_WHILE_LOOP`: Simple cyclic region made of a condition block `u`, a loop body block `v` and a merge block `w` such that `v` ⇆ `u` ─→ `w`
+- `REGION_FOR_LOOP`: While loop with detected counting pattern
+- `REGION_NATURAL_LOOP`: Single-entry cyclic region with varying complexity such that the entry point dominates all nodes in the cyclic structure.
 """
 @enum RegionType begin
     REGION_BLOCK
@@ -19,26 +33,6 @@ Single-entry control-flow structure which is classified according to well-specif
     REGION_WHILE_LOOP
     REGION_NATURAL_LOOP
 end
-
-"Sequence of blocks `u` ─→ [`v`, `vs...`] ─→ `w`"
-REGION_BLOCK
-"Conditional with one branch `u` ─→ `v` and one merge block reachable by `u` ─→ `w` or `v` ─→ `w`."
-REGION_IF_THEN
-"Conditional with two symmetric branches `u` ─→ `v` and `u` ─→ `w` and a single merge block reachable by `v` ─→ x or `w` ─→ x."
-REGION_IF_THEN_ELSE
-"Conditional with any number of branches [`u` ─→ `vᵢ`, `u` ─→ `vᵢ₊₁`, ...] and a single merge block reachable by [`vᵢ` ─→ `w`, `vᵢ₊₁` ─→ `w`, ...]."
-REGION_SWITCH
-"""
-Acyclic region which contains a block `v` with multiple branches, including one or multiple branches to blocks `wᵢ` which end with a function termination instruction.
-The region is composed of `v` and all the `wᵢ`.
-"""
-REGION_TERMINATION
-"Simple cycling region made of a condition block `u`, a loop body block `v` and a merge block `w` such that `v` ⇆ `u` ─→ `w`."
-REGION_WHILE_LOOP
-"Single-entry cyclic region with varying complexity such that the entry point dominates all nodes in the cyclic structure."
-REGION_NATURAL_LOOP
-
-# Define active patterns for use in pattern matching with MLStyle.
 
 @active block_region(args) begin
     (g, v) = args

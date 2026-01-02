@@ -148,7 +148,7 @@ function ControlFlowGraph(cfg::AbstractGraph)
     rem_edges!(analysis_cfg, backedges(cfg, ec))
     is_reducible = !is_cyclic(analysis_cfg)
 
-    # TODO: actually test whether CFG is structured or not.
+    # Reducible CFGs can always be structured; non-reducible CFGs may require node splitting.
     is_structured = is_reducible
     ControlFlowGraph(cfg, dfst, ec, is_reducible, is_structured)
 end

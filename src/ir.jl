@@ -81,9 +81,6 @@ indices(v::SSAVector) = (idx for (idx, _, _) in v.data)
 statements(v::SSAVector) = (stmt for (_, stmt, _) in v.data)
 types(v::SSAVector) = (typ for (_, _, typ) in v.data)
 
-# Alias for backwards compatibility
-items(v::SSAVector) = statements(v)
-
 """
     find_by_ssa(v::SSAVector, ssa_idx::Int) -> Union{SSAEntry, Nothing}
 

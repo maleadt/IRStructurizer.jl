@@ -208,16 +208,12 @@ function DeltaGraph(g::AbstractGraph{T}) where {T}
     dg
 end
 
-# Re-implementation of functions from Graphs.jl to be compatible with non-contiguous vertex storage.
-
 """
-    has_path(g::AbstractGraph, u, v; exclude_vertices=Vector())
+    has_path(g::DeltaGraph, u, v; exclude_vertices=Vector())
 
 Return `true` if there is a path from `u` to `v` in `g` (while avoiding vertices in
 `exclude_vertices`) or `u == v`. Return false if there is no such path or if `u` or `v`
 is in `excluded_vertices`.
-
-Re-implemented from Graphs.jl.
 """
 function Graphs.has_path(g::DeltaGraph{T}, u::Integer, v::Integer;
         exclude_vertices::AbstractVector=Vector{T}()) where {T}

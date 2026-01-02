@@ -4,7 +4,7 @@ using FileCheck
 using IRStructurizer
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
-                      validate_scf, items, statements
+                      validate_scf, statements
 using Core: SSAValue
 
 @testset "IRStructurizer" verbose=true begin
@@ -21,14 +21,14 @@ using Core: SSAValue
 
     # Create flat, then structurize
     sci = StructuredCodeInfo(ci)
-    @test !any(x -> x isa IfOp, items(sci.entry.body))
+    @test !any(x -> x isa IfOp, statements(sci.entry.body))
 
     structurize!(sci)
-    @test any(x -> x isa IfOp, items(sci.entry.body))
+    @test any(x -> x isa IfOp, statements(sci.entry.body))
 
     # code_structured does both steps
     sci2, _ = code_structured(g, Tuple{Int})
-    @test any(x -> x isa IfOp, items(sci2.entry.body))
+    @test any(x -> x isa IfOp, statements(sci2.entry.body))
 end
 
 @testset "validation: UnstructuredControlFlowError" begin
@@ -50,7 +50,7 @@ end
     # After structurize!, validation passes
     structurize!(sci)
     # GotoIfNot should no longer be in body (replaced by IfOp)
-    @test !any(expr -> expr isa Core.GotoIfNot, items(sci.entry.body))
+    @test !any(expr -> expr isa Core.GotoIfNot, statements(sci.entry.body))
     validate_scf(sci)  # Should not throw
 end
 
@@ -65,7 +65,7 @@ end
     end
 
     # Counting loop should produce ForOp
-    loop_ops = filter(x -> x isa ControlFlowOp, collect(items(sci.entry.body)))
+    loop_ops = filter(x -> x isa ControlFlowOp, collect(statements(sci.entry.body)))
     @test !isempty(loop_ops)
     @test loop_ops[1] isa ForOp
 end
@@ -282,7 +282,7 @@ end  # CFG analysis
         end
         return i
     end
-    for_ops = filter(x -> x isa ForOp, collect(items(sci.entry.body)))
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
     @test length(for_ops) == 1
 
     for_op = for_ops[1]
@@ -317,7 +317,7 @@ end
         end
         return acc
     end
-    for_ops = filter(x -> x isa ForOp, collect(items(sci.entry.body)))
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
     @test length(for_ops) == 1
 
     for_op = for_ops[1]
@@ -421,7 +421,7 @@ end  # WhileOp detection
     @test sci isa StructuredCodeInfo
 
     # Should have some loop op (not ForOp since step changes)
-    loop_ops = filter(x -> x isa ForOp || x isa WhileOp || x isa LoopOp, collect(items(sci.entry.body)))
+    loop_ops = filter(x -> x isa ForOp || x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
     @test length(loop_ops) >= 1
 end
 
@@ -600,7 +600,7 @@ end
         return acc
     end
     validate_scf(sci_while)
-    for_ops = filter(x -> x isa ForOp, collect(items(sci_while.entry.body)))
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci_while.entry.body)))
     @test length(for_ops) == 1
 
     # Native for-in-range (non-SESE due to iterator protocol) → LoopOp
