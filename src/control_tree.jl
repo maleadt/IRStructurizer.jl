@@ -1,6 +1,4 @@
-# graph-level CFG pattern detection
-#
-# inspects the control-flow graph to build a control tree
+# control tree construction via CFG pattern matching
 
 using MLStyle: @active, @match
 using Graphs

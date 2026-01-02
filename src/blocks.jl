@@ -1,4 +1,4 @@
-# block-level CFG from Julia IR
+# basic block extraction from Julia IR
 
 """
     BlockInfo

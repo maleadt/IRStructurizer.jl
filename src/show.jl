@@ -1,4 +1,26 @@
-# Pretty Printing (Julia CodeInfo-style with box-drawing characters)
+# structured IR pretty printing
+
+function Base.show(io::IO, ::MIME"text/plain", sci::StructuredCodeInfo)
+    color = get(io, :color, false)::Bool
+
+    # Print header
+    println(io, "StructuredCodeInfo(")
+
+    # Create printer with │ prefix for the entry block (2 chars, not 4)
+    base_p = IRPrinter(io, sci.code, sci.max_ssa_idx)
+    p = child_printer(base_p, sci.entry, "│ ")
+
+    # Print entry block body - use is_closing_self=true so the last item
+    # replaces │ with └── instead of adding └── after │
+    print_block_body(p, sci.entry; is_closing_self=true)
+
+    print(io, ")")
+end
+
+# Use detailed format for string() as well (like CodeInfo does)
+function Base.show(io::IO, sci::StructuredCodeInfo)
+    show(io, MIME"text/plain"(), sci)
+end
 
 """
     IRPrinter
@@ -345,10 +367,6 @@ function print_terminator_closing_self(p::IRPrinter, term)
     println(p.io)
 end
 
-#=============================================================================
- Pretty Printing for Final Block/ControlFlowOp
-=============================================================================#
-
 # Print expression with type annotation (no box-drawing, just indent)
 function print_expr_with_type(p::IRPrinter, idx::Int, expr, typ)
     print_indent(p)
@@ -572,28 +590,4 @@ function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize
         after_body_p = child_printer(p, op.after, "│   ")
         print_block_body(after_body_p, op.after; is_last_in_parent=true)
     end
-end
-
-# Main entry point: show for StructuredCodeInfo
-# Note: Return type is handled by Pair when using code_structured()
-function Base.show(io::IO, ::MIME"text/plain", sci::StructuredCodeInfo)
-    color = get(io, :color, false)::Bool
-
-    # Print header
-    println(io, "StructuredCodeInfo(")
-
-    # Create printer with │ prefix for the entry block (2 chars, not 4)
-    base_p = IRPrinter(io, sci.code, sci.max_ssa_idx)
-    p = child_printer(base_p, sci.entry, "│ ")
-
-    # Print entry block body - use is_closing_self=true so the last item
-    # replaces │ with └── instead of adding └── after │
-    print_block_body(p, sci.entry; is_closing_self=true)
-
-    print(io, ")")
-end
-
-# Use detailed format for string() as well (like CodeInfo does)
-function Base.show(io::IO, sci::StructuredCodeInfo)
-    show(io, MIME"text/plain"(), sci)
 end

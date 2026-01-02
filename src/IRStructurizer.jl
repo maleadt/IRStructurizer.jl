@@ -3,17 +3,21 @@ module IRStructurizer
 using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
             GotoNode, GotoIfNot, ReturnNode, PhiNode, PiNode, QuoteNode, GlobalRef
 
-# graph-level analyses
-include("graph.jl")
-include("cfg.jl")
-include("analysis.jl")
+# data structures
+include("graph.jl")           # DeltaGraph, SimpleTree, tree utilities
+
+# CFG analysis
+include("dominance.jl")       # dominators, edge classification, DFS
+
+# block extraction
+include("blocks.jl")          # BlockInfo, find_basic_blocks, build_block_cfg
+
+# control tree construction
+include("control_tree.jl")    # RegionType, patterns, ControlTree, ForLoopInfo
 
 # structured IR definitions
 include("ir.jl")
 include("show.jl")
-
-# block-level CFG
-include("block_cfg.jl")
 
 # control tree to structured IR
 include("structure.jl")

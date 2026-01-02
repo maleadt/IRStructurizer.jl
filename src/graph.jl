@@ -1,6 +1,8 @@
-# directed graph implementation with stable vertex indices after deletions
+# graph and tree data structures
 
 using Graphs
+using AbstractTrees
+using AbstractTrees: AbstractTrees, PreOrderDFS, PostOrderDFS
 using Graphs: AbstractGraph, Edge, SimpleDiGraph, add_edge!, rem_edge!,
               vertices, edges, nv, ne, inneighbors, outneighbors,
               has_vertex, is_cyclic, is_weakly_connected, edgetype
@@ -254,4 +256,108 @@ function vertices_between(g::AbstractGraph{T}, u::Integer, v::Union{Nothing,Inte
     end
     !isnothing(v) && !in(v, collected) && error("`v` could not be reached from `u`.")
     collected
+end
+
+# SimpleTree: generic tree data structure
+
+mutable struct SimpleTree{T}
+    data::T
+    parent::Union{Nothing,SimpleTree{T}}
+    children::Vector{SimpleTree{T}}
+    function SimpleTree{T}(data::T, parent, children) where {T}
+        tree = new{T}(data, parent, SimpleTree{T}[])
+        # Make sure that all the children mark this new tree as parent.
+        for c in children
+            child_copy = SimpleTree{T}(c.data, tree, c.children)
+            push!(tree.children, child_copy)
+        end
+        tree
+    end
+end
+SimpleTree{T}(data::T, children=SimpleTree{T}[]) where {T} = SimpleTree{T}(data, nothing, children)
+SimpleTree(data::T, parent, children) where {T} = SimpleTree{T}(data, parent, children)
+SimpleTree(data::T, children=SimpleTree{T}[]) where {T} = SimpleTree{T}(data, children)
+
+"""
+Equality is defined for `SimpleTree`s over data and children. The equality of
+parents is not tested to avoid infinite recursion, and only the presence of
+parents is tested instead.
+"""
+Base.:(==)(x::SimpleTree{T}, y::SimpleTree{T}) where {T} = x.data == y.data && x.children == y.children && isnothing(x.parent) == isnothing(y.parent)
+
+function Base.show(io::IO, ::MIME"text/plain", tree::SimpleTree)
+    if isempty(children(tree))
+        print(io, typeof(tree), "(", tree.data, ", [])")
+    else
+        print(io, sprint(print_tree, tree; context=io))
+    end
+end
+Base.show(io::IO, tree::SimpleTree) = print(io, typeof(tree), "(", nodevalue(tree), isroot(tree) ? "" : string(", parent = ", nodevalue(parent(tree))), ", children = [", join(nodevalue.(children(tree)), ", "), "])")
+
+Base.getindex(tree::SimpleTree, index) = children(tree)[index]
+Base.firstindex(tree::SimpleTree) = firstindex(children(tree))
+Base.lastindex(tree::SimpleTree) = lastindex(children(tree))
+
+# AbstractTrees interface
+AbstractTrees.nodetype(T::Type{<:SimpleTree}) = T
+AbstractTrees.NodeType(::Type{SimpleTree{T}}) where {T} = AbstractTrees.HasNodeType()
+AbstractTrees.nodevalue(tree::SimpleTree) = tree.data
+AbstractTrees.ChildIndexing(::Type{<:SimpleTree}) = AbstractTrees.IndexedChildren()
+AbstractTrees.ParentLinks(::Type{<:SimpleTree}) = AbstractTrees.StoredParents()
+AbstractTrees.parent(tree::SimpleTree) = tree.parent
+Base.parent(tree::SimpleTree) = tree.parent
+AbstractTrees.children(tree::SimpleTree) = tree.children
+AbstractTrees.childrentype(::Type{T}) where {T<:SimpleTree} = T
+
+isroot(tree::SimpleTree) = isnothing(tree.parent)
+nodevalue(tree::SimpleTree) = tree.data
+children(tree::SimpleTree) = tree.children
+parent(tree::SimpleTree) = tree.parent
+
+# print_tree helper using AbstractTrees
+function print_tree(io::IO, tree::SimpleTree; maxdepth=10)
+    AbstractTrees.print_tree(io, tree; maxdepth)
+end
+
+# Tree utilities
+
+common_ancestor(trees) = common_ancestor(Iterators.peel(trees)...)
+function common_ancestor(tree, trees)
+    common_anc = tree
+    parent_chain = parents(common_anc)
+    for candidate in trees
+        common_anc = in(candidate, parent_chain) ? candidate : find_parent(in(parent_chain), candidate)
+        parent_chain = parents(common_anc)
+        isnothing(common_anc) && return nothing
+    end
+    common_anc
+end
+
+is_ancestor(candidate, tree) = !isnothing(find_parent(==(candidate), tree))
+
+function parents(tree)
+    res = [tree]
+    while true
+        isroot(tree) && break
+        tree = parent(tree)
+        push!(res, tree)
+    end
+    res
+end
+
+function find_parent(f, tree)
+    original = tree
+    while true
+        f(tree) === true && tree !== original && return tree
+        isroot(tree) && break
+        tree = parent(tree)
+    end
+end
+
+function find_subtree(f, tree::SimpleTree)
+    original = tree
+    for tree in PreOrderDFS(tree)
+        f(tree) === true && tree !== original && return tree
+    end
+    nothing
 end
