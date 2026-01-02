@@ -25,20 +25,11 @@ end
 """
     convert_phi_value(val) -> IRValue
 
-Convert a phi node value to an IRValue.
+Convert a phi node value to an IRValue. Most values pass through unchanged;
+only QuoteNode needs unwrapping to extract the quoted value.
 """
 function convert_phi_value(val)
-    if val isa SSAValue
-        return val
-    elseif val isa Argument
-        return val
-    elseif val isa Integer
-        return val
-    elseif val isa QuoteNode
-        return val.value
-    else
-        error("Unexpected phi value type: $(typeof(val))")
-    end
+    val isa QuoteNode ? val.value : val
 end
 
 #=============================================================================
@@ -480,6 +471,34 @@ function find_condition_value(block_idx::Int, code::CodeInfo, blocks::Vector{Blo
 end
 
 """
+    find_condition_chain(stmts, header_range, cond_ssa::SSAValue) -> Set{Int}
+
+Walk backwards from the condition SSA to find all SSA indices in the header
+that contribute to computing the condition. These should be excluded from
+the ForOp body since they're part of the loop control, not the loop body.
+"""
+function find_condition_chain(stmts, header_range, cond_ssa::SSAValue)
+    chain = Set{Int}()
+    worklist = [cond_ssa.id]
+    while !isempty(worklist)
+        idx = popfirst!(worklist)
+        idx in header_range || continue
+        idx in chain && continue
+        push!(chain, idx)
+        # Add operands that are SSAValues in header
+        stmt = stmts[idx]
+        if stmt isa Expr
+            for arg in stmt.args
+                if arg isa SSAValue && arg.id in header_range
+                    push!(worklist, arg.id)
+                end
+            end
+        end
+    end
+    return chain
+end
+
+"""
     set_block_terminator!(block::Block, code::CodeInfo, blocks::Vector{BlockInfo})
 
 Set the block terminator based on statements.
@@ -828,10 +847,22 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
     # Build the body block
     body = Block()
 
-    # Collect header statements (excluding phi nodes and control flow)
+    # Find the condition SSA from GotoIfNot and compute the condition chain to exclude
+    cond_ssa = nothing
     for si in header_block.range
         stmt = stmts[si]
-        if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
+        if stmt isa GotoIfNot && stmt.cond isa SSAValue
+            cond_ssa = stmt.cond
+            break
+        end
+    end
+    excluded = cond_ssa !== nothing ?
+        find_condition_chain(stmts, header_block.range, cond_ssa) : Set{Int}()
+
+    # Collect header statements (excluding phi nodes, control flow, and condition chain)
+    for si in header_block.range
+        stmt = stmts[si]
+        if si ∉ excluded && !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
             push!(body, si, stmt, types[si])
         end
     end
@@ -854,27 +885,11 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
 
     # If is_inclusive (Julia's 1:n), we need upper+1 for exclusive semantics
     # This is handled by inserting add_int in the parent block during handle_loop!
-    # For now, store the upper bound as-is; the adjustment will be made in
-    # apply_loop_patterns! replacement or a post-processing step
-
-    # Actually, since we're building directly, let's handle inclusive bounds here
-    # by allocating an SSA for add_int(upper, 1) if needed
     if for_info.is_inclusive
         # Allocate a synthesized SSA for the adjusted upper bound
         adj_ssa_idx = ctx.next_ssa_idx
         ctx.next_ssa_idx += 1
-
-        # The actual add_int expression will be inserted before ForOp
-        # For now, use SSAValue reference to the adjustment
         upper = SSAValue(adj_ssa_idx)
-
-        # Store info for later (we'll handle this in handle_loop! by special-casing)
-        # Actually, let's just return a marker struct or modify the flow...
-
-        # Simpler approach: store the adjustment info and let handle_loop! insert it
-        # For now, we'll store the original upper and mark is_inclusive
-        # The adjustment can be done in handle_loop! before pushing the ForOp
-        # Let me reconsider...
     end
 
     # Create BlockArgs and apply substitutions immediately
@@ -894,4 +909,3 @@ function build_for_op(tree::ControlTree, code::CodeInfo, blocks::Vector{BlockInf
 
     return for_op, phi_indices, phi_types, for_info.is_inclusive, for_info.upper
 end
-

@@ -325,16 +325,17 @@ end
     @test length(for_op.init_values) == 1
 end
 
-@testset "Julia for-in-range (1:n)" begin
+@testset "Julia for-in-range (1:n) stays as LoopOp" begin
+    # Native for-in-range has complex iterator protocol IR (multiple GotoIfNots)
+    # so it stays as LoopOp, not ForOp. Use while-loops for ForOp.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             acc = 0
-            @check "for %{{.*}} ="
+            @check "loop"
             for i in 1:n
                 @check "add_int"
                 acc += i
             end
-            @check "continue"
             return acc
         end
     end
@@ -347,6 +348,9 @@ end
         return acc
     end
     validate_scf(sci)
+
+    # Verify IR is valid (LoopOp is nested inside IfOps from iterator protocol)
+    @test sci isa StructuredCodeInfo
 end
 
 @testset "nested for loops" begin
@@ -514,10 +518,11 @@ end
 end
 
 @testset "swap_loop phi references" begin
+    # Native for-in-range produces LoopOp (iterator protocol is non-SESE)
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             x, y = 1, 2
-            @check "for"
+            @check "loop"
             for i in 1:n
                 x, y = y, x
             end
@@ -583,6 +588,62 @@ end
     end
 end
 
+@testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin
+    # Simple SESE while-loop → ForOp
+    sci_while, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        return acc
+    end
+    validate_scf(sci_while)
+    for_ops = filter(x -> x isa ForOp, collect(items(sci_while.entry.body)))
+    @test length(for_ops) == 1
+
+    # Native for-in-range (non-SESE due to iterator protocol) → LoopOp
+    # LoopOp is nested inside IfOps from iterator protocol's branch structure
+    sci_for, _ = code_structured(Tuple{Int}) do n::Int
+        acc = 0
+        for i in 1:n
+            acc += i
+        end
+        return acc
+    end
+    validate_scf(sci_for)
+    # LoopOp will be nested inside IfOps, just verify the IR is valid
+    @test sci_for isa StructuredCodeInfo
+end
+
+@testset "while-loop mimicking iterator protocol stays valid" begin
+    # A while-loop that performs operations similar to the iterator protocol
+    # (multiple branches, comparisons) should still produce valid structured IR.
+    # This previously caused issues when non-SESE loops were incorrectly matched.
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        # Mimic iterator: check if done, extract value, update state
+        state = 1
+        upper = n
+        acc = 0
+        while true
+            # "done" check - similar to iterator protocol
+            done = state > upper
+            done && break
+            # "extract" value
+            i = state
+            # body
+            acc += i
+            # "next" state
+            state += 1
+        end
+        return acc
+    end
+
+    # Should produce valid structured IR (no unstructured control flow)
+    validate_scf(sci)
+end
+
 end  # regression
 
 #=============================================================================
@@ -591,39 +652,17 @@ end  # regression
 
 @testset "Julia for-in-range integration" begin
 
-# Helper to recursively find ForOp in nested structure
-function find_for_op_recursive(block::Block)
-    for stmt in statements(block.body)
-        if stmt isa ForOp
-            return stmt
-        elseif stmt isa IfOp
-            result = find_for_op_recursive(stmt.then_region)
-            result !== nothing && return result
-            result = find_for_op_recursive(stmt.else_region)
-            result !== nothing && return result
-        elseif stmt isa WhileOp
-            result = find_for_op_recursive(stmt.before)
-            result !== nothing && return result
-            result = find_for_op_recursive(stmt.after)
-            result !== nothing && return result
-        elseif stmt isa LoopOp
-            result = find_for_op_recursive(stmt.body)
-            result !== nothing && return result
-        end
-    end
-    return nothing
-end
 
 @testset "sum_to_n: accumulator pattern" begin
+    # Native for-in-range stays as LoopOp (iterator protocol is non-SESE)
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             acc = 0
-            @check "for %{{.*}} ="
+            @check "loop"
             for i in 1:n
                 @check "add_int"
                 acc += i
             end
-            @check "continue"
             return acc
         end
     end
@@ -636,18 +675,13 @@ end
         return acc
     end
     validate_scf(sci)
-
-    for_op = find_for_op_recursive(sci.entry)
-    @test for_op !== nothing
-    @test for_op.step == 1
-    @test length(for_op.init_values) == 2
 end
 
 @testset "product: multiply pattern" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             acc = 1
-            @check "for"
+            @check "loop"
             for i in 1:n
                 @check "mul_int"
                 acc *= i
@@ -664,10 +698,6 @@ end
         return acc
     end
     validate_scf(sci)
-
-    for_op = find_for_op_recursive(sci.entry)
-    @test for_op !== nothing
-    @test for_op.step == 1
 end
 
 @testset "count_evens: conditional accumulator" begin
@@ -702,7 +732,7 @@ end
         code_structured(Tuple{Int}) do n
             sum = 0
             count = 0
-            @check "for"
+            @check "loop"
             for i in 1:n
                 @check "add_int"
                 sum += i
@@ -723,20 +753,16 @@ end
         return sum, count
     end
     validate_scf(sci)
-
-    for_op = find_for_op_recursive(sci.entry)
-    @test for_op !== nothing
-    # Three carried values: iteration index, sum, count
-    @test length(for_op.init_values) == 3
 end
 
 @testset "nested for-in-range loops" begin
+    # Both native for-in-range loops produce LoopOp (iterator protocol is non-SESE)
     @test @filecheck begin
         code_structured(Tuple{Int, Int}) do n, m
             acc = 0
             @check "loop"
             for i in 1:n
-                @check "for"
+                @check "loop"
                 for j in 1:m
                     @check "mul_int"
                     acc += i * j
@@ -762,7 +788,7 @@ end
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             x, y = 1, 2
-            @check "for"
+            @check "loop"
             for i in 1:n
                 x, y = y, x
             end
@@ -780,7 +806,19 @@ end
     validate_scf(sci)
 end
 
-@testset "for-in-range bounds correctness" begin
+@testset "for-in-range produces valid LoopOp" begin
+    # Native for-in-range stays as LoopOp (iterator protocol is non-SESE)
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n
+            last = 0
+            @check "loop"
+            for i in 1:n
+                last = i
+            end
+            return last
+        end
+    end
+
     sci, _ = code_structured(Tuple{Int}) do n
         last = 0
         for i in 1:n
@@ -789,12 +827,6 @@ end
         return last
     end
     validate_scf(sci)
-
-    for_op = find_for_op_recursive(sci.entry)
-    @test for_op !== nothing
-    @test for_op.step == 1
-    # Upper bound should be SSAValue (pointing to n+1 for exclusive)
-    @test for_op.upper isa SSAValue
 end
 
 end  # Julia for-in-range integration

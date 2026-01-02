@@ -395,7 +395,7 @@ function match_condition(::LessEqualPattern, cond_expr::Expr, phi_info::Dict)
     return ConditionMatch(iv_candidate.id, bound, true)  # inclusive bound
 end
 
-# Default patterns to try, in order (canonical Julia iteration first)
+# Default patterns to try, in order
 const DEFAULT_CONDITION_PATTERNS = (
     EqualityPattern(),      # === (Julia's for i in 1:n)
     LessThanPattern(),      # slt_int/ult_int (while i < n)
@@ -459,6 +459,10 @@ Analyzes the loop header to detect counting for-loop patterns:
 5. Check loop-invariance of bounds
 
 Returns ForLoopInfo if a for-loop pattern is detected, nothing otherwise.
+
+NOTE: Assumes SESE structure (single GotoIfNot in header). For non-SESE loops
+with multiple GotoIfNots, `extract_loop_condition` returns the first one found,
+which may be an internal branch rather than the loop exit condition.
 """
 function try_detect_for_loop(header_idx::Int, code::CodeInfo, blocks;
                              patterns=DEFAULT_CONDITION_PATTERNS)
@@ -527,12 +531,10 @@ function cyclic_region!(sccs, g, v, ec, doms, domtrees, backedges, code, blocks)
     entry_edges = filter(e -> in(e.dst, cycle) && !in(e.src, cycle), edges(g))
 
     if any(u -> in(Edge(u, v), backedges), inneighbors(g, v))
-        # Natural loop - try unified for-loop detection
+        # Natural loop - keep as LoopOp (don't try to promote to ForOp)
+        # For-loop detection only works on SESE while-loops.
+        # Complex loops with internal control flow stay as LoopOp.
         if all(==(v) ∘ (e -> e.dst), entry_edges)
-            for_info = try_detect_for_loop(v, code, blocks)
-            if for_info !== nothing
-                return (REGION_FOR_LOOP, cycle, for_info)
-            end
             return (REGION_NATURAL_LOOP, cycle, nothing)
         end
     end
