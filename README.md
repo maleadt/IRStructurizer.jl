@@ -100,3 +100,9 @@ structures containing:
 
 Phi nodes become explicit `BlockArg` values (like MLIR block arguments), preserving SSA
 semantics.
+
+
+## Acknowledgements
+
+Most of this package is based on [Cédric Belmant](https://github.com/serenity4)'s
+[SPIRV.jl](https://github.com/serenity4/SPIRV.jl) structurization code.
