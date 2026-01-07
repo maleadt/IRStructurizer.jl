@@ -32,6 +32,25 @@ function convert_phi_value(val)
     val isa QuoteNode ? val.value : val
 end
 
+"""
+    get_value_type(val, code::CodeInfo) -> Type
+
+Get the Julia type of a value that could be SSAValue, SlotNumber, Argument, or a constant.
+"""
+function get_value_type(val, code::CodeInfo)
+    if val isa SSAValue
+        return code.ssavaluetypes[val.id]
+    elseif val isa SlotNumber
+        return code.slottypes[val.id]
+    elseif val isa Argument
+        # Argument(n) maps directly to slottypes[n]
+        return code.slottypes[val.n]
+    else
+        # Constant value
+        return typeof(val)
+    end
+end
+
 #=============================================================================
  Control Tree to Structured IR
 =============================================================================#
@@ -381,8 +400,9 @@ function handle_loop!(block::Block, tree::ControlTree, code::CodeInfo, blocks::V
 
             # Insert add_int expression before the loop
             adj_upper = convert_phi_value(original_upper)
-            add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, 1)
-            push!(block, adj_ssa_idx, add_int_expr, Int64)
+            upper_type = get_value_type(original_upper, code)
+            add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, one(upper_type))
+            push!(block, adj_ssa_idx, add_int_expr, upper_type)
 
             # Update ForOp's upper bound to the adjusted value
             for_op.upper = SSAValue(adj_ssa_idx)
