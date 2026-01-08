@@ -505,9 +505,9 @@ end
         x + 1.0
     end
 
-    # Float64 type should be preserved in types
-    @test !isempty(sci.types)
-    @test any(t -> t isa Type && t <: AbstractFloat, sci.types)
+    # Float64 type should be preserved in entry block types
+    @test !isempty(sci.entry.body)
+    @test any(((_, entry),) -> entry.typ isa Type && entry.typ <: AbstractFloat, sci.entry.body)
 end
 
 @testset "multiple arguments" begin
