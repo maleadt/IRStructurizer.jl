@@ -399,39 +399,41 @@ function find_break_values(block::Block)
 end
 
 #=============================================================================
- StructuredCodeInfo - the structured IR for a function
+ StructuredIRCode - the structured IR for a function
 =============================================================================#
 
 """
-    StructuredCodeInfo
+    StructuredIRCode
 
 Represents a function's code with a structured view of control flow.
-The CodeInfo is kept for metadata (slotnames, argtypes, method info).
 
 After structurize!(), the entry Block contains the final structured IR with
 expressions and control flow ops.
 
-Create with `StructuredCodeInfo(ci)` for a flat (unstructured) view,
+Create with `StructuredIRCode(ir)` for a flat (unstructured) view,
 then call `structurize!(sci)` to convert control flow to structured ops.
 """
-mutable struct StructuredCodeInfo
-    const code::CodeInfo                      # For metadata (slotnames, argtypes, etc.)
+mutable struct StructuredIRCode
+    const ir::IRCode                          # Julia IRCode
     entry::Block                              # Structured IR
-    max_ssa_idx::Int                          # Max SSA index (may exceed length(code.code) after structurization)
+    max_ssa_idx::Int                          # Max SSA index (may exceed length after structurization)
 end
 
-"""
-    StructuredCodeInfo(code::CodeInfo)
+# Accessor for consistency
+ir(sci::StructuredIRCode) = sci.ir
 
-Create a flat (unstructured) StructuredCodeInfo from Julia CodeInfo.
+"""
+    StructuredIRCode(ir::IRCode)
+
+Create a flat (unstructured) StructuredIRCode from Julia IRCode.
 All statements are placed sequentially in a single block,
 with control flow statements (GotoNode, GotoIfNot) included as-is.
 
 Call `structurize!(sci)` to convert to structured control flow.
 """
-function StructuredCodeInfo(code::CodeInfo)
-    stmts = code.code
-    types = code.ssavaluetypes
+function StructuredIRCode(ir::IRCode)
+    stmts = ir.stmts.stmt
+    types = ir.stmts.type
     n = length(stmts)
 
     entry = Block()
@@ -446,7 +448,7 @@ function StructuredCodeInfo(code::CodeInfo)
         end
     end
 
-    return StructuredCodeInfo(code, entry, n)
+    return StructuredIRCode(ir, entry, n)
 end
 
 #=============================================================================
