@@ -10,16 +10,19 @@ julia> using IRStructurizer
 julia> f(x) = x > 0 ? x + 1 : x - 1
 
 julia> code_structured(f, Tuple{Int})
-StructuredIRCode(
-│   %1 = intrinsic Base.slt_int(0, x)::Bool
-└── if %1 -> Nothing
-    ├ then:
-    │   %3 = intrinsic Base.add_int(x, 1)::Int64
-    │   return %3
-    ├ else:
-    │   %5 = intrinsic Base.sub_int(x, 1)::Int64
-    └   return %5
+1-element Vector{Pair{StructuredIRCode, DataType}}:
+ StructuredIRCode(
+│ %1 = intrinsic Base.slt_int(0, _2)::Bool
+│ %2 = if %1 -> Nothing
+│ ├ then:
+│ │   %3 = intrinsic Base.add_int(_2, 1)::Int64
+│ │   return %3
+│ ├ else:
+│ │   %5 = intrinsic Base.sub_int(_2, 1)::Int64
+│ └   return %5
 ) => Int64
+
+julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only
 ```
 
 ## API

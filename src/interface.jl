@@ -3,12 +3,13 @@
 export code_structured, StructuredIRCode
 
 """
-    code_structured(f, argtypes; validate=true, kwargs...) -> Pair{StructuredIRCode, DataType}
+    code_structured(f, argtypes; validate=true, kwargs...) -> Vector{Pair{StructuredIRCode, DataType}}
 
-Get the structured IR for a function with the given argument types.
+Returns an array of structured IR for the methods matching the given generic function
+and type signature.
 
-This is analogous to `code_typed` but returns a `StructuredIRCode` with
-control flow restructured into nested SCF-style operations (if/for/while).
+This is analogous to `code_typed` but returns `StructuredIRCode` with control flow
+restructured into nested SCF-style operations (if/for/while).
 
 # Arguments
 - `f`: The function to analyze
@@ -23,26 +24,28 @@ ForOp is created directly during CFG analysis for loops that match counting patt
 loops that don't match counting patterns. LoopOp is used for general cyclic regions.
 
 # Returns
-A `Pair{StructuredIRCode, DataType}` where the first element is the structured IR
-and the second is the return type. Displays with MLIR SCF-style syntax.
+A `Vector{Pair{StructuredIRCode, DataType}}` where each element is a pair of the
+structured IR and the return type for a matching method. Displays with MLIR SCF-style syntax.
 
 # Example
 ```julia
 julia> f(x) = x > 0 ? x + 1 : x - 1
 
 julia> code_structured(f, Tuple{Int})
-StructuredIRCode(
-│ %1 = Base.slt_int(0, x)::Bool
-│ ...
-└ return %3
-) => Int64
+1-element Vector{Pair{StructuredIRCode, DataType}}:
+ StructuredIRCode(
+ │ %1 = Base.slt_int(0, x)::Bool
+ │ ...
+ └ return %3
+ ) => Int64
 
-julia> sci, ret_type = code_structured(f, Tuple{Int})  # destructure
+julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only  # destructure
 ```
 """
 function code_structured(@nospecialize(f), @nospecialize(argtypes);
                          validate::Bool=true, kwargs...)
-    ir, ret_type = only(code_ircode(f, argtypes; kwargs...))
-    sci = StructuredIRCode(ir; validate)
-    return sci => ret_type
+    map(code_ircode(f, argtypes; kwargs...)) do (ir, ret_type)
+        sci = StructuredIRCode(ir; validate)
+        sci => ret_type
+    end
 end
