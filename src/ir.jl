@@ -477,6 +477,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     if validate
         validate_scf(sci.entry)
         validate_no_phis(sci.entry)
+        validate_terminators(sci.entry)
     end
 
     return sci

@@ -250,11 +250,12 @@ function handle_if_then_else!(block::Block, tree::ControlTree, ir::IRCode,
     merge_phis = find_merge_phis(ir, then_block_idx, else_block_idx)
 
     # Add YieldOp terminators with phi values
-    if !isempty(merge_phis)
-        then_values = [phi.then_val for phi in merge_phis]
-        else_values = [phi.else_val for phi in merge_phis]
-        then_blk.terminator = YieldOp(then_values)
-        else_blk.terminator = YieldOp(else_values)
+    then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
+        YieldOp([phi.then_val for phi in merge_phis]),
+        YieldOp([phi.else_val for phi in merge_phis])
+    else
+        something(then_blk.terminator, YieldOp()),
+        something(else_blk.terminator, YieldOp())
     end
 
     if_op = IfOp(cond_value, then_blk, else_blk)
@@ -378,11 +379,11 @@ function handle_if_then!(block::Block, tree::ControlTree, ir::IRCode,
     merge_phis = find_merge_phis(ir, then_block_idx, cond_idx)
 
     # Add YieldOp terminators with phi values
-    if !isempty(merge_phis)
-        then_values = [phi.then_val for phi in merge_phis]
-        else_values = [phi.else_val for phi in merge_phis]
-        then_blk.terminator = YieldOp(then_values)
-        else_blk.terminator = YieldOp(else_values)
+    then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
+        YieldOp([phi.then_val for phi in merge_phis]),
+        YieldOp([phi.else_val for phi in merge_phis])
+    else
+        something(then_blk.terminator, YieldOp()), YieldOp()
     end
 
     if_op = IfOp(cond_value, then_blk, else_blk)
@@ -450,12 +451,16 @@ function handle_termination!(block::Block, tree::ControlTree, ir::IRCode,
         else_tree = tree_children[3]
         then_blk = tree_to_block(then_tree, ir, ctx)
         else_blk = tree_to_block(else_tree, ir, ctx)
+        then_blk.terminator = something(then_blk.terminator, YieldOp())
+        else_blk.terminator = something(else_blk.terminator, YieldOp())
         if_op = IfOp(cond_value, then_blk, else_blk)
         push!(block, result_idx, if_op, Nothing)
     elseif length(tree_children) == 2
         then_tree = tree_children[2]
         then_blk = tree_to_block(then_tree, ir, ctx)
         else_blk = Block()
+        then_blk.terminator = something(then_blk.terminator, YieldOp())
+        else_blk.terminator = YieldOp()
         if_op = IfOp(cond_value, then_blk, else_blk)
         push!(block, result_idx, if_op, Nothing)
     end

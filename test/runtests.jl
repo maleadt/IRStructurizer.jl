@@ -4,7 +4,7 @@ using FileCheck
 using IRStructurizer
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
-                      validate_scf, statements
+                      validate_scf, validate_terminators, SSAVector, statements
 using Core: SSAValue
 using Base: code_ircode
 
@@ -52,6 +52,27 @@ end
     sci = StructuredIRCode(ir)
     @test !any(expr -> expr isa Core.GotoIfNot, statements(sci.entry.body))
     validate_scf(sci)  # Should not throw
+end
+
+@testset "validation: InvalidTerminatorError" begin
+    # Manually construct malformed IR with missing YieldOp
+    then_region = Block()
+    else_region = Block()
+    if_op = IfOp(true, then_region, else_region)
+    entry = Block()
+    push!(entry, 1, if_op, Tuple{Int})
+
+    # Validation should catch the missing YieldOp
+    @test_throws InvalidTerminatorError validate_terminators(entry)
+
+    # Verify the error message mentions the issue
+    try
+        validate_terminators(entry)
+    catch e
+        @test e isa InvalidTerminatorError
+        @test any(msg -> occursin("then region", msg), e.messages)
+        @test any(msg -> occursin("else region", msg), e.messages)
+    end
 end
 
 @testset "ForOp detection during CFG analysis" begin
