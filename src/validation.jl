@@ -100,7 +100,7 @@ function Base.showerror(io::IO, e::InvalidTerminatorError)
 end
 
 """
-    validate_terminators(entry::Block) -> Bool
+    validate_terminators(sci::StructuredIRCode) -> Bool
 
 Validate that all structured control flow ops have correct terminators.
 Throws `InvalidTerminatorError` if any terminator is missing or invalid.
@@ -112,31 +112,35 @@ Validation rules:
 - WhileOp after: must have YieldOp
 - LoopOp body: recursively validate nested ops
 """
-function validate_terminators(entry::Block)
+function validate_terminators(sci::StructuredIRCode)
     errors = String[]
-    validate_terminators!(errors, entry)
+    validate_terminators!(errors, sci, sci.entry)
     isempty(errors) || throw(InvalidTerminatorError(errors))
     return true
 end
 
-validate_terminators(sci::StructuredIRCode) = validate_terminators(sci.entry)
+# Convenience method for testing: wrap block in minimal SCI
+function validate_terminators(entry::Block)
+    sci = StructuredIRCode(Any[], Any[], entry, 0)
+    return validate_terminators(sci)
+end
 
-function validate_terminators!(errors::Vector{String}, block::Block)
+function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, block::Block)
     for (idx, entry) in block.body
         stmt = entry.stmt
         if stmt isa IfOp
-            validate_if_terminators!(errors, stmt, idx)
+            validate_if_terminators!(errors, sci, stmt, idx)
         elseif stmt isa ForOp
-            validate_for_terminators!(errors, stmt, idx)
+            validate_for_terminators!(errors, sci, stmt, idx)
         elseif stmt isa WhileOp
-            validate_while_terminators!(errors, stmt, idx)
+            validate_while_terminators!(errors, sci, stmt, idx)
         elseif stmt isa LoopOp
-            validate_loop_terminators!(errors, stmt, idx)
+            validate_loop_terminators!(errors, sci, stmt, idx)
         end
     end
 end
 
-function validate_if_terminators!(errors::Vector{String}, op::IfOp, idx::Int)
+function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::IfOp, idx::Int)
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
@@ -150,31 +154,40 @@ function validate_if_terminators!(errors::Vector{String}, op::IfOp, idx::Int)
         push!(errors, "IfOp at %$idx: else region must have explicit terminator, got nothing")
     end
 
-    # Validate yield arity: both branches must yield same number of values
+    # Validate yield arity and types: both branches must yield same number of values with matching types
     if then_term isa YieldOp && else_term isa YieldOp
         then_arity = length(then_term.values)
         else_arity = length(else_term.values)
         if then_arity != else_arity
             push!(errors, "IfOp at %$idx: yield arity mismatch (then yields $then_arity, else yields $else_arity)")
         end
+
+        # Type validation for matching positions
+        for i in 1:min(then_arity, else_arity)
+            then_type = resolve_type(sci, then_term.values[i])
+            else_type = resolve_type(sci, else_term.values[i])
+            if then_type !== nothing && else_type !== nothing && then_type != else_type
+                push!(errors, "IfOp at %$idx: yield type mismatch at position $i (then: $then_type, else: $else_type)")
+            end
+        end
     end
 
     # Recursively validate nested ops
-    validate_terminators!(errors, op.then_region)
-    validate_terminators!(errors, op.else_region)
+    validate_terminators!(errors, sci, op.then_region)
+    validate_terminators!(errors, sci, op.else_region)
 end
 
-function validate_for_terminators!(errors::Vector{String}, op::ForOp, idx::Int)
+function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::ForOp, idx::Int)
     term = op.body.terminator
     if !(term isa ContinueOp)
         push!(errors, "ForOp at %$idx: body must have ContinueOp, got $(typeof(term))")
     end
 
     # Recursively validate nested ops
-    validate_terminators!(errors, op.body)
+    validate_terminators!(errors, sci, op.body)
 end
 
-function validate_while_terminators!(errors::Vector{String}, op::WhileOp, idx::Int)
+function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::WhileOp, idx::Int)
     before_term = op.before.terminator
     after_term = op.after.terminator
 
@@ -186,12 +199,12 @@ function validate_while_terminators!(errors::Vector{String}, op::WhileOp, idx::I
     end
 
     # Recursively validate nested ops
-    validate_terminators!(errors, op.before)
-    validate_terminators!(errors, op.after)
+    validate_terminators!(errors, sci, op.before)
+    validate_terminators!(errors, sci, op.after)
 end
 
-function validate_loop_terminators!(errors::Vector{String}, op::LoopOp, idx::Int)
+function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::LoopOp, idx::Int)
     # LoopOp body can have various terminators (BreakOp, ContinueOp, etc.)
     # Just recursively validate nested ops
-    validate_terminators!(errors, op.body)
+    validate_terminators!(errors, sci, op.body)
 end
