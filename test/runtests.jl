@@ -4,7 +4,7 @@ using FileCheck
 using IRStructurizer
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
-                      validate_scf, validate_terminators, SSAVector, statements
+                      validate_scf, validate_terminators, SSAMap, statements
 using Core: SSAValue
 using Base: code_ircode
 
@@ -572,13 +572,12 @@ end
     end |> only
     validate_scf(sci)
 
-    # Find the loop in the structure
-    while_idx = findfirst(stmt -> stmt isa WhileOp, collect(statements(sci.entry.body)))
-    if while_idx !== nothing
-        # Check that the result type is Tuple{} (no results), not Int
-        result_type = sci.entry.body[while_idx].typ
-        @test result_type === Tuple{}
-    end
+    # Find the loop in the structure (may be LoopOp, WhileOp, or ForOp)
+    matches = filter(p -> p[2].stmt isa LoopOp || p[2].stmt isa WhileOp || p[2].stmt isa ForOp, sci.entry.body)
+    @test length(matches) == 1
+    (_, entry) = only(matches)
+    # Check that the result type is Tuple{} (no results), not Int
+    @test entry.typ === Tuple{}
 end
 
 @testset "while loop ConditionOp uses BlockArgs not SSAValues" begin
@@ -593,20 +592,16 @@ end
     end |> only
     validate_scf(sci)
 
-    while_idx = findfirst(stmt -> stmt isa WhileOp, collect(statements(sci.entry.body)))
-    @test while_idx !== nothing
+    (_, entry) = only(filter(p -> p[2].stmt isa WhileOp, sci.entry.body))
+    while_op = entry.stmt
+    before = while_op.before
 
-    if while_idx !== nothing
-        while_op = sci.entry.body[while_idx].stmt
-        before = while_op.before
+    @test before.terminator isa ConditionOp
+    cond_op = before.terminator
 
-        @test before.terminator isa ConditionOp
-        cond_op = before.terminator
-
-        # The result should be BlockArg, not SSAValue
-        @test !isempty(cond_op.args)
-        @test cond_op.args[1] isa IRStructurizer.BlockArg
-    end
+    # The result should be BlockArg, not SSAValue
+    @test !isempty(cond_op.args)
+    @test cond_op.args[1] isa IRStructurizer.BlockArg
 end
 
 @testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin
