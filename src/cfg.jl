@@ -4,9 +4,6 @@ using Graphs
 using Graphs: AbstractGraph, SimpleDiGraph, Edge, add_edge!, rem_edge!,
               vertices, edges, nv, ne, inneighbors, outneighbors, edgetype, is_cyclic
 
-# Re-export from Core.Compiler (imported in IRStructurizer.jl)
-# construct_domtree, DomTree, dominates, bb_unreachable
-
 """
     is_backedge(domtree::DomTree, from::Int, to::Int) -> Bool
 

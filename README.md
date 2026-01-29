@@ -33,9 +33,12 @@ Get structured IR for function `f` with argument types `argtypes`.
 
 - `validate`: Throw `UnstructuredControlFlowError` if unstructured control flow remains
 
-### `structurize!(sci::StructuredIRCode)`
+### `StructuredIRCode(ir::IRCode; structurize=true, validate=true)`
 
-Convert unstructured control flow in-place. Lower-level API if you already have a `StructuredIRCode`, which can be constructed from Julia's `IRCode`.
+Construct structured IR from Julia's `IRCode` (obtained via `Base.code_ircode`).
+
+- `structurize`: Convert unstructured control flow (GotoNode/GotoIfNot) into structured operations
+- `validate`: Throw `UnstructuredControlFlowError` if unstructured control flow remains
 
 
 ## Implementation

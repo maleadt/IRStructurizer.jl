@@ -1,6 +1,6 @@
 # public API
 
-export code_structured, StructuredIRCode
+export code_structured
 
 """
     code_structured(f, argtypes; validate=true, kwargs...) -> Vector{Pair{StructuredIRCode, DataType}}

@@ -1,5 +1,7 @@
 # structured IR definitions
 
+export StructuredIRCode
+
 #=============================================================================
  Block Arguments (for loop carried values)
 =============================================================================#
