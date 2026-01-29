@@ -9,6 +9,7 @@ Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
 MLStyle = "d8e11817-5142-5d16-987a-aa16d5891078"
 
 [compat]
+julia = "1.11"
 AbstractTrees = "0.4"
 Graphs = "1.13.2"
 MLStyle = "0.4"
