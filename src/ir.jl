@@ -498,29 +498,101 @@ function apply_substitutions!(op::IfOp, subs::Substitutions)
     apply_substitutions!(op.else_region, subs)
 end
 
-function apply_substitutions!(op::LoopOp, subs::Substitutions)
-    for (j, v) in enumerate(op.init_values)
-        op.init_values[j] = substitute_ssa(v, subs)
-    end
-    apply_substitutions!(op.body, subs)
-end
-
-function apply_substitutions!(op::WhileOp, subs::Substitutions)
-    for (j, v) in enumerate(op.init_values)
-        op.init_values[j] = substitute_ssa(v, subs)
-    end
-    apply_substitutions!(op.before, subs)
-    apply_substitutions!(op.after, subs)
-end
-
 function apply_substitutions!(op::ForOp, subs::Substitutions)
+    # Substitute bounds and init_values (evaluated in outer scope)
     op.lower = substitute_ssa(op.lower, subs)
     op.upper = substitute_ssa(op.upper, subs)
     op.step = substitute_ssa(op.step, subs)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
-    apply_substitutions!(op.body, subs)
+
+    # Thread outer BlockArgs through inner loop as invariant carries.
+    # Without this, an outer BlockArg(1) collides with the inner loop's own BlockArg(1) (its IV).
+    isempty(subs) && return
+    inner_subs = Substitutions()
+    for (ssa_idx, outer_arg) in subs
+        next_id = isempty(op.body.args) ? 2 : maximum(a.id for a in op.body.args) + 1
+        inner_arg = BlockArg(next_id, outer_arg.type)
+        push!(op.body.args, inner_arg)
+        push!(op.init_values, outer_arg)
+        if op.body.terminator isa ContinueOp
+            push!(op.body.terminator.values, inner_arg)
+        end
+        inner_subs[ssa_idx] = inner_arg
+    end
+    apply_substitutions!(op.body, inner_subs)
+end
+
+function apply_substitutions!(op::LoopOp, subs::Substitutions)
+    for (j, v) in enumerate(op.init_values)
+        op.init_values[j] = substitute_ssa(v, subs)
+    end
+
+    isempty(subs) && return
+    inner_subs = Substitutions()
+    for (ssa_idx, outer_arg) in subs
+        next_id = isempty(op.body.args) ? 1 : maximum(a.id for a in op.body.args) + 1
+        inner_arg = BlockArg(next_id, outer_arg.type)
+        push!(op.body.args, inner_arg)
+        push!(op.init_values, outer_arg)
+        _thread_loop_carry!(op.body, inner_arg)
+        inner_subs[ssa_idx] = inner_arg
+    end
+    apply_substitutions!(op.body, inner_subs)
+end
+
+"""
+    _thread_loop_carry!(block, inner_arg)
+
+Push `inner_arg` to every ContinueOp and BreakOp terminator reachable from `block`,
+recursing into nested IfOps (but not into nested loop ops, which have their own scopes).
+"""
+function _thread_loop_carry!(block::Block, inner_arg::BlockArg)
+    if block.terminator isa ContinueOp
+        push!(block.terminator.values, inner_arg)
+    elseif block.terminator isa BreakOp
+        push!(block.terminator.values, inner_arg)
+    end
+    for stmt in statements(block.body)
+        if stmt isa IfOp
+            _thread_loop_carry!(stmt.then_region, inner_arg)
+            _thread_loop_carry!(stmt.else_region, inner_arg)
+        end
+    end
+end
+
+function apply_substitutions!(op::WhileOp, subs::Substitutions)
+    for (j, v) in enumerate(op.init_values)
+        op.init_values[j] = substitute_ssa(v, subs)
+    end
+
+    isempty(subs) && return
+    before_subs = Substitutions()
+    after_subs = Substitutions()
+    for (ssa_idx, outer_arg) in subs
+        # before region
+        next_before_id = isempty(op.before.args) ? 1 : maximum(a.id for a in op.before.args) + 1
+        before_arg = BlockArg(next_before_id, outer_arg.type)
+        push!(op.before.args, before_arg)
+        push!(op.init_values, outer_arg)
+        if op.before.terminator isa ConditionOp
+            push!(op.before.terminator.args, before_arg)
+        end
+
+        # after region
+        next_after_id = isempty(op.after.args) ? 1 : maximum(a.id for a in op.after.args) + 1
+        after_arg = BlockArg(next_after_id, outer_arg.type)
+        push!(op.after.args, after_arg)
+        if op.after.terminator isa YieldOp
+            push!(op.after.terminator.values, after_arg)
+        end
+
+        before_subs[ssa_idx] = before_arg
+        after_subs[ssa_idx] = after_arg
+    end
+    apply_substitutions!(op.before, before_subs)
+    apply_substitutions!(op.after, after_subs)
 end
 
 
