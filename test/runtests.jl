@@ -716,6 +716,49 @@ end
     end
 end
 
+@testset "outer IV used inside inner loop" begin
+    sci, _ = code_structured(Tuple{Int, Int}) do n::Int, m::Int
+        acc = 0
+        i = 0
+        while i < n
+            j = 0
+            while j < m
+                acc += i  # outer IV used in inner body
+                j += 1
+            end
+            i += 1
+        end
+        return acc
+    end |> only
+    validate_scf(sci)
+
+    # Verify the inner ForOp threads outer IV through as an extra init_value
+    outer_for = nothing
+    for (_, entry) in sci.entry.body
+        if entry.stmt isa ForOp
+            outer_for = entry.stmt
+            break
+        end
+    end
+    @test outer_for !== nothing
+
+    inner_for = nothing
+    for (_, entry) in outer_for.body.body
+        if entry.stmt isa ForOp
+            inner_for = entry.stmt
+            break
+        end
+    end
+    @test inner_for !== nothing
+
+    # Inner ForOp should have extra init_values for threaded outer BlockArgs.
+    # Original inner loop has 1 non-IV init_value (acc).
+    # The outer loop's subs has 2 entries (IV i + carried acc), both threaded through.
+    # After fix: 1 (acc) + 2 (outer IV + outer acc) = 3 init_values
+    @test length(inner_for.init_values) == 3
+    @test length(inner_for.body.args) == 3
+end
+
 end  # regression
 
 #=============================================================================
