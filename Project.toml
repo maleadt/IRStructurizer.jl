@@ -1,7 +1,7 @@
 name = "IRStructurizer"
 uuid = "93e32bba-5bb8-402b-805d-ffb066edee93"
 authors = ["Tim Besard <tim.besard@gmail.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 AbstractTrees = "1520ce14-60c1-5f80-bbc7-55ef81b5835c"
