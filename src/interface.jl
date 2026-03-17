@@ -2,8 +2,17 @@
 
 export code_structured
 
+function default_tt(@nospecialize(f))
+    ms = methods(f)
+    if length(ms) == 1
+        return Base.tuple_type_tail(only(ms).sig)
+    else
+        return Tuple
+    end
+end
+
 """
-    code_structured(f, argtypes; validate=true, kwargs...) -> Vector{Pair{StructuredIRCode, DataType}}
+    code_structured(f, [argtypes]; validate=true, kwargs...) -> Vector{Pair{StructuredIRCode, DataType}}
 
 Returns an array of structured IR for the methods matching the given generic function
 and type signature.
@@ -13,7 +22,8 @@ restructured into nested SCF-style operations (if/for/while).
 
 # Arguments
 - `f`: The function to analyze
-- `argtypes`: Argument types as a tuple of types (e.g., `(Int, Float64)`)
+- `argtypes`: Argument types as a tuple of types (e.g., `Tuple{Int, Float64}`).
+  If omitted and `f` has exactly one method, the types are inferred from its signature.
 - `validate`: Whether to validate that all control flow was properly structured (default: true).
   When `true`, throws `UnstructuredControlFlowError` if any unstructured control flow remains.
 
@@ -42,7 +52,7 @@ julia> code_structured(f, Tuple{Int})
 julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only  # destructure
 ```
 """
-function code_structured(@nospecialize(f), @nospecialize(argtypes);
+function code_structured(@nospecialize(f), @nospecialize(argtypes=default_tt(f));
                          validate::Bool=true, kwargs...)
     map(code_ircode(f, argtypes; kwargs...)) do (ir, ret_type)
         sci = StructuredIRCode(ir; validate)

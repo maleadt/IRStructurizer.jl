@@ -91,6 +91,24 @@ end
     @test loop_ops[1] isa ForOp
 end
 
+@testset "code_structured single-argument form" begin
+    # Single-method function: argtypes inferred from signature
+    h_single(x::Int) = x > 0 ? x + 1 : x - 1
+    sci1, ret1 = code_structured(h_single) |> only
+    @test any(x -> x isa IfOp, statements(sci1.entry.body))
+    @test ret1 === Int64
+
+    # Equivalent to explicit argtypes
+    sci2, ret2 = code_structured(h_single, Tuple{Int}) |> only
+    @test ret1 === ret2
+
+    # Multi-method function: falls back to Tuple, returns all methods
+    h_multi(x::Int) = x + 1
+    h_multi(x::Float64) = x - 1.0
+    results = code_structured(h_multi)
+    @test length(results) == 2
+end
+
 @testset "display output format" begin
     # Verify display shows proper structure
     sci, _ = code_structured(Tuple{Bool}) do x::Bool
