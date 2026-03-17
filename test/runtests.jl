@@ -759,6 +759,42 @@ end
     @test length(inner_for.body.args) == 3
 end
 
+@testset "unreachable blocks are ignored" begin
+    # IR with unreachable blocks (e.g., from :meta nodes placed in dead blocks)
+    # should be handled gracefully by skipping them during structurization.
+    f_simple(x::Int) = x + 1
+    ir, _ = only(code_ircode(f_simple, (Int,)))
+
+    # Manually add an unreachable block with a :meta node
+    nstmts = length(ir.stmts)
+    push!(ir.cfg.blocks, Core.Compiler.BasicBlock(
+        Core.Compiler.StmtRange(nstmts + 1, nstmts + 1),
+        Int[],  # no predecessors — unreachable
+        Int[],  # no successors
+    ))
+    # Add a dummy statement for the unreachable block
+    Core.Compiler.resize!(ir.stmts, nstmts + 1)
+    inst = ir.stmts[nstmts + 1]
+    @static if VERSION >= v"1.12-"
+        inst[:stmt] = Expr(:meta, :test, :dummy)
+        inst[:type] = Nothing
+        inst[:info] = Core.Compiler.NoCallInfo()
+        inst[:line] = (Int32(0), Int32(0), Int32(0))
+        inst[:flag] = Core.Compiler.IR_FLAGS_EFFECTS
+    else
+        Core.Compiler.setindex!(inst, Expr(:meta, :test, :dummy), :stmt)
+        Core.Compiler.setindex!(inst, Nothing, :type)
+        Core.Compiler.setindex!(inst, Core.Compiler.NoCallInfo(), :info)
+        Core.Compiler.setindex!(inst, Int32(0), :line)
+        Core.Compiler.setindex!(inst, Core.Compiler.IR_FLAGS_EFFECTS, :flag)
+    end
+
+    # This should succeed — unreachable block is skipped
+    sci = StructuredIRCode(ir)
+    validate_scf(sci)
+    @test sci.entry.terminator isa Core.ReturnNode
+end
+
 end  # regression
 
 #=============================================================================

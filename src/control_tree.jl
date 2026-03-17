@@ -639,7 +639,22 @@ function ControlTree(ir::IRCode)
 
     sccs = strongly_connected_components(cfg)
 
-    control_trees = Dict{T,ControlTree}(v => ControlTree(ControlNode(v, REGION_BLOCK)) for v in vertices(cfg))
+    # Remove unreachable blocks — they can't match any region pattern and would
+    # prevent the CFG from contracting to a single vertex.  This handles e.g.
+    # :meta nodes that Julia's optimizer places in dead blocks.
+    entry_node = first(vertices(cfg))
+    reachable = Set{T}()
+    stack = T[entry_node]
+    while !isempty(stack)
+        u = pop!(stack)
+        u in reachable && continue
+        push!(reachable, u)
+        for s in outneighbors(cfg, u)
+            s in reachable || push!(stack, s)
+        end
+    end
+
+    control_trees = Dict{T,ControlTree}(v => ControlTree(ControlNode(v, REGION_BLOCK)) for v in vertices(cfg) if v in reachable)
     # Use reverse post-order traversal
     next = reverse(traverse(cfg))
 
@@ -700,7 +715,7 @@ function ControlTree(ir::IRCode)
         pushfirst!(next, v)
     end
 
-    @assert nv(abstract_graph) == 1 string("Expected to contract the CFG into a single vertex, got ", nv(abstract_graph), " vertices instead.")
+    @assert length(control_trees) == 1 string("Expected to contract the CFG into a single vertex, got ", length(control_trees), " vertices instead.")
     only(values(control_trees))
 end
 
