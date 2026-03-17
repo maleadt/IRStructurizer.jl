@@ -27,5 +27,6 @@ include("structure.jl")
 # validation and public API
 include("validation.jl")
 include("interface.jl")
+include("precompile.jl")
 
 end
