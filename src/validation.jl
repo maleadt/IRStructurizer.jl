@@ -182,9 +182,62 @@ function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCo
 end
 
 function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::LoopOp, idx::Int)
-    # LoopOp body can have various terminators (BreakOp, ContinueOp, etc.)
-    # Just recursively validate nested ops
+    n_init = length(op.init_values)
+    n_args = length(op.body.args)
+
+    # init_values must match body.args
+    if n_init != n_args
+        push!(errors, "LoopOp at %$idx: init_values length ($n_init) != body.args length ($n_args)")
+    end
+
+    # Collect all ContinueOps and BreakOps reachable from the body
+    # (recurse into nested IfOps but NOT into nested loop ops)
+    continues = ContinueOp[]
+    breaks = BreakOp[]
+    _collect_loop_terminators!(continues, breaks, op.body)
+
+    # All ContinueOps must match loop-carry length
+    for cont in continues
+        nc = length(cont.values)
+        if nc != n_init
+            push!(errors, "LoopOp at %$idx: ContinueOp has $nc values, expected $n_init (loop-carry length)")
+        end
+    end
+
+    # All BreakOps must have the same arity and at least n_init values
+    if !isempty(breaks)
+        break_arity = length(first(breaks).values)
+        if break_arity < n_init
+            push!(errors, "LoopOp at %$idx: BreakOp has $break_arity values, expected >= $n_init (loop-carry length)")
+        end
+        for brk in breaks
+            nb = length(brk.values)
+            if nb != break_arity
+                push!(errors, "LoopOp at %$idx: BreakOp arity mismatch ($nb vs $break_arity)")
+            end
+        end
+    end
+
+    # Recursively validate nested ops
     validate_terminators!(errors, sci, op.body)
+end
+
+"""
+Collect all ContinueOp and BreakOp terminators reachable from `block`,
+recursing into nested IfOps but NOT into nested loop ops (which have their own scope).
+"""
+function _collect_loop_terminators!(continues::Vector{ContinueOp}, breaks::Vector{BreakOp}, block::Block)
+    if block.terminator isa ContinueOp
+        push!(continues, block.terminator)
+    elseif block.terminator isa BreakOp
+        push!(breaks, block.terminator)
+    end
+    for stmt in statements(block.body)
+        if stmt isa IfOp
+            _collect_loop_terminators!(continues, breaks, stmt.then_region)
+            _collect_loop_terminators!(continues, breaks, stmt.else_region)
+        end
+    end
 end
 
 #=============================================================================
