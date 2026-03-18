@@ -55,7 +55,7 @@ end
     validate_scf(sci)  # Should not throw
 end
 
-@testset "validation: InvalidTerminatorError" begin
+@testset "validation: invalid terminators" begin
     # Manually construct malformed IR with missing YieldOp
     then_region = Block()
     else_region = Block()
@@ -64,19 +64,19 @@ end
     push!(entry, 1, if_op, Tuple{Int})
 
     # Validation should catch the missing YieldOp
-    @test_throws InvalidTerminatorError validate_terminators(entry)
+    @test_throws ErrorException validate_terminators(entry)
 
     # Verify the error message mentions the issue
     try
         validate_terminators(entry)
     catch e
-        @test e isa InvalidTerminatorError
-        @test any(msg -> occursin("then region", msg), e.messages)
-        @test any(msg -> occursin("else region", msg), e.messages)
+        @test e isa ErrorException
+        @test occursin("then region", e.msg)
+        @test occursin("else region", e.msg)
     end
 end
 
-@testset "validation: scope-aware UndefinedSSAError" begin
+@testset "validation: scope-aware undefined SSA" begin
     # Manually construct IR where an SSA value defined inside an IfOp branch
     # is referenced in the outer scope — should be caught by scoped validation.
     then_region = Block()
@@ -94,7 +94,7 @@ end
     entry.terminator = Core.ReturnNode(SSAValue(2))
 
     sci = StructuredIRCode(Any[Any, Int64], Any[], entry, 10)
-    @test_throws UndefinedSSAError validate_ssa_defs(sci)
+    @test_throws ErrorException validate_ssa_defs(sci)
 
     # Same structure but referencing %2 (defined in outer scope) — should pass
     entry2 = Block()
@@ -881,6 +881,38 @@ end
     sci = StructuredIRCode(ir)
     validate_scf(sci)
     @test sci.entry.terminator isa Core.ReturnNode
+end
+
+@testset "REGION_PROPER: short-circuit || pattern" begin
+    # This was broken: handle_block_region! silently dropped merge phis
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        r = 0
+        if x > 0 || y > 0
+            r = 1
+        end
+        r
+    end |> only
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+
+    # Verify the output has nested IfOps (from || lowering)
+    if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
+    @test !isempty(if_ops)
+end
+
+@testset "REGION_PROPER: short-circuit && pattern" begin
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        r = 0
+        if x > 0 && y > 0
+            r = 1
+        end
+        r
+    end |> only
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+
+    if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
+    @test !isempty(if_ops)
 end
 
 end  # regression

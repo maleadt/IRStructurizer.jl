@@ -1,7 +1,6 @@
 # structured IR validation
 
-export UnstructuredControlFlowError, UnsubstitutedPhiError, InvalidTerminatorError,
-       UndefinedSSAError
+export UnstructuredControlFlowError
 
 """
 Exception thrown when unstructured control flow is detected in structured IR.
@@ -15,17 +14,6 @@ function Base.showerror(io::IO, e::UnstructuredControlFlowError)
           join(e.stmt_indices, ", "))
 end
 
-"""
-Exception thrown when phi nodes remain after block arg substitution.
-"""
-struct UnsubstitutedPhiError <: Exception
-    stmt_indices::Vector{Int}
-end
-
-function Base.showerror(io::IO, e::UnsubstitutedPhiError)
-    print(io, "UnsubstitutedPhiError: phi nodes remain at statement(s): ",
-          join(e.stmt_indices, ", "))
-end
 
 """
     validate_scf(entry::Block) -> Bool
@@ -60,12 +48,13 @@ end
     validate_no_phis(entry::Block) -> Bool
 
 Validate that all phi nodes have been converted to BlockArgs.
-Throws `UnsubstitutedPhiError` if PhiNode expressions remain.
+Errors if PhiNode expressions remain (indicates a bug in structurization).
 """
 function validate_no_phis(entry::Block)
     remaining = Int[]
     validate_no_phis!(remaining, entry)
-    isempty(remaining) || throw(UnsubstitutedPhiError(sort!(remaining)))
+    isempty(remaining) || error("internal error: phi nodes remain at statement(s): ",
+                                  join(sort!(remaining), ", "))
     return true
 end
 
@@ -86,25 +75,10 @@ function validate_no_phis!(bad::Vector{Int}, block::Block)
 end
 
 """
-Exception thrown when structured control flow ops have invalid terminators.
-"""
-struct InvalidTerminatorError <: Exception
-    messages::Vector{String}
-end
-
-function Base.showerror(io::IO, e::InvalidTerminatorError)
-    print(io, "InvalidTerminatorError: ")
-    for (i, msg) in enumerate(e.messages)
-        i > 1 && print(io, "; ")
-        print(io, msg)
-    end
-end
-
-"""
     validate_terminators(sci::StructuredIRCode) -> Bool
 
 Validate that all structured control flow ops have correct terminators.
-Throws `InvalidTerminatorError` if any terminator is missing or invalid.
+Errors if any terminator is missing or invalid (indicates a bug in structurization).
 
 Validation rules:
 - IfOp: both regions must have explicit terminator (never `nothing`)
@@ -116,7 +90,8 @@ Validation rules:
 function validate_terminators(sci::StructuredIRCode)
     errors = String[]
     validate_terminators!(errors, sci, sci.entry)
-    isempty(errors) || throw(InvalidTerminatorError(errors))
+    isempty(errors) || error("internal error: invalid terminators: ",
+                              join(errors, "; "))
     return true
 end
 
@@ -217,18 +192,6 @@ end
 =============================================================================#
 
 """
-Exception thrown when SSA values are used but never defined in the structured IR.
-"""
-struct UndefinedSSAError <: Exception
-    undefined::Vector{Int}
-end
-
-function Base.showerror(io::IO, e::UndefinedSSAError)
-    print(io, "UndefinedSSAError: SSA values used but not defined: ",
-          join(("%$id" for id in e.undefined), ", "))
-end
-
-"""
     validate_ssa_defs(sci::StructuredIRCode) -> Bool
 
 Validate that all SSAValue references in the structured IR have definitions
@@ -236,14 +199,15 @@ visible in their scope. Uses scope-aware checking: defs inside IfOp branches,
 LoopOp/WhileOp/ForOp bodies are NOT visible to the enclosing scope — only
 the op's result SSA index is visible.
 
-Throws `UndefinedSSAError` if any SSAValue is used but not defined in its scope.
+Errors if any SSAValue is used but not defined in its scope (indicates a bug in structurization).
 """
 function validate_ssa_defs(sci::StructuredIRCode)
     scope_stack = [Set{Int}()]  # stack of def sets; index 1 = outermost
     violations = Int[]
     validate_ssa_defs_scoped!(scope_stack, violations, sci.entry)
     undefined = sort!(unique!(violations))
-    isempty(undefined) || throw(UndefinedSSAError(undefined))
+    isempty(undefined) || error("internal error: SSA values used but not defined: ",
+                                join(("%$id" for id in undefined), ", "))
     return true
 end
 

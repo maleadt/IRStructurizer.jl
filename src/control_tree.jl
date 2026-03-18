@@ -15,7 +15,6 @@ Acyclic regions:
 - `REGION_BLOCK`: Linear sequence of blocks `u` ─→ [`v`, `vs...`] ─→ `w`
 - `REGION_IF_THEN`: Conditional with one branch `u` ─→ `v` and one merge block reachable by `u` ─→ `w` or `v` ─→ `w`
 - `REGION_IF_THEN_ELSE`: Conditional with two symmetric branches `u` ─→ `v` and `u` ─→ `w` and a single merge block reachable by `v` ─→ x or `w` ─→ x
-- `REGION_SWITCH`: Conditional with any number of branches [`u` ─→ `vᵢ`, `u` ─→ `vᵢ₊₁`, ...] and a single merge block reachable by [`vᵢ` ─→ `w`, `vᵢ₊₁` ─→ `w`, ...]
 - `REGION_TERMINATION`: Acyclic region which contains a block `v` with multiple branches, including one or multiple branches to blocks `wᵢ` which end with a function termination instruction. The region is composed of `v` and all the `wᵢ`.
 - `REGION_PROPER`: Generic proper region that doesn't match simpler patterns. Single-entry acyclic subgraph where the entry dominates all nodes.
 
@@ -28,7 +27,6 @@ Cyclic regions:
     REGION_BLOCK
     REGION_IF_THEN
     REGION_IF_THEN_ELSE
-    REGION_SWITCH
     REGION_TERMINATION
     REGION_FOR_LOOP
     REGION_WHILE_LOOP
@@ -92,33 +90,6 @@ end
     nothing
 end
 
-@active switch_region(args) begin
-    (g, v) = args
-    ws = outneighbors(g, v)
-    length(ws) ≥ 2 || return nothing
-    break_candidate = nothing
-    for w in ws
-        us = inneighbors(g, w)
-        length(us) ≤ 2 || return nothing
-        for u in us
-            u == v || in(u, ws) && u ≠ w || return nothing
-        end
-        out = outneighbors(g, w)
-        length(out) ≤ 2 || return nothing
-        # Consider that a termination region instead.
-        length(ws) == 2 && isempty(out) && return nothing
-        for w′ in out
-            in(w′, ws) && continue
-            if isnothing(break_candidate)
-                w′ == v && return nothing
-                break_candidate = w′
-            end
-            w′ == break_candidate || return nothing
-        end
-    end
-    Some(ws)
-end
-
 @active termination_region(args) begin
     (g, v, backedges) = args
     length(outneighbors(g, v)) ≥ 2 || return nothing
@@ -133,7 +104,6 @@ function acyclic_region(g, v, ec, doms, domtree, backedges)
         block_region(vs) => return (REGION_BLOCK, vs)
         if_then_region(v, t, m) => return (REGION_IF_THEN, [v, t])
         if_then_else_region(v, t, e, m) => return (REGION_IF_THEN_ELSE, [v, t, e])
-        switch_region(branches) => return (REGION_SWITCH, [v; branches])
         _ => nothing
     end
     @match (g, v, backedges) begin
@@ -584,10 +554,9 @@ ControlTree(v::Integer, region_type::RegionType, children=ControlTree[]) = Contr
 ControlTree(v::Integer, region_type::RegionType, meta::ForLoopInfo, children=ControlTree[]) = ControlTree(ControlNode(v, region_type, meta), children)
 
 is_loop(ctree::ControlTree) = in(region_type(ctree), (REGION_FOR_LOOP, REGION_NATURAL_LOOP, REGION_WHILE_LOOP))
-is_selection(ctree::ControlTree) = in(region_type(ctree), (REGION_IF_THEN, REGION_IF_THEN_ELSE, REGION_SWITCH, REGION_TERMINATION))
+is_selection(ctree::ControlTree) = in(region_type(ctree), (REGION_IF_THEN, REGION_IF_THEN_ELSE, REGION_TERMINATION))
 is_block(ctree::ControlTree) = region_type(ctree) == REGION_BLOCK
 is_proper_region(ctree::ControlTree) = region_type(ctree) == REGION_PROPER
-is_switch(ctree::ControlTree) = region_type(ctree) == REGION_SWITCH
 
 is_single_entry_single_exit(g::AbstractGraph, v) = length(inneighbors(g, v)) == 1 && length(outneighbors(g, v)) == 1
 is_single_entry_single_exit(g::AbstractGraph) = is_weakly_connected(g) && length(sinks(g)) == length(sources(g)) == 1
@@ -715,7 +684,10 @@ function ControlTree(ir::IRCode)
         pushfirst!(next, v)
     end
 
-    @assert length(control_trees) == 1 string("Expected to contract the CFG into a single vertex, got ", length(control_trees), " vertices instead.")
+    if length(control_trees) != 1
+        remaining = sort!(collect(keys(control_trees)))
+        throw(UnstructuredControlFlowError(remaining))
+    end
     only(values(control_trees))
 end
 

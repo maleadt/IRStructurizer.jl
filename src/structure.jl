@@ -7,26 +7,10 @@ using AbstractTrees: PreOrderDFS
 =============================================================================#
 
 """
-    get_loop_blocks(tree::ControlTree, ir::IRCode) -> Set{Int}
-
-Get all block indices contained in a loop control tree.
-"""
-function get_loop_blocks(tree::ControlTree, ir::IRCode)
-    loop_blocks = Set{Int}()
-    nblocks = length(ir.cfg.blocks)
-    for subtree in PreOrderDFS(tree)
-        idx = node_index(subtree)
-        if 1 <= idx <= nblocks
-            push!(loop_blocks, idx)
-        end
-    end
-    return loop_blocks
-end
-
-"""
     get_region_blocks(tree::ControlTree, ir::IRCode) -> Set{Int}
 
-Get all block indices contained in a control tree region.
+Get all block indices contained in a control tree region (works for any region type,
+including loops).
 """
 function get_region_blocks(tree::ControlTree, ir::IRCode)
     blocks = Set{Int}()
@@ -39,6 +23,9 @@ function get_region_blocks(tree::ControlTree, ir::IRCode)
     end
     return blocks
 end
+
+"Alias for `get_region_blocks` — works identically for loop regions."
+const get_loop_blocks = get_region_blocks
 
 """
     get_exit_block(tree::ControlTree, ir::IRCode) -> Int
@@ -97,6 +84,68 @@ function get_value_type(val, ir::IRCode)
     end
 end
 
+"""
+    HeaderPhiInfo
+
+Result of extracting phi node information from a loop header.
+"""
+struct HeaderPhiInfo
+    phi_indices::Vector{Int}
+    phi_types::Vector{Any}
+    init_values::Vector{IRValue}
+    carried_values::Vector{IRValue}
+end
+
+"""
+    extract_header_phis(header_idx, ir, loop_blocks; exclude_iv=nothing) -> HeaderPhiInfo
+
+Extract phi node information from a loop header block. For each phi, determines
+the entry value (from outside the loop) and carried value (from inside the loop).
+
+If `exclude_iv` is set, that phi index is included in `phi_indices`/`phi_types`
+but excluded from `init_values`/`carried_values` (used for ForOp's induction variable).
+"""
+function extract_header_phis(header_idx::Int, ir::IRCode, loop_blocks::Set{Int};
+                              exclude_iv::Union{Nothing,Int}=nothing)
+    stmts = ir.stmts.stmt
+    types = ir.stmts.type
+    bb = ir.cfg.blocks[header_idx]
+    header_range = first(bb.stmts):last(bb.stmts)
+
+    phi_indices = Int[]
+    phi_types = Any[]
+    init_values = IRValue[]
+    carried_values = IRValue[]
+
+    for si in header_range
+        stmt = stmts[si]
+        stmt isa PhiNode || continue
+
+        push!(phi_indices, si)
+        push!(phi_types, types[si])
+
+        entry_val = nothing
+        carried_val = nothing
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            if isassigned(stmt.values, edge_idx)
+                val = stmt.values[edge_idx]
+                if edge ∈ loop_blocks
+                    carried_val = val
+                else
+                    entry_val = convert_phi_value(val)
+                end
+            end
+        end
+
+        if si != exclude_iv
+            entry_val !== nothing && push!(init_values, entry_val)
+            carried_val !== nothing && push!(carried_values, carried_val)
+        end
+    end
+
+    HeaderPhiInfo(phi_indices, phi_types, init_values, carried_values)
+end
+
 #=============================================================================
  Control Tree to Structured IR
 =============================================================================#
@@ -132,11 +181,8 @@ function tree_to_block(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         handle_termination!(block, tree, ir, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, ir, ctx)
-    elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, ir, ctx)
     elseif rtype == REGION_PROPER
-        # Generic proper region - treat like REGION_BLOCK
-        handle_block_region!(block, tree, ir, ctx)
+        handle_proper_region!(block, tree, ir, ctx)
     else
         error("Unknown region type: $rtype")
     end
@@ -196,13 +242,113 @@ function handle_nested_region!(block::Block, tree::ControlTree, ir::IRCode,
         handle_termination!(block, tree, ir, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, ir, ctx)
-    elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, ir, ctx)
     elseif rtype == REGION_PROPER
-        # Generic proper region - treat like REGION_BLOCK
-        handle_block_region!(block, tree, ir, ctx)
+        handle_proper_region!(block, tree, ir, ctx)
     else
         error("Unknown region type in nested region: $rtype")
+    end
+end
+
+"""
+    resolve_yield(blk, phi_ssa_idx, default_val)
+
+If `blk` already defines `phi_ssa_idx` (e.g., via an inner IfOp's getfield for nested
+short-circuit patterns), yield SSAValue(phi_ssa_idx). Otherwise yield `default_val`.
+"""
+function resolve_yield(blk::Block, phi_ssa_idx::Int, default_val)
+    get(blk.body, phi_ssa_idx, nothing) !== nothing ? SSAValue(phi_ssa_idx) : default_val
+end
+
+"""
+    emit_ifop_result!(block, if_op, phi_ssa_indices, phi_types, ctx) -> Int
+
+Push an IfOp to `block` with its result type, then generate getfield statements at
+each `phi_ssa_indices[i]`. Returns the IfOp's SSA index.
+
+Used by `emit_if_op!`, `handle_proper_region!`, and `build_proper_branch!` to avoid
+repeating the IfOp allocation / getfield pattern.
+"""
+function emit_ifop_result!(block::Block, if_op::IfOp, phi_ssa_indices::Vector{Int},
+                            phi_types::Vector{Any}, ctx::StructurizationContext)
+    if_result_idx = ctx.next_ssa_idx
+    ctx.next_ssa_idx += 1
+
+    if !isempty(phi_ssa_indices)
+        result_type = Tuple{phi_types...}
+        push!(block, if_result_idx, if_op, result_type)
+
+        for (i, (phi_idx, phi_type)) in enumerate(zip(phi_ssa_indices, phi_types))
+            getfield_expr = Expr(:call, Core.getfield, SSAValue(if_result_idx), i)
+            push!(block, phi_idx, getfield_expr, phi_type)
+        end
+    else
+        push!(block, if_result_idx, if_op, Tuple{})
+    end
+
+    return if_result_idx
+end
+
+"""
+    emit_if_op!(block, cond_idx, then_tree, else_tree_or_nothing, ir, ctx; is_termination=false)
+
+Unified handler for if-like regions (IF_THEN_ELSE, IF_THEN, TERMINATION).
+
+- For IF_THEN_ELSE: pass both then_tree and else_tree
+- For IF_THEN: pass else_tree=nothing (creates empty else block, uses cond_idx as else proxy)
+- For TERMINATION: pass is_termination=true (preserves return terminators, Nothing result type)
+"""
+function emit_if_op!(block::Block, cond_idx::Int,
+                      then_tree::ControlTree, else_tree::Union{ControlTree,Nothing},
+                      ir::IRCode, ctx::StructurizationContext;
+                      is_termination::Bool=false)
+    emit_condition_block_stmts!(block, cond_idx, ir)
+    cond_value = find_condition_value(cond_idx, ir)
+
+    then_blk = tree_to_block(then_tree, ir, ctx)
+    else_blk = else_tree !== nothing ? tree_to_block(else_tree, ir, ctx) : Block()
+
+    if is_termination
+        then_blk.terminator = something(then_blk.terminator, YieldOp())
+        else_blk.terminator = something(else_blk.terminator, YieldOp())
+        if_op = IfOp(cond_value, then_blk, else_blk)
+
+        # Use gotoifnot SSA index as result key
+        nblocks = length(ir.cfg.blocks)
+        bb = ir.cfg.blocks[cond_idx]
+        result_idx = last(bb.stmts)
+        for si in first(bb.stmts):last(bb.stmts)
+            ir.stmts.stmt[si] isa GotoIfNot && (result_idx = si; break)
+        end
+        push!(block, result_idx, if_op, Nothing)
+    else
+        # Find merge phis
+        then_rblocks = get_region_blocks(then_tree, ir)
+        then_exit = get_exit_block(then_tree, ir, then_rblocks)
+
+        else_rblocks = else_tree !== nothing ?
+            get_region_blocks(else_tree, ir) : Set{Int}((cond_idx,))
+        else_exit = else_tree !== nothing ?
+            get_exit_block(else_tree, ir, else_rblocks) : cond_idx
+
+        merge_phis = find_merge_phis(ir, then_exit, else_exit;
+                                      then_blocks=then_rblocks,
+                                      else_blocks=else_rblocks)
+
+        then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
+            # If a branch already defines the merge phi's SSA index (e.g., via an inner
+            # IfOp's getfield for nested short-circuit patterns like &&), yield that
+            # SSAValue instead of the raw phi edge value from find_merge_phis.
+            YieldOp([resolve_yield(then_blk, phi.ssa_idx, phi.then_val) for phi in merge_phis]),
+            YieldOp([resolve_yield(else_blk, phi.ssa_idx, phi.else_val) for phi in merge_phis])
+        else
+            something(then_blk.terminator, YieldOp()),
+            something(else_blk.terminator, YieldOp())
+        end
+
+        if_op = IfOp(cond_value, then_blk, else_blk)
+        phi_indices = Int[phi.ssa_idx for phi in merge_phis]
+        phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
+        emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx)
     end
 end
 
@@ -215,79 +361,8 @@ function handle_if_then_else!(block::Block, tree::ControlTree, ir::IRCode,
                               ctx::StructurizationContext)
     tree_children = children(tree)
     length(tree_children) >= 3 || return handle_block_region!(block, tree, ir, ctx)
-
-    nblocks = length(ir.cfg.blocks)
-
-    # First child is the condition block
-    cond_tree = tree_children[1]
-    cond_idx = node_index(cond_tree)
-
-    # Find the GotoIfNot's SSA index for keying (fallback if no merge phi)
-    gotoifnot_idx = nothing
-    if 1 <= cond_idx <= nblocks
-        bb = ir.cfg.blocks[cond_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa GotoIfNot
-                gotoifnot_idx = si
-            end
-            if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block, si, stmt, ir.stmts.type[si])
-            end
-        end
-    end
-
-    cond_value = find_condition_value(cond_idx, ir)
-
-    # Then and else blocks
-    then_tree = tree_children[2]
-    else_tree = tree_children[3]
-
-    then_blk = tree_to_block(then_tree, ir, ctx)
-    else_blk = tree_to_block(else_tree, ir, ctx)
-
-    # Find merge block and detect merge phis
-    # Use exit blocks (not entry blocks) for multi-block regions
-    then_rblocks = get_region_blocks(then_tree, ir)
-    else_rblocks = get_region_blocks(else_tree, ir)
-    then_block_idx = get_exit_block(then_tree, ir, then_rblocks)
-    else_block_idx = get_exit_block(else_tree, ir, else_rblocks)
-    merge_phis = find_merge_phis(ir, then_block_idx, else_block_idx;
-                                 then_blocks=then_rblocks,
-                                 else_blocks=else_rblocks)
-
-    # Add YieldOp terminators with phi values
-    then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
-        YieldOp([phi.then_val for phi in merge_phis]),
-        YieldOp([phi.else_val for phi in merge_phis])
-    else
-        something(then_blk.terminator, YieldOp()),
-        something(else_blk.terminator, YieldOp())
-    end
-
-    if_op = IfOp(cond_value, then_blk, else_blk)
-
-    # Allocate synthesized SSA index for IfOp
-    if_result_idx = ctx.next_ssa_idx
-    ctx.next_ssa_idx += 1
-
-    # Always use Tuple type for IfOp results (uniform handling in codegen)
-    if !isempty(merge_phis)
-        phi_types = [ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
-        result_type = Tuple{phi_types...}
-        push!(block, if_result_idx, if_op, result_type)
-
-        # Generate getfield statements at original phi indices
-        # This preserves SSA reference semantics: `return %7` still works because getfield is at %7
-        for (i, phi) in enumerate(merge_phis)
-            getfield_expr = Expr(:call, Core.getfield, SSAValue(if_result_idx), i)
-            push!(block, phi.ssa_idx, getfield_expr, phi_types[i])
-        end
-    else
-        # No results - still use Tuple{} for uniformity
-        result_type = Tuple{}
-        push!(block, if_result_idx, if_op, result_type)
-    end
+    cond_idx = node_index(tree_children[1])
+    emit_if_op!(block, cond_idx, tree_children[2], tree_children[3], ir, ctx)
 end
 
 """
@@ -388,77 +463,8 @@ function handle_if_then!(block::Block, tree::ControlTree, ir::IRCode,
                          ctx::StructurizationContext)
     tree_children = children(tree)
     length(tree_children) >= 2 || return handle_block_region!(block, tree, ir, ctx)
-
-    nblocks = length(ir.cfg.blocks)
-
-    # First child is the condition block
-    cond_tree = tree_children[1]
-    cond_idx = node_index(cond_tree)
-
-    # Find the GotoIfNot's SSA index for keying
-    gotoifnot_idx = nothing
-    if 1 <= cond_idx <= nblocks
-        bb = ir.cfg.blocks[cond_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa GotoIfNot
-                gotoifnot_idx = si
-            end
-            if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block, si, stmt, ir.stmts.type[si])
-            end
-        end
-    end
-
-    cond_value = find_condition_value(cond_idx, ir)
-
-    # Then block
-    then_tree = tree_children[2]
-    then_blk = tree_to_block(then_tree, ir, ctx)
-
-    # Empty else block
-    else_blk = Block()
-
-    # Find merge block and detect merge phis
-    # For if-then, the merge block is the common successor of cond_idx and then_block_idx.
-    # cond_idx acts as the "else" path since it has a direct edge to merge when condition is false.
-    # Use exit block (not entry block) for multi-block then regions
-    then_rblocks = get_region_blocks(then_tree, ir)
-    then_block_idx = get_exit_block(then_tree, ir, then_rblocks)
-    merge_phis = find_merge_phis(ir, then_block_idx, cond_idx;
-                                 then_blocks=then_rblocks,
-                                 else_blocks=Set{Int}((cond_idx,)))
-
-    # Add YieldOp terminators with phi values
-    then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
-        YieldOp([phi.then_val for phi in merge_phis]),
-        YieldOp([phi.else_val for phi in merge_phis])
-    else
-        something(then_blk.terminator, YieldOp()), YieldOp()
-    end
-
-    if_op = IfOp(cond_value, then_blk, else_blk)
-
-    # Allocate synthesized SSA index for IfOp
-    if_result_idx = ctx.next_ssa_idx
-    ctx.next_ssa_idx += 1
-
-    # Use Tuple type for IfOp results (uniform handling in codegen)
-    if !isempty(merge_phis)
-        phi_types = [ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
-        result_type = Tuple{phi_types...}
-        push!(block, if_result_idx, if_op, result_type)
-
-        # Generate getfield statements at original phi indices
-        # This preserves SSA reference semantics: `return %7` still works because getfield is at %7
-        for (i, phi) in enumerate(merge_phis)
-            getfield_expr = Expr(:call, Core.getfield, SSAValue(if_result_idx), i)
-            push!(block, phi.ssa_idx, getfield_expr, phi_types[i])
-        end
-    else
-        # No merge phis - use Tuple{} for uniformity
-        push!(block, if_result_idx, if_op, Tuple{})
-    end
+    cond_idx = node_index(tree_children[1])
+    emit_if_op!(block, cond_idx, tree_children[2], nothing, ir, ctx)
 end
 
 """
@@ -470,50 +476,14 @@ function handle_termination!(block::Block, tree::ControlTree, ir::IRCode,
                              ctx::StructurizationContext)
     tree_children = children(tree)
     isempty(tree_children) && return handle_block_region!(block, tree, ir, ctx)
+    cond_idx = node_index(tree_children[1])
 
-    nblocks = length(ir.cfg.blocks)
-
-    # First child is the condition block
-    cond_tree = tree_children[1]
-    cond_idx = node_index(cond_tree)
-
-    # Find the GotoIfNot's SSA index for keying
-    gotoifnot_idx = nothing
-    if 1 <= cond_idx <= nblocks
-        bb = ir.cfg.blocks[cond_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa GotoIfNot
-                gotoifnot_idx = si
-            end
-            if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
-                push!(block, si, stmt, ir.stmts.type[si])
-            end
-        end
-    end
-
-    cond_value = find_condition_value(cond_idx, ir)
-    bb = ir.cfg.blocks[cond_idx]
-    result_idx = gotoifnot_idx !== nothing ? gotoifnot_idx : last(bb.stmts)
-
-    # Build then and else blocks from remaining children
     if length(tree_children) >= 3
-        then_tree = tree_children[2]
-        else_tree = tree_children[3]
-        then_blk = tree_to_block(then_tree, ir, ctx)
-        else_blk = tree_to_block(else_tree, ir, ctx)
-        then_blk.terminator = something(then_blk.terminator, YieldOp())
-        else_blk.terminator = something(else_blk.terminator, YieldOp())
-        if_op = IfOp(cond_value, then_blk, else_blk)
-        push!(block, result_idx, if_op, Nothing)
+        emit_if_op!(block, cond_idx, tree_children[2], tree_children[3], ir, ctx;
+                     is_termination=true)
     elseif length(tree_children) == 2
-        then_tree = tree_children[2]
-        then_blk = tree_to_block(then_tree, ir, ctx)
-        else_blk = Block()
-        then_blk.terminator = something(then_blk.terminator, YieldOp())
-        else_blk.terminator = YieldOp()
-        if_op = IfOp(cond_value, then_blk, else_blk)
-        push!(block, result_idx, if_op, Nothing)
+        emit_if_op!(block, cond_idx, tree_children[2], nothing, ir, ctx;
+                     is_termination=true)
     end
 end
 
@@ -536,25 +506,7 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
 
     # Dispatch based on region type
     if rtype == REGION_FOR_LOOP
-        for_op, phi_indices, phi_types, is_inclusive, original_upper = build_for_op(tree, ir, ctx)
-
-        # Handle inclusive bounds (Julia's for i in 1:n) by inserting add_int(upper, 1)
-        if is_inclusive
-            # Allocate SSA for adjusted upper bound
-            adj_ssa_idx = ctx.next_ssa_idx
-            ctx.next_ssa_idx += 1
-
-            # Insert add_int expression before the loop
-            adj_upper = convert_phi_value(original_upper)
-            upper_type = get_value_type(original_upper, ir)
-            add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, one(upper_type))
-            push!(block, adj_ssa_idx, add_int_expr, upper_type)
-
-            # Update ForOp's upper bound to the adjusted value
-            for_op.upper = SSAValue(adj_ssa_idx)
-        end
-
-        loop_op = for_op
+        loop_op, phi_indices, phi_types = build_for_op(block, tree, ir, ctx)
     elseif rtype == REGION_WHILE_LOOP
         loop_op, phi_indices, phi_types = build_while_op(tree, ir, ctx)
     else  # REGION_NATURAL_LOOP or other cyclic regions
@@ -590,15 +542,302 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
 end
 
 """
-    handle_switch!(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
+    handle_proper_region!(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
 
-Handle REGION_SWITCH by treating it as a nested if-else chain.
+Handle REGION_PROPER — a multi-exit acyclic region (e.g., short-circuit `||`/`&&`).
+
+Lowers to nested IfOps by tracing each path from entry to the merge block.
+The merge block may be inside the region (e.g., `||`) or outside it (e.g., `&&`);
+both cases are handled.
 """
-function handle_switch!(block::Block, tree::ControlTree, ir::IRCode,
-                        ctx::StructurizationContext)
-    # For now, handle as a nested if-else chain
-    # TODO: Implement proper switch handling if needed
-    handle_block_region!(block, tree, ir, ctx)
+function handle_proper_region!(block::Block, tree::ControlTree, ir::IRCode,
+                                ctx::StructurizationContext)
+    tree_children = children(tree)
+    isempty(tree_children) && return handle_block_region!(block, tree, ir, ctx)
+
+    nblocks = length(ir.cfg.blocks)
+    entry_idx = node_index(tree_children[1])
+    1 <= entry_idx <= nblocks || return handle_block_region!(block, tree, ir, ctx)
+
+    # Verify entry block has a GotoIfNot
+    bb = ir.cfg.blocks[entry_idx]
+    gotoifnot = nothing
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa GotoIfNot && (gotoifnot = stmt; break)
+    end
+    gotoifnot === nothing && return handle_block_region!(block, tree, ir, ctx)
+
+    region_blocks = get_region_blocks(tree, ir)
+
+    # Find merge block: a block with phi nodes having ≥2 edges from region blocks.
+    # Try inside the region first (e.g., `||`), then outside (e.g., `&&`).
+    merge_idx = find_proper_merge_block(region_blocks, ir, nblocks)
+    merge_idx === nothing && return handle_block_region!(block, tree, ir, ctx)
+    merge_is_internal = merge_idx in region_blocks
+
+    # Collect merge phi information: for each phi, map predecessor block → value
+    merge_phis = collect_proper_merge_phis(merge_idx, region_blocks, ir)
+
+    # Emit entry block statements (excluding control flow and phis)
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        if !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
+            push!(block, si, stmt, ir.stmts.type[si])
+        end
+    end
+
+    cond_value = find_condition_value(entry_idx, ir)
+
+    # GotoIfNot: condition false → dest, condition true → fallthrough
+    false_target = gotoifnot.dest
+    true_target = nothing
+    for succ in ir.cfg.blocks[entry_idx].succs
+        succ != false_target && (true_target = succ; break)
+    end
+
+    # Build mapping from block index → control tree child for non-leaf sub-trees.
+    # When build_proper_branch! encounters such a block, it processes the sub-tree
+    # via tree_to_block instead of walking raw IR blocks.
+    subtree_map = Dict{Int, ControlTree}()
+    for child in tree_children
+        if !isempty(children(child))
+            subtree_map[node_index(child)] = child
+        end
+    end
+
+    # Build then and else branches recursively
+    then_blk = Block()
+    else_blk = Block()
+    build_proper_branch!(then_blk, true_target, entry_idx, merge_idx, merge_phis,
+                          region_blocks, ir, ctx, subtree_map)
+    build_proper_branch!(else_blk, false_target, entry_idx, merge_idx, merge_phis,
+                          region_blocks, ir, ctx, subtree_map)
+
+    # Emit IfOp with merge phi results
+    if_op = IfOp(cond_value, then_blk, else_blk)
+    phi_indices = Int[phi.ssa_idx for phi in merge_phis]
+    phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
+    emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx)
+
+    # If merge block is inside the region, process its non-phi statements here
+    if merge_is_internal
+        merge_bb = ir.cfg.blocks[merge_idx]
+        for si in first(merge_bb.stmts):last(merge_bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            if stmt isa ReturnNode
+                block.terminator = stmt
+            elseif !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot)
+                push!(block, si, stmt, ir.stmts.type[si])
+            end
+        end
+    end
+end
+
+"""
+    find_proper_merge_block(region_blocks, ir, nblocks) -> Union{Int, Nothing}
+
+Find the merge block for a proper region: a block with phi nodes having ≥2 edges
+from region blocks. Searches both inside (e.g., `||`) and outside (e.g., `&&`).
+"""
+function find_proper_merge_block(region_blocks::Set{Int}, ir::IRCode, nblocks::Int)
+    # Collect candidates: internal blocks (reverse-sorted, merge is typically last in RPO)
+    # plus external successor blocks.
+    candidates = sort!(collect(region_blocks); rev=true)
+    for b in region_blocks
+        1 <= b <= nblocks || continue
+        for succ in ir.cfg.blocks[b].succs
+            succ in region_blocks || push!(candidates, succ)
+        end
+    end
+
+    # Single pass: find first block with a phi having ≥2 edges from region blocks
+    for idx in candidates
+        1 <= idx <= nblocks || continue
+        bb = ir.cfg.blocks[idx]
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            if stmt isa PhiNode
+                region_edge_count = count(e -> e in region_blocks, stmt.edges)
+                region_edge_count >= 2 && return idx
+            end
+        end
+    end
+
+    return nothing
+end
+
+"""
+    collect_proper_merge_phis(merge_idx, region_blocks, ir)
+
+Collect phi nodes from a merge block that have edges from within the region.
+Returns a vector of (ssa_idx, edge_values) named tuples.
+"""
+function collect_proper_merge_phis(merge_idx::Int, region_blocks::Set{Int}, ir::IRCode)
+    merge_phis = @NamedTuple{ssa_idx::Int, edge_values::Dict{Int,Any}}[]
+    merge_bb = ir.cfg.blocks[merge_idx]
+    for si in first(merge_bb.stmts):last(merge_bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+        edge_values = Dict{Int,Any}()
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            if isassigned(stmt.values, edge_idx) && edge in region_blocks
+                edge_values[edge] = stmt.values[edge_idx]
+            end
+        end
+        isempty(edge_values) || push!(merge_phis, (ssa_idx=si, edge_values=edge_values))
+    end
+    return merge_phis
+end
+
+"""
+    build_proper_branch!(branch_blk, target, from_block, merge_idx, merge_phis,
+                          region_blocks, ir, ctx, subtree_map)
+
+Build a branch block for a proper region by following the path from `target` to the
+merge block, creating nested IfOps at branch points.
+
+`from_block` is the block that branches to `target` (needed for merge phi lookup
+when the target goes directly to the merge).
+
+`subtree_map` maps block indices to their control tree sub-trees; when the path
+encounters such a block, the sub-tree is processed via `tree_to_block` instead of
+walking raw IR blocks (needed for nested patterns like `||` with `&&`).
+"""
+function build_proper_branch!(branch_blk::Block, target::Union{Int,Nothing},
+                               from_block::Int, merge_idx::Int,
+                               merge_phis,
+                               region_blocks::Set{Int},
+                               ir::IRCode, ctx::StructurizationContext,
+                               subtree_map::Dict{Int, ControlTree}=Dict{Int, ControlTree}())
+    nblocks = length(ir.cfg.blocks)
+
+    # If target is the merge or outside region, yield merge phi values
+    if target === nothing || target == merge_idx ||
+       !(target in region_blocks) || !(1 <= target <= nblocks)
+        branch_blk.terminator = yield_for_merge_edge(from_block, merge_phis, ctx)
+        return
+    end
+
+    # Walk the path from target, emitting statements
+    current = target
+    while true
+        # Check if current block is the root of a control tree sub-tree.
+        # If so, process via tree_to_block (handles internal phis, IfOps, etc.)
+        subtree = get(subtree_map, current, nothing)
+        if subtree !== nothing
+            sub_block = tree_to_block(subtree, ir, ctx)
+            # Merge sub-tree results into branch_blk
+            for (idx, entry) in sub_block.body
+                push!(branch_blk, idx, entry.stmt, entry.typ)
+            end
+            # Find the exit successor of the sub-tree (next block on the path)
+            sub_blocks = get_region_blocks(subtree, ir)
+            next = nothing
+            for b in sub_blocks
+                1 <= b <= nblocks || continue
+                for succ in ir.cfg.blocks[b].succs
+                    if !(succ in sub_blocks) && (succ in region_blocks || succ == merge_idx)
+                        next = succ
+                        break
+                    end
+                end
+                next !== nothing && break
+            end
+            if next === nothing || next == merge_idx
+                # Sub-tree exits to merge
+                exit_idx = get_exit_block(subtree, ir, sub_blocks)
+                branch_blk.terminator = yield_for_merge_edge(exit_idx, merge_phis, ctx)
+                return
+            end
+            current = next
+            continue
+        end
+
+        bb = ir.cfg.blocks[current]
+
+        # Emit non-control-flow statements (skip phis — they may have been
+        # resolved by a preceding sub-tree's getfield at the same SSA index)
+        gotoifnot = nothing
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            if stmt isa GotoIfNot
+                gotoifnot = stmt
+            elseif !(stmt isa GotoNode || stmt isa ReturnNode || stmt isa PhiNode)
+                push!(branch_blk, si, stmt, ir.stmts.type[si])
+            end
+        end
+
+        if gotoifnot !== nothing
+            # Nested branch — create inner IfOp
+            cond_value = find_condition_value(current, ir)
+            false_target = gotoifnot.dest
+            true_target = nothing
+            for succ in ir.cfg.blocks[current].succs
+                succ != false_target && (true_target = succ; break)
+            end
+
+            then_inner = Block()
+            else_inner = Block()
+            build_proper_branch!(then_inner, true_target, current, merge_idx,
+                                  merge_phis, region_blocks, ir, ctx, subtree_map)
+            build_proper_branch!(else_inner, false_target, current, merge_idx,
+                                  merge_phis, region_blocks, ir, ctx, subtree_map)
+
+            inner_if = IfOp(cond_value, then_inner, else_inner)
+
+            # Use synthesized SSA indices for getfield (these are intermediate
+            # results inside a branch, not the final merge phi indices)
+            phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
+            gf_indices = Int[]
+            for _ in merge_phis
+                push!(gf_indices, ctx.next_ssa_idx)
+                ctx.next_ssa_idx += 1
+            end
+            emit_ifop_result!(branch_blk, inner_if, gf_indices, phi_types, ctx)
+            branch_blk.terminator = if !isempty(gf_indices)
+                YieldOp(IRValue[SSAValue(idx) for idx in gf_indices])
+            else
+                YieldOp()
+            end
+            return
+        end
+
+        # No branch — follow to next block
+        next = nothing
+        for succ in ir.cfg.blocks[current].succs
+            next = succ
+            break
+        end
+
+        if next === nothing || next == merge_idx
+            # Reached merge
+            branch_blk.terminator = yield_for_merge_edge(current, merge_phis, ctx)
+            return
+        end
+
+        if !(next in region_blocks) || !(1 <= next <= nblocks)
+            # Exited region (shouldn't normally happen)
+            branch_blk.terminator = yield_for_merge_edge(current, merge_phis, ctx)
+            return
+        end
+
+        current = next
+    end
+end
+
+"""
+    yield_for_merge_edge(pred_block, merge_phis, ctx) -> YieldOp
+
+Create a YieldOp with values from the merge phis for the given predecessor edge.
+"""
+function yield_for_merge_edge(pred_block::Int, merge_phis, ctx::StructurizationContext)
+    yield_values = IRValue[]
+    for phi in merge_phis
+        val = get(phi.edge_values, pred_block, nothing)
+        push!(yield_values, val !== nothing ? val : Undef(ctx.ssavaluetypes[phi.ssa_idx]))
+    end
+    return YieldOp(yield_values)
 end
 
 #=============================================================================
@@ -606,22 +845,60 @@ end
 =============================================================================#
 
 """
-    collect_block_statements!(block::Block, block_idx::Int, ir::IRCode)
+    collect_block_statements!(block::Block, block_idx::Int, ir::IRCode;
+                               capture_terminator::Bool=true)
 
-Collect statements from a basic block into a Block, excluding control flow.
-Stores raw expressions (no substitutions) with their SSA indices.
+Collect statements from a basic block into a Block, excluding control flow
+(GotoNode, GotoIfNot, PhiNode). When `capture_terminator=true` (default),
+ReturnNode is captured as the block's terminator; when false, ReturnNode is skipped
+(used for condition blocks in if-handlers).
 """
-function collect_block_statements!(block::Block, block_idx::Int, ir::IRCode)
+function collect_block_statements!(block::Block, block_idx::Int, ir::IRCode;
+                                    capture_terminator::Bool=true)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
+    nblocks = length(ir.cfg.blocks)
+    1 <= block_idx <= nblocks || return
     bb = ir.cfg.blocks[block_idx]
     for si in first(bb.stmts):last(bb.stmts)
         stmt = stmts[si]
-        if stmt isa ReturnNode
+        if capture_terminator && stmt isa ReturnNode
             block.terminator = stmt
-        elseif !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa PhiNode)
+        elseif !(stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode || stmt isa PhiNode)
             push!(block, si, stmt, types[si])
         end
+    end
+end
+
+"Emit condition block statements (excludes ReturnNode). Alias for `collect_block_statements!(...; capture_terminator=false)`."
+emit_condition_block_stmts!(block::Block, cond_idx::Int, ir::IRCode) =
+    collect_block_statements!(block, cond_idx, ir; capture_terminator=false)
+
+"""
+    process_child_region!(block::Block, child::ControlTree, ir::IRCode, ctx::StructurizationContext)
+
+Process a control tree child, dispatching to the appropriate handler based on region type.
+"""
+function process_child_region!(block::Block, child::ControlTree, ir::IRCode,
+                                ctx::StructurizationContext)
+    if region_type(child) == REGION_BLOCK
+        handle_block_region!(block, child, ir, ctx)
+    else
+        handle_nested_region!(block, child, ir, ctx)
+    end
+end
+
+"""
+    collect_loop_body_stmts!(body::Block, tree::ControlTree, header_idx::Int,
+                              ir::IRCode, ctx::StructurizationContext)
+
+Process loop body children (all children except the header) into a body block.
+"""
+function collect_loop_body_stmts!(body::Block, tree::ControlTree, header_idx::Int,
+                                   ir::IRCode, ctx::StructurizationContext)
+    for child in children(tree)
+        node_index(child) == header_idx && continue
+        process_child_region!(body, child, ir, ctx)
     end
 end
 
@@ -728,38 +1005,9 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
     header_bb = ir.cfg.blocks[header_idx]
     header_range = first(header_bb.stmts):last(header_bb.stmts)
 
-    # Extract phi node information: init_values (from outside loop) and carried_values (from inside loop)
-    init_values = IRValue[]
-    carried_values = IRValue[]
-    phi_indices = Int[]
-    phi_types = Any[]
-
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa PhiNode
-            push!(phi_indices, si)
-            push!(phi_types, types[si])
-            phi = stmt
-
-            entry_val = nothing
-            carried_val = nothing
-
-            for (edge_idx, edge) in enumerate(phi.edges)
-                if isassigned(phi.values, edge_idx)
-                    val = phi.values[edge_idx]
-                    # In IRCode, edge IS the block index directly
-                    if edge ∈ loop_blocks
-                        carried_val = val
-                    else
-                        entry_val = convert_phi_value(val)
-                    end
-                end
-            end
-
-            entry_val !== nothing && push!(init_values, entry_val)
-            carried_val !== nothing && push!(carried_values, carried_val)
-        end
-    end
+    # Extract phi node information
+    phi_info = extract_header_phis(header_idx, ir, loop_blocks)
+    (; phi_indices, phi_types, init_values, carried_values) = phi_info
 
     # Find the condition for loop exit
     condition = nothing
@@ -773,31 +1021,15 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
 
     # Build "before" region: header statements + ConditionOp
     before = Block()
-    for si in header_range
-        stmt = stmts[si]
-        if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-            push!(before, si, stmt, types[si])
-        end
-    end
+    emit_condition_block_stmts!(before, header_idx, ir)
 
-    # ConditionOp terminates the before block
-    # The condition args are SSAValues of the phi nodes (will be substituted to BlockArgs later)
     condition_args = IRValue[SSAValue(idx) for idx in phi_indices]
     cond_value = condition !== nothing ? convert_phi_value(condition) : true
     before.terminator = ConditionOp(cond_value, condition_args)
 
     # Build "after" region: body statements + YieldOp
     after = Block()
-
-    # Process loop body blocks (excluding header)
-    for child in children(tree)
-        child_idx = node_index(child)
-        if child_idx != header_idx
-            handle_block_region!(after, child, ir, ctx)
-        end
-    end
-
-    # YieldOp carries values back to the loop header
+    collect_loop_body_stmts!(after, tree, header_idx, ir, ctx)
     after.terminator = YieldOp(copy(carried_values))
 
     # Create BlockArgs and apply substitutions immediately
@@ -805,7 +1037,7 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         arg = BlockArg(i, phi_type)
         push!(before.args, arg)
-        push!(after.args, BlockArg(i, phi_type))  # Matching BlockArg for after region
+        push!(after.args, BlockArg(i, phi_type))
         subs[phi_idx] = arg
     end
     apply_substitutions!(before, subs)
@@ -856,40 +1088,10 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     nblocks = length(ir.cfg.blocks)
 
     @assert 1 <= header_idx <= nblocks "Invalid header_idx from control tree: $header_idx"
-    header_bb = ir.cfg.blocks[header_idx]
-    header_range = first(header_bb.stmts):last(header_bb.stmts)
 
     # 1. Extract phis from header
-    init_values = IRValue[]
-    carried_values = IRValue[]
-    phi_indices = Int[]
-    phi_types = Any[]
-
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa PhiNode
-            push!(phi_indices, si)
-            push!(phi_types, types[si])
-            phi = stmt
-
-            entry_val = nothing
-            carried_val = nothing
-
-            for (edge_idx, edge) in enumerate(phi.edges)
-                if isassigned(phi.values, edge_idx)
-                    val = phi.values[edge_idx]
-                    if edge ∈ loop_blocks
-                        carried_val = val
-                    else
-                        entry_val = convert_phi_value(val)
-                    end
-                end
-            end
-
-            entry_val !== nothing && push!(init_values, entry_val)
-            carried_val !== nothing && push!(carried_values, carried_val)
-        end
-    end
+    phi_info = extract_header_phis(header_idx, ir, loop_blocks)
+    (; phi_indices, phi_types, init_values, carried_values) = phi_info
 
     # 2. Find exit condition
     exit = find_loop_exit_condition(ir, loop_blocks)
@@ -913,12 +1115,7 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
 
     for (i, child) in enumerate(children(tree))
         target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
-        child_rtype = region_type(child)
-        if child_rtype == REGION_BLOCK
-            handle_block_region!(target, child, ir, ctx)
-        else
-            handle_nested_region!(target, child, ir, ctx)
-        end
+        process_child_region!(target, child, ir, ctx)
     end
 
     # 5. Scan exit target phis for extra body-computed values that need exporting.
@@ -1011,7 +1208,7 @@ The ForOp structure:
 - body: Loop body statements + ContinueOp with carried values
 - init_values: Non-IV loop-carried values
 """
-function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
+function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
     header_idx = node_index(tree)
@@ -1023,47 +1220,15 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
     header_bb = ir.cfg.blocks[header_idx]
     header_range = first(header_bb.stmts):last(header_bb.stmts)
 
-    # Extract phi info: separate IV from other loop-carried variables
+    # Extract phi info with IV excluded from init/carried values
     iv_phi_idx = for_info.iv_phi_idx
-    all_phi_indices = Int[]
-    all_phi_types = Any[]
-    init_values = IRValue[]
-    carried_values = IRValue[]
-
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa PhiNode
-            push!(all_phi_indices, si)
-            push!(all_phi_types, types[si])
-            phi = stmt
-
-            entry_val = nothing
-            carried_val = nothing
-
-            for (edge_idx, edge) in enumerate(phi.edges)
-                if isassigned(phi.values, edge_idx)
-                    val = phi.values[edge_idx]
-                    # In IRCode, edge IS the block index directly
-                    if edge ∈ loop_blocks
-                        carried_val = val
-                    else
-                        entry_val = convert_phi_value(val)
-                    end
-                end
-            end
-
-            # Skip IV for init_values and carried_values, handle separately
-            if si != iv_phi_idx
-                entry_val !== nothing && push!(init_values, entry_val)
-                carried_val !== nothing && push!(carried_values, carried_val)
-            end
-        end
-    end
+    all_phi_info = extract_header_phis(header_idx, ir, loop_blocks; exclude_iv=iv_phi_idx)
+    (; init_values, carried_values) = all_phi_info
 
     # Build result phi_indices and phi_types (excluding IV)
     phi_indices = Int[]
     phi_types = Any[]
-    for (idx, typ) in zip(all_phi_indices, all_phi_types)
+    for (idx, typ) in zip(all_phi_info.phi_indices, all_phi_info.phi_types)
         if idx != iv_phi_idx
             push!(phi_indices, idx)
             push!(phi_types, typ)
@@ -1100,12 +1265,7 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
     end
 
     # Process loop body blocks (excluding header)
-    for child in children(tree)
-        child_idx = node_index(child)
-        if child_idx != header_idx
-            handle_block_region!(body, child, ir, ctx)
-        end
-    end
+    collect_loop_body_stmts!(body, tree, header_idx, ir, ctx)
 
     # ContinueOp with non-IV carried values
     body.terminator = ContinueOp(copy(carried_values))
@@ -1115,12 +1275,14 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
     upper = convert_phi_value(for_info.upper)
     step = convert_phi_value(for_info.step)
 
-    # If is_inclusive (Julia's 1:n), we need upper+1 for exclusive semantics
-    # This is handled by inserting add_int in the parent block during handle_loop!
+    # If is_inclusive (Julia's 1:n), insert upper+1 in the parent block
     if for_info.is_inclusive
-        # Allocate a synthesized SSA for the adjusted upper bound
         adj_ssa_idx = ctx.next_ssa_idx
         ctx.next_ssa_idx += 1
+        adj_upper = convert_phi_value(for_info.upper)
+        upper_type = get_value_type(for_info.upper, ir)
+        add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, one(upper_type))
+        push!(block, adj_ssa_idx, add_int_expr, upper_type)
         upper = SSAValue(adj_ssa_idx)
     end
 
@@ -1139,5 +1301,5 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
 
     for_op = ForOp(lower, for_info.is_inclusive ? for_info.upper : upper, step, iv_arg, body, init_values)
 
-    return for_op, phi_indices, phi_types, for_info.is_inclusive, for_info.upper
+    return for_op, phi_indices, phi_types
 end
