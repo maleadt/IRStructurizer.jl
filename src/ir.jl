@@ -300,6 +300,11 @@ end
 
 Counted for-loop with lower/upper/step bounds.
 init_values = initial values for loop-carried variables.
+
+Arity contract (all equal):
+- `init_values`, `body.args` (minus IV), and `ContinueOp.values` must have equal length.
+- Extra exit values (loop-internal values used after the loop) are included as loop-carried
+  variables with `Undef` initial values.
 """
 mutable struct ForOp <: ControlFlowOp
     lower::IRValue
@@ -344,10 +349,10 @@ end
 General loop with dynamic exit via BreakOp/ContinueOp.
 init_values = initial values for loop-carried variables.
 
-Arity contract:
-- `init_values`, `body.args`, and `ContinueOp.values` must have equal length (loop-carry chain).
-- `BreakOp.values` may be longer: the first N values correspond to loop-carried variables,
-  additional values are body-computed results exported only on loop exit.
+Arity contract (all equal):
+- `init_values`, `body.args`, `ContinueOp.values`, and `BreakOp.values` must have equal length.
+- Extra exit values (loop-internal values used after the loop) are included as loop-carried
+  variables with `Undef` initial values.
 """
 mutable struct LoopOp <: ControlFlowOp
     body::Block

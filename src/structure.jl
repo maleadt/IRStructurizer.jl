@@ -28,6 +28,62 @@ end
 const get_loop_blocks = get_region_blocks
 
 """
+    compute_natural_loop_blocks(ir::IRCode, header::Int) -> Set{Int}
+
+Compute the natural loop body from the CFG using dominance analysis.
+Returns all blocks dominated by the header that are reachable from it
+(including unreachable/throw blocks that are internal to the loop).
+
+Unlike `get_loop_blocks` (which uses the control tree and may include exit-target
+blocks absorbed by TERMINATION regions), this uses only CFG structure.
+"""
+function compute_natural_loop_blocks(ir::IRCode, header::Int)
+    blocks = ir.cfg.blocks
+    nblocks = length(blocks)
+    domtree = construct_domtree(ir)
+
+    # Start from the standard natural loop (backward walk from backedge sources)
+    loop_blocks = Set{Int}([header])
+    worklist = Int[]
+
+    for pred in blocks[header].preds
+        (1 <= pred <= nblocks) || continue
+        if dominates(domtree, header, pred) && !(pred in loop_blocks)
+            push!(loop_blocks, pred)
+            push!(worklist, pred)
+        end
+    end
+
+    while !isempty(worklist)
+        block = pop!(worklist)
+        for pred in blocks[block].preds
+            if !(pred in loop_blocks)
+                push!(loop_blocks, pred)
+                push!(worklist, pred)
+            end
+        end
+    end
+
+    # Also include dead-end error/throw blocks dominated by the header.
+    # These are blocks like bounds-check throws (Union{} return type, no successors)
+    # that are internal to the loop but can't reach the backedge source.
+    # We do NOT include legitimate exit targets (blocks with return/phi).
+    for blk in 1:nblocks
+        blk in loop_blocks && continue
+        dominates(domtree, header, blk) || continue
+        isempty(blocks[blk].succs) || continue
+        # Only add if it's an error/throw path (last stmt returns Union{}/Bottom)
+        bb = blocks[blk]
+        last_type = ir.stmts.type[last(bb.stmts)]
+        last_type === Union{} || continue
+        any(pred in loop_blocks for pred in bb.preds) || continue
+        push!(loop_blocks, blk)
+    end
+
+    return loop_blocks
+end
+
+"""
     get_exit_block(tree::ControlTree, ir::IRCode) -> Int
 
 Get the exit block index of a control tree region.
@@ -385,6 +441,81 @@ function is_defined_in_blocks(val, blocks::Set{Int}, ir::IRCode)
 end
 
 """
+    find_extra_exit_values(ir, exit_dest, loop_blocks, already_exported) -> Vector{NamedTuple}
+
+Find loop-internal values referenced in the exit target block that are not already
+exported via header phis. Returns a vector of `(; value, getfield_idx, type)` tuples.
+
+Scans both PhiNodes (with edges from loop blocks) and non-phi statements whose
+Expr arguments are SSAValues defined inside the loop.
+"""
+function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int},
+                                already_exported::Set{Int})
+    extra = @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
+    stmts = ir.stmts.stmt
+    types = ir.stmts.type
+    nblocks = length(ir.cfg.blocks)
+    1 <= exit_dest <= nblocks || return extra
+
+    exit_bb = ir.cfg.blocks[exit_dest]
+    seen = Set{Int}()  # track getfield_idx to avoid duplicates
+
+    for si in first(exit_bb.stmts):last(exit_bb.stmts)
+        stmt = stmts[si]
+
+        if stmt isa PhiNode
+            si ∈ already_exported && continue
+
+            # Find value from loop blocks
+            loop_val = nothing
+            for (edge_idx, edge) in enumerate(stmt.edges)
+                if isassigned(stmt.values, edge_idx) && edge ∈ loop_blocks
+                    loop_val = stmt.values[edge_idx]
+                end
+            end
+
+            if loop_val !== nothing
+                gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                push!(extra, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
+                push!(seen, gf_idx)
+            end
+        else
+            # Non-phi statement: check if any Expr arg is an SSAValue defined in loop blocks
+            stmt isa Expr || continue
+            for arg in stmt.args
+                if arg isa SSAValue && is_defined_in_blocks(arg, loop_blocks, ir)
+                    arg.id ∈ already_exported && continue
+                    arg.id ∈ seen && continue
+                    push!(extra, (; value=arg, getfield_idx=arg.id, type=types[arg.id]))
+                    push!(seen, arg.id)
+                end
+            end
+        end
+    end
+
+    return extra
+end
+
+"""
+    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, arg_offset)
+
+Pad extra exit values into the loop-carry chain and append to phi tracking vectors.
+Each extra exit value becomes a loop-carried variable with `Undef` initial value.
+`arg_offset` is the starting BlockArg id for the new args.
+"""
+function pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, arg_offset::Int)
+    for (j, ex) in enumerate(extra_exits)
+        push!(init_values, Undef(ex.type))
+        push!(carried_values, ex.value)
+        push!(body.args, BlockArg(arg_offset + j, ex.type))
+    end
+    for ex in extra_exits
+        push!(phi_indices, ex.getfield_idx)
+        push!(phi_types, ex.type)
+    end
+end
+
+"""
     find_merge_phis(ir, then_block_idx, else_block_idx; then_blocks, else_blocks)
 
 Find phis in the merge block (common successor of then and else blocks)
@@ -505,12 +636,13 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
     rtype = region_type(tree)
 
     # Dispatch based on region type
+    post_loop_blocks = Int[]
     if rtype == REGION_FOR_LOOP
         loop_op, phi_indices, phi_types = build_for_op(block, tree, ir, ctx)
     elseif rtype == REGION_WHILE_LOOP
         loop_op, phi_indices, phi_types = build_while_op(tree, ir, ctx)
     else  # REGION_NATURAL_LOOP or other cyclic regions
-        loop_op, phi_indices, phi_types = build_loop_op(tree, ir, ctx)
+        loop_op, phi_indices, phi_types, post_loop_blocks = build_loop_op(tree, ir, ctx)
     end
 
     # Allocate new SSA index for loop's tuple result
@@ -538,6 +670,12 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
         iv_phi_idx = for_info.iv_phi_idx
         iv_type = ctx.ssavaluetypes[iv_phi_idx]
         push!(block, iv_phi_idx, loop_op.upper, iv_type)
+    end
+
+    # Emit post-loop content: blocks that were in the control tree but outside
+    # the natural loop (e.g., exit-target blocks absorbed by TERMINATION regions).
+    for blk_idx in post_loop_blocks
+        collect_block_statements!(block, blk_idx, ir)
     end
 end
 
@@ -1068,41 +1206,55 @@ end
 
 """
     build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-        -> Tuple{LoopOp, Vector{Int}, Vector{Any}}
+        -> Tuple{LoopOp, Vector{Int}, Vector{Any}, Vector{Int}}
 
 Build a LoopOp from a control tree and return phi node information.
-Returns (loop_op, phi_indices, phi_types) where:
+Returns (loop_op, phi_indices, phi_types, post_loop_blocks) where:
 - loop_op: The constructed LoopOp
 - phi_indices: SSA indices of the header phi nodes (for getfield generation)
 - phi_types: Julia types of the header phi nodes
+- post_loop_blocks: block indices whose content should be emitted after the loop
 
-Uses a two-phase child processing approach: children up to and including the one
-containing the exit condition go into the loop body; children after go into the
-continue branch. This handles both header-exit and non-header-exit loops uniformly.
+Uses CFG-based natural loop blocks for exit detection, which correctly excludes
+exit-target blocks that may have been absorbed into the control tree by
+TERMINATION regions.
 """
 function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
     header_idx = node_index(tree)
-    loop_blocks = get_loop_blocks(tree, ir)
     nblocks = length(ir.cfg.blocks)
 
     @assert 1 <= header_idx <= nblocks "Invalid header_idx from control tree: $header_idx"
 
+    # Use CFG-based natural loop blocks for exit detection.
+    # The control tree may include exit-target blocks (via TERMINATION regions),
+    # but the natural loop only contains blocks reachable from the header via backedges.
+    natural_blocks = compute_natural_loop_blocks(ir, header_idx)
+
     # 1. Extract phis from header
-    phi_info = extract_header_phis(header_idx, ir, loop_blocks)
+    phi_info = extract_header_phis(header_idx, ir, natural_blocks)
     (; phi_indices, phi_types, init_values, carried_values) = phi_info
 
-    # 2. Find exit condition
-    exit = find_loop_exit_condition(ir, loop_blocks)
+    # 2. Find exit condition (using natural loop blocks)
+    exit = find_loop_exit_condition(ir, natural_blocks)
 
-    # 3. Determine which child contains the exit block
+    # 3. Classify children: determine exit child, post-loop blocks, and cache
+    #    child_blocks to avoid redundant get_region_blocks calls in step 4.
     exit_child_idx = nothing
-    if exit !== nothing
-        for (i, child) in enumerate(children(tree))
-            if exit.block ∈ get_region_blocks(child, ir)
+    post_loop_set = Set{Int}()
+    child_block_cache = Vector{Set{Int}}()
+    for (i, child) in enumerate(children(tree))
+        child_blocks = get_region_blocks(child, ir)
+        push!(child_block_cache, child_blocks)
+        if exit !== nothing
+            if exit.block ∈ child_blocks
                 exit_child_idx = i
-                break
+            end
+            for blk in child_blocks
+                if blk ∉ natural_blocks && 1 <= blk <= nblocks
+                    push!(post_loop_set, blk)
+                end
             end
         end
     end
@@ -1110,47 +1262,41 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     # 4. Process children in two phases:
     #    - Up to and including the exit child → body (pre-condition stmts)
     #    - After the exit child → then_blk (post-condition stmts, continue branch)
+    #    For children containing the exit block AND post-loop blocks (TERMINATION
+    #    regions), only collect statements from the in-loop blocks directly.
     body = Block()
     then_blk = Block()
 
     for (i, child) in enumerate(children(tree))
+        child_blocks = child_block_cache[i]
+
+        # Skip children entirely outside the natural loop
+        if !isempty(post_loop_set) && issubset(child_blocks, post_loop_set)
+            continue
+        end
+
+        # For mixed children (e.g., TERMINATION with exit + post-loop blocks),
+        # only collect statements from the in-loop blocks directly
+        if !isempty(post_loop_set) && !isempty(intersect(child_blocks, post_loop_set))
+            target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
+            for blk_idx in sort!(collect(setdiff(child_blocks, post_loop_set)))
+                collect_block_statements!(target, blk_idx, ir; capture_terminator=false)
+            end
+            continue
+        end
+
         target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
         process_child_region!(target, child, ir, ctx)
     end
 
-    # 5. Scan exit target phis for extra body-computed values that need exporting.
-    # When exit phis reference values computed inside the loop body, those values
-    # must be exported via BreakOp and re-exposed in the outer scope via getfield.
-    # We place the getfield at the body-local SSA index (not the exit phi index),
-    # so that outer merge phi yields can reference the value by its original SSA index.
-    extra_exits = @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
-
-    if exit !== nothing
-        exit_dest = exit.dest  # block the GotoIfNot jumps to (loop exit target)
-        if 1 <= exit_dest <= nblocks
-            exit_bb = ir.cfg.blocks[exit_dest]
-            phi_indices_set = Set(phi_indices)
-            for si in first(exit_bb.stmts):last(exit_bb.stmts)
-                stmt = stmts[si]
-                stmt isa PhiNode || continue
-                si ∈ phi_indices_set && continue  # already handled as header phi
-
-                # Find value from loop blocks
-                loop_val = nothing
-                for (edge_idx, edge) in enumerate(stmt.edges)
-                    if isassigned(stmt.values, edge_idx) && edge ∈ loop_blocks
-                        loop_val = stmt.values[edge_idx]
-                    end
-                end
-
-                if loop_val !== nothing
-                    # Place getfield at the body-local SSA index so outer yields find it
-                    gf_idx = loop_val isa SSAValue ? loop_val.id : si
-                    push!(extra_exits, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
-                end
-            end
-        end
+    # 5. Find and pad extra exit values into the loop-carry chain.
+    extra_exits = if exit !== nothing
+        find_extra_exit_values(ir, exit.dest, natural_blocks, Set(phi_indices))
+    else
+        @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
     end
+    n_header_phis = length(phi_indices)
+    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_header_phis)
 
     # 6. Build exit control flow
     if exit !== nothing
@@ -1159,9 +1305,10 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         then_blk.terminator = ContinueOp(copy(carried_values))
 
         else_blk = Block()
-        break_values = IRValue[SSAValue(idx) for idx in phi_indices]
-        for ex in extra_exits
-            push!(break_values, ex.value)
+        break_values = IRValue[v for v in carried_values]
+        # Replace header phi carried values with SSAValue refs (they're block args)
+        for (i, idx) in enumerate(phi_indices[1:n_header_phis])
+            break_values[i] = SSAValue(idx)
         end
         else_blk.terminator = BreakOp(break_values)
 
@@ -1170,9 +1317,9 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         body.terminator = ContinueOp(copy(carried_values))
     end
 
-    # 7. BlockArgs + substitutions
+    # 7. BlockArgs for header phis + substitutions
     subs = Substitutions()
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
         arg = BlockArg(i, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
@@ -1180,14 +1327,9 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     apply_substitutions!(body, subs)
 
     loop_op = LoopOp(body, init_values)
+    post_loop_blocks = sort!(collect(post_loop_set))
 
-    # Append extra exit getfield indices to header phi indices
-    for ex in extra_exits
-        push!(phi_indices, ex.getfield_idx)
-        push!(phi_types, ex.type)
-    end
-
-    return loop_op, phi_indices, phi_types
+    return loop_op, phi_indices, phi_types, post_loop_blocks
 end
 
 """
@@ -1267,7 +1409,18 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     # Process loop body blocks (excluding header)
     collect_loop_body_stmts!(body, tree, header_idx, ir, ctx)
 
-    # ContinueOp with non-IV carried values
+    # Find and pad extra exit values into the loop-carry chain
+    exit_info = find_loop_exit_condition(ir, loop_blocks)
+    already_exported = Set{Int}([iv_phi_idx; phi_indices])
+    extra_exits = if exit_info !== nothing
+        find_extra_exit_values(ir, exit_info.dest, loop_blocks, already_exported)
+    else
+        @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
+    end
+    n_phi = length(phi_indices)
+    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_phi + 1)
+
+    # ContinueOp with non-IV carried values (including extra exits)
     body.terminator = ContinueOp(copy(carried_values))
 
     # Build ForOp with bounds from ForLoopInfo
@@ -1291,7 +1444,7 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     subs[iv_phi_idx] = iv_arg  # IV at index 1
 
     # Non-IV loop-carried values at indices 2, 3, ...
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
         arg = BlockArg(i + 1, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg

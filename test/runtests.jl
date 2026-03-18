@@ -6,7 +6,7 @@ using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
                       validate_scf, validate_terminators, validate_ssa_defs,
                       SSAMap, statements
-using Core: SSAValue
+using Core: SSAValue, ReturnNode
 using Base: code_ircode
 
 @testset "IRStructurizer" verbose=true begin
@@ -1125,6 +1125,39 @@ end
     end
 
     sci, _ = only(code_structured(mixed_type_loop, Tuple{Vector{Float32}, Int32}))
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+    @test sci isa StructuredIRCode
+end
+
+@testset "constant-bound for-loop with post-loop use" begin
+    function const_bound_loop(x::Int32)
+        acc = Int32(0)
+        for i in Int32(1):Int32(4)
+            acc += i
+        end
+        return acc + x
+    end
+
+    sci, _ = only(code_structured(const_bound_loop, Tuple{Int32}))
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+    @test sci isa StructuredIRCode
+
+    # The return must be at the top level, not inside the loop body
+    @test sci.entry.terminator isa ReturnNode
+end
+
+@testset "runtime-bound for-loop with post-loop use (regression)" begin
+    function runtime_bound_loop(x::Int32, n::Int32)
+        acc = Int32(0)
+        for i in Int32(1):n
+            acc += i
+        end
+        return acc + x
+    end
+
+    sci, _ = only(code_structured(runtime_bound_loop, Tuple{Int32, Int32}))
     validate_scf(sci)
     validate_ssa_defs(sci)
     @test sci isa StructuredIRCode
