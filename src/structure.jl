@@ -322,9 +322,15 @@ function find_merge_phis(ir::IRCode, then_block_idx::Int, else_block_idx::Int)
             end
         end
 
-        # Only include if we have values from both branches
+        # Include phis with values from at least one branch.
+        # Partial phis (one branch missing) arise from Julia's iterator protocol;
+        # duplicate the present value — the missing-branch value is dead (guarded by a condition).
         if then_val !== nothing && else_val !== nothing
             push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=else_val))
+        elseif then_val !== nothing
+            push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=then_val))
+        elseif else_val !== nothing
+            push!(merge_phis, (ssa_idx=si, then_val=else_val, else_val=else_val))
         end
     end
 
@@ -526,6 +532,15 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         getfield_expr = Expr(:call, Core.getfield, SSAValue(loop_result_idx), i)
         push!(block, phi_idx, getfield_expr, phi_type)
+    end
+
+    # For ForOp, the IV phi is excluded from phi_indices but may still be referenced.
+    # Define it as the exclusive upper bound (the IV's value at loop exit).
+    if rtype == REGION_FOR_LOOP
+        for_info = metadata(tree)::ForLoopInfo
+        iv_phi_idx = for_info.iv_phi_idx
+        iv_type = ctx.ssavaluetypes[iv_phi_idx]
+        push!(block, iv_phi_idx, loop_op.upper, iv_type)
     end
 end
 
@@ -847,7 +862,12 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         for child in children(tree)
             child_idx = node_index(child)
             if child_idx != header_idx
-                handle_block_region!(then_blk, child, ir, ctx)
+                child_rtype = region_type(child)
+                if child_rtype == REGION_BLOCK
+                    handle_block_region!(then_blk, child, ir, ctx)
+                else
+                    handle_nested_region!(then_blk, child, ir, ctx)
+                end
             end
         end
         then_blk.terminator = ContinueOp(copy(carried_values))
@@ -863,7 +883,12 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         # Unlike the header-exit case, we don't skip the header here because
         # handle_block_region! properly handles merge phis for compound regions.
         for child in children(tree)
-            handle_block_region!(body, child, ir, ctx)
+            child_rtype = region_type(child)
+            if child_rtype == REGION_BLOCK
+                handle_block_region!(body, child, ir, ctx)
+            else
+                handle_nested_region!(body, child, ir, ctx)
+            end
         end
 
         if condition !== nothing
