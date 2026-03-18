@@ -6,7 +6,7 @@ using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
                       validate_scf, validate_terminators, validate_ssa_defs,
                       SSAMap, statements
-using Core: SSAValue
+using Core: SSAValue, ReturnNode
 using Base: code_ircode
 
 @testset "IRStructurizer" verbose=true begin
@@ -809,6 +809,43 @@ end
     @test length(inner_for.body.args) == 3
 end
 
+@testset "ForOp body.args order matches init_values (extra exits)" begin
+    # Regression test: pad_extra_exits! must append AFTER header phi BlockArgs,
+    # so body.args[i] and init_values[i] have matching types positionally.
+    # The inner for-loop threads outer BlockArgs as extra exits; verify the
+    # header phi (acc) comes first in init(), before extra exits.
+    sci, _ = code_structured(Tuple{Int, Int}) do n::Int, m::Int
+        acc = 0
+        i = 0
+        while i < n
+            j = 0
+            while j < m
+                acc += i
+                j += 1
+            end
+            i += 1
+        end
+        return acc
+    end |> only
+    validate_scf(sci)
+
+    outer_for = nothing
+    for (_, entry) in sci.entry.body
+        entry.stmt isa ForOp && (outer_for = entry.stmt; break)
+    end
+    @test outer_for !== nothing
+    inner_for = nothing
+    for (_, entry) in outer_for.body.body
+        entry.stmt isa ForOp && (inner_for = entry.stmt; break)
+    end
+    @test inner_for !== nothing
+
+    # Header phi (acc) should be body.args[1]; extra exits follow.
+    @test length(inner_for.body.args) == length(inner_for.init_values)
+    @test length(inner_for.body.args) >= 1
+    @test inner_for.body.args[1].id == 2  # id 1 = IV, id 2 = first non-IV arg
+end
+
 @testset "for-in-range loop exit condition in non-header block" begin
     # Regression test: Julia's `for i in 1:n` generates IR where the loop header's
     # GotoIfNot (i == upper?) is an inner branch (both targets inside the loop),
@@ -1128,6 +1165,36 @@ end
     validate_scf(sci)
     validate_ssa_defs(sci)
     @test sci isa StructuredIRCode
+end
+
+@testset "constant-bound for-loop with post-loop use" begin
+    @test @filecheck begin
+        code_structured(Tuple{Int32}) do x::Int32
+            acc = Int32(0)
+            @check "loop init"
+            for i in Int32(1):Int32(4)
+                @check "add_int"
+                acc += i
+            end
+            @check "add_int"
+            @check "return"
+            return acc + x
+        end
+    end
+end
+
+@testset "runtime-bound for-loop with post-loop use" begin
+    @test @filecheck begin
+        code_structured(Tuple{Int32, Int32}) do x::Int32, n::Int32
+            acc = Int32(0)
+            for i in Int32(1):n
+                acc += i
+            end
+            @check "add_int"
+            @check "return"
+            return acc + x
+        end
+    end
 end
 
 end  # Julia for-in-range integration

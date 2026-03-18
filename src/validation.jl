@@ -204,17 +204,11 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
         end
     end
 
-    # All BreakOps must have the same arity and at least n_init values
-    if !isempty(breaks)
-        break_arity = length(first(breaks).values)
-        if break_arity < n_init
-            push!(errors, "LoopOp at %$idx: BreakOp has $break_arity values, expected >= $n_init (loop-carry length)")
-        end
-        for brk in breaks
-            nb = length(brk.values)
-            if nb != break_arity
-                push!(errors, "LoopOp at %$idx: BreakOp arity mismatch ($nb vs $break_arity)")
-            end
+    # All BreakOps must have exactly n_init values (same as loop-carry length)
+    for brk in breaks
+        nb = length(brk.values)
+        if nb != n_init
+            push!(errors, "LoopOp at %$idx: BreakOp has $nb values, expected $n_init (loop-carry length)")
         end
     end
 
