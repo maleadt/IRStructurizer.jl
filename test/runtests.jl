@@ -883,6 +883,38 @@ end
     @test sci.entry.terminator isa Core.ReturnNode
 end
 
+@testset "REGION_PROPER: short-circuit || pattern" begin
+    # This was broken: handle_block_region! silently dropped merge phis
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        r = 0
+        if x > 0 || y > 0
+            r = 1
+        end
+        r
+    end |> only
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+
+    # Verify the output has nested IfOps (from || lowering)
+    if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
+    @test !isempty(if_ops)
+end
+
+@testset "REGION_PROPER: short-circuit && pattern" begin
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        r = 0
+        if x > 0 && y > 0
+            r = 1
+        end
+        r
+    end |> only
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+
+    if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
+    @test !isempty(if_ops)
+end
+
 end  # regression
 
 #=============================================================================

@@ -66,6 +66,8 @@ regions. Back edges are detected using `Core.Compiler.construct_domtree()`.
 | `REGION_BLOCK` | Linear chain of blocks |
 | `REGION_IF_THEN` | Conditional with one branch |
 | `REGION_IF_THEN_ELSE` | Diamond pattern (two branches merge) |
+| `REGION_PROPER` | Multi-exit acyclic region (short-circuit `\|\|`/`&&`) |
+| `REGION_TERMINATION` | Branch where one or more paths terminate (early return) |
 | `REGION_WHILE_LOOP` | Header with back edge from body |
 | `REGION_FOR_LOOP` | While loop with detected counter pattern |
 | `REGION_NATURAL_LOOP` | General cyclic region |

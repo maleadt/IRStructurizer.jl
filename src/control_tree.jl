@@ -715,7 +715,10 @@ function ControlTree(ir::IRCode)
         pushfirst!(next, v)
     end
 
-    @assert length(control_trees) == 1 string("Expected to contract the CFG into a single vertex, got ", length(control_trees), " vertices instead.")
+    if length(control_trees) != 1
+        remaining = sort!(collect(keys(control_trees)))
+        throw(UnstructuredControlFlowError(remaining))
+    end
     only(values(control_trees))
 end
 

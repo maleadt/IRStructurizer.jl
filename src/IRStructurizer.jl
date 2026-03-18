@@ -10,6 +10,9 @@ using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
 # Import code_ircode from Base
 using Base: code_ircode
 
+# error types (needed early by control_tree.jl and validation.jl)
+include("errors.jl")
+
 # auxiliary data structures and analyses
 include("graph.jl")
 include("cfg.jl")
