@@ -103,6 +103,10 @@ function print_value(p::IRPrinter, v::SlotNumber)
     print(p.io, "slot#", v.id)
 end
 
+function print_value(p::IRPrinter, v::Undef)
+    print(p.io, "undef")
+end
+
 function print_value(p::IRPrinter, v::QuoteNode)
     print(p.io, repr(v.value))
 end
@@ -127,6 +131,9 @@ function format_value(p::IRPrinter, v::Argument)
 end
 function format_value(p::IRPrinter, v::SlotNumber)
     string("slot#", v.id)
+end
+function format_value(p::IRPrinter, v::Undef)
+    "undef"
 end
 function format_value(p::IRPrinter, v::QuoteNode)
     repr(v.value)

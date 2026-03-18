@@ -163,8 +163,10 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
             push!(errors, "IfOp at %$idx: yield arity mismatch (then yields $then_arity, else yields $else_arity)")
         end
 
-        # Type validation for matching positions
+        # Type validation for matching positions (Undef matches any type)
         for i in 1:min(then_arity, else_arity)
+            then_term.values[i] isa Undef && continue
+            else_term.values[i] isa Undef && continue
             then_type = resolve_type(sci, then_term.values[i])
             else_type = resolve_type(sci, else_term.values[i])
             if then_type !== nothing && else_type !== nothing && then_type != else_type
@@ -229,108 +231,150 @@ end
 """
     validate_ssa_defs(sci::StructuredIRCode) -> Bool
 
-Validate that all SSAValue references in the structured IR have definitions.
-Collects all SSA ids defined in block bodies and all SSA ids referenced in
-statements and terminators, then checks that every used id is defined.
+Validate that all SSAValue references in the structured IR have definitions
+visible in their scope. Uses scope-aware checking: defs inside IfOp branches,
+LoopOp/WhileOp/ForOp bodies are NOT visible to the enclosing scope — only
+the op's result SSA index is visible.
 
-Throws `UndefinedSSAError` if any SSAValue is used but never defined.
+Throws `UndefinedSSAError` if any SSAValue is used but not defined in its scope.
 """
 function validate_ssa_defs(sci::StructuredIRCode)
-    defs = Set{Int}()
-    uses = Set{Int}()
-    collect_ssa_defs_uses!(defs, uses, sci.entry)
-    undefined = sort!(collect(setdiff(uses, defs)))
+    scope_stack = [Set{Int}()]  # stack of def sets; index 1 = outermost
+    violations = Int[]
+    validate_ssa_defs_scoped!(scope_stack, violations, sci.entry)
+    undefined = sort!(unique!(violations))
     isempty(undefined) || throw(UndefinedSSAError(undefined))
     return true
 end
 
-function collect_ssa_defs_uses!(defs::Set{Int}, uses::Set{Int}, block::Block)
-    # Collect definitions and uses from body statements
-    for (idx, entry) in block.body
-        push!(defs, idx)
-        collect_ssa_uses!(defs, uses, entry.stmt)
+# Check if an SSA id is defined in the current scope or any ancestor scope
+function is_defined_in_scope(scope_stack::Vector{Set{Int}}, id::Int)
+    for i in length(scope_stack):-1:1
+        id in scope_stack[i] && return true
+    end
+    return false
+end
+
+# Check an SSAValue use against the scope stack, recording violations
+function check_use!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val)
+    # non-SSAValue — nothing to check
+end
+
+function check_use!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val::SSAValue)
+    is_defined_in_scope(scope_stack, val.id) || push!(violations, val.id)
+end
+
+function validate_ssa_defs_scoped!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, block::Block)
+    current = scope_stack[end]
+
+    # Pre-collect all defs in this block (within a scope, order doesn't matter)
+    for (idx, _) in block.body
+        push!(current, idx)
     end
 
-    # Collect uses from terminator
-    collect_terminator_uses!(uses, block.terminator)
+    # Now check uses
+    for (_, entry) in block.body
+        check_stmt_uses!(scope_stack, violations, entry.stmt)
+    end
+
+    check_terminator_uses!(scope_stack, violations, block.terminator)
 end
 
-# Collect SSAValue references from a statement (two-arg: non-nested statements)
-function collect_ssa_uses!(::Set{Int}, ::Set{Int}, stmt)
-    # Leaf types that don't reference SSAValues
+# --- Statement use checking (scope-aware) ---
+
+function check_stmt_uses!(::Vector{Set{Int}}, ::Vector{Int}, stmt)
+    # Leaf types — no SSAValue references
 end
 
-function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, val::SSAValue)
-    push!(uses, val.id)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val::SSAValue)
+    check_use!(scope_stack, violations, val)
 end
 
-function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, expr::Expr)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, expr::Expr)
     for arg in expr.args
-        arg isa SSAValue && push!(uses, arg.id)
+        arg isa SSAValue && check_use!(scope_stack, violations, arg)
     end
 end
 
-function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, node::GotoIfNot)
-    node.cond isa SSAValue && push!(uses, node.cond.id)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, node::GotoIfNot)
+    node.cond isa SSAValue && check_use!(scope_stack, violations, node.cond)
 end
 
-function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, node::ReturnNode)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, node::ReturnNode)
     if isdefined(node, :val) && node.val isa SSAValue
-        push!(uses, node.val.id)
+        check_use!(scope_stack, violations, node.val)
     end
 end
 
-function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::IfOp)
-    op.condition isa SSAValue && push!(uses, op.condition.id)
-    collect_ssa_defs_uses!(defs, uses, op.then_region)
-    collect_ssa_defs_uses!(defs, uses, op.else_region)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::IfOp)
+    check_use!(scope_stack, violations, op.condition)
+
+    # Then region: new scope
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.then_region)
+    pop!(scope_stack)
+
+    # Else region: new scope (sibling, NOT shared with then)
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.else_region)
+    pop!(scope_stack)
 end
 
-function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::LoopOp)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::LoopOp)
     for v in op.init_values
-        v isa SSAValue && push!(uses, v.id)
+        check_use!(scope_stack, violations, v)
     end
-    collect_ssa_defs_uses!(defs, uses, op.body)
+
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.body)
+    pop!(scope_stack)
 end
 
-function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::WhileOp)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::WhileOp)
     for v in op.init_values
-        v isa SSAValue && push!(uses, v.id)
+        check_use!(scope_stack, violations, v)
     end
-    collect_ssa_defs_uses!(defs, uses, op.before)
-    collect_ssa_defs_uses!(defs, uses, op.after)
+
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.before)
+    pop!(scope_stack)
+
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.after)
+    pop!(scope_stack)
 end
 
-function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::ForOp)
-    op.lower isa SSAValue && push!(uses, op.lower.id)
-    op.upper isa SSAValue && push!(uses, op.upper.id)
-    op.step isa SSAValue && push!(uses, op.step.id)
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::ForOp)
+    check_use!(scope_stack, violations, op.lower)
+    check_use!(scope_stack, violations, op.upper)
+    check_use!(scope_stack, violations, op.step)
     for v in op.init_values
-        v isa SSAValue && push!(uses, v.id)
+        check_use!(scope_stack, violations, v)
     end
-    collect_ssa_defs_uses!(defs, uses, op.body)
+
+    push!(scope_stack, Set{Int}())
+    validate_ssa_defs_scoped!(scope_stack, violations, op.body)
+    pop!(scope_stack)
 end
 
-# Collect SSAValue references from terminators
-function collect_terminator_uses!(uses::Set{Int}, term)
+# --- Terminator use checking ---
+
+function check_terminator_uses!(::Vector{Set{Int}}, ::Vector{Int}, term)
     # nothing terminator or unrecognized — no uses
 end
 
-function collect_terminator_uses!(uses::Set{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
+function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
     for v in term.values
-        v isa SSAValue && push!(uses, v.id)
+        check_use!(scope_stack, violations, v)
     end
 end
 
-function collect_terminator_uses!(uses::Set{Int}, term::ConditionOp)
-    term.condition isa SSAValue && push!(uses, term.condition.id)
+function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::ConditionOp)
+    check_use!(scope_stack, violations, term.condition)
     for v in term.args
-        v isa SSAValue && push!(uses, v.id)
+        check_use!(scope_stack, violations, v)
     end
 end
 
-function collect_terminator_uses!(uses::Set{Int}, term::ReturnNode)
-    if isdefined(term, :val) && term.val isa SSAValue
-        push!(uses, term.val.id)
-    end
-end
+check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
+    check_stmt_uses!(s, v, term)

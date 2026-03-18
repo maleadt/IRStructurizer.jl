@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode
+export StructuredIRCode, Undef
 
 #=============================================================================
  Block Arguments (for loop carried values)
@@ -18,12 +18,33 @@ struct BlockArg
 end
 
 #=============================================================================
+ Undef - placeholder for structurization artifacts
+=============================================================================#
+
+"""
+    Undef
+
+Typed undefined value, analogous to LLVM's `undef`/`poison` or SPIR-V's `OpUndef`.
+
+Inserted during structurization when a phi node has a missing predecessor edge.
+In a structured IfOp, both branches must yield equal arity, but the original IR
+may only define a value on one path. The dead path gets `Undef(T)` — this value
+is never observed at runtime (guarded by the branch condition).
+"""
+struct Undef
+    type::Any  # Julia type
+end
+
+Base.show(io::IO, u::Undef) = print(io, "undef::$(u.type)")
+
+#=============================================================================
  IR Values - references to SSA values or block arguments
 =============================================================================#
 
 # IRValue: Values used in structured IR
 # - SSAValue, Argument, SlotNumber: references to Julia IR values
 # - BlockArg: block arguments for control flow
+# - Undef: structurization artifact for dead branches
 # - Raw values (Integer, Float, etc.): compile-time constants
 const IRValue = Any
 
@@ -648,6 +669,8 @@ Resolve the Julia type of an IRValue.
 Returns `nothing` if the type cannot be resolved.
 """
 function resolve_type end
+
+resolve_type(sci::StructuredIRCode, value::Undef) = value.type
 
 resolve_type(sci::StructuredIRCode, value::BlockArg) = value.type
 

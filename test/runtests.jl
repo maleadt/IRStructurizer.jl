@@ -4,7 +4,8 @@ using FileCheck
 using IRStructurizer
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
-                      validate_scf, validate_terminators, SSAMap, statements
+                      validate_scf, validate_terminators, validate_ssa_defs,
+                      SSAMap, statements
 using Core: SSAValue
 using Base: code_ircode
 
@@ -73,6 +74,37 @@ end
         @test any(msg -> occursin("then region", msg), e.messages)
         @test any(msg -> occursin("else region", msg), e.messages)
     end
+end
+
+@testset "validation: scope-aware UndefinedSSAError" begin
+    # Manually construct IR where an SSA value defined inside an IfOp branch
+    # is referenced in the outer scope — should be caught by scoped validation.
+    then_region = Block()
+    push!(then_region, 10, Expr(:call, GlobalRef(Base, :add_int), Core.Argument(2), 1), Int64)
+    then_region.terminator = YieldOp([SSAValue(10)])
+    else_region = Block()
+    else_region.terminator = YieldOp([42])
+    if_op = IfOp(Core.Argument(2), then_region, else_region)
+
+    entry = Block()
+    push!(entry, 1, if_op, Tuple{Int64})
+    push!(entry, 2, Expr(:call, Core.getfield, SSAValue(1), 1), Int64)
+    # Reference %10 in outer scope — this is INVALID (defined inside then-branch)
+    push!(entry, 3, Expr(:call, GlobalRef(Base, :add_int), SSAValue(10), 1), Int64)
+    entry.terminator = Core.ReturnNode(SSAValue(2))
+
+    sci = StructuredIRCode(Any[Any, Int64], Any[], entry, 10)
+    @test_throws UndefinedSSAError validate_ssa_defs(sci)
+
+    # Same structure but referencing %2 (defined in outer scope) — should pass
+    entry2 = Block()
+    push!(entry2, 1, if_op, Tuple{Int64})
+    push!(entry2, 2, Expr(:call, Core.getfield, SSAValue(1), 1), Int64)
+    push!(entry2, 3, Expr(:call, GlobalRef(Base, :add_int), SSAValue(2), 1), Int64)
+    entry2.terminator = Core.ReturnNode(SSAValue(3))
+
+    sci2 = StructuredIRCode(Any[Any, Int64], Any[], entry2, 10)
+    @test validate_ssa_defs(sci2)
 end
 
 @testset "ForOp detection during CFG analysis" begin
@@ -1034,6 +1066,36 @@ end
         return last
     end |> only
     validate_scf(sci)
+end
+
+@testset "for-in-range with Int32 bounds" begin
+    function simple_for_loop(n::Int32)
+        acc = Int32(0)
+        for i in Int32(1):n
+            acc += i
+        end
+        return acc
+    end
+
+    sci, _ = only(code_structured(simple_for_loop, Tuple{Int32}))
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+    @test sci isa StructuredIRCode
+end
+
+@testset "for-in-range with mixed types (Int32 iterator, Float32 accumulator)" begin
+    function mixed_type_loop(data::Vector{Float32}, n::Int32)
+        acc = 0.0f0
+        for i in Int32(1):n
+            acc += data[i]
+        end
+        return acc
+    end
+
+    sci, _ = only(code_structured(mixed_type_loop, Tuple{Vector{Float32}, Int32}))
+    validate_scf(sci)
+    validate_ssa_defs(sci)
+    @test sci isa StructuredIRCode
 end
 
 end  # Julia for-in-range integration

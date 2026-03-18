@@ -48,7 +48,10 @@ For single-block regions, this is the block itself.
 For multi-block regions, this is the block that has successors outside the region.
 """
 function get_exit_block(tree::ControlTree, ir::IRCode)
-    blocks = get_region_blocks(tree, ir)
+    return get_exit_block(tree, ir, get_region_blocks(tree, ir))
+end
+
+function get_exit_block(tree::ControlTree, ir::IRCode, blocks::Set{Int})
     nblocks = length(ir.cfg.blocks)
 
     # Find block(s) with successors outside the region
@@ -245,9 +248,13 @@ function handle_if_then_else!(block::Block, tree::ControlTree, ir::IRCode,
 
     # Find merge block and detect merge phis
     # Use exit blocks (not entry blocks) for multi-block regions
-    then_block_idx = get_exit_block(then_tree, ir)
-    else_block_idx = get_exit_block(else_tree, ir)
-    merge_phis = find_merge_phis(ir, then_block_idx, else_block_idx)
+    then_rblocks = get_region_blocks(then_tree, ir)
+    else_rblocks = get_region_blocks(else_tree, ir)
+    then_block_idx = get_exit_block(then_tree, ir, then_rblocks)
+    else_block_idx = get_exit_block(else_tree, ir, else_rblocks)
+    merge_phis = find_merge_phis(ir, then_block_idx, else_block_idx;
+                                 then_blocks=then_rblocks,
+                                 else_blocks=else_rblocks)
 
     # Add YieldOp terminators with phi values
     then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
@@ -284,14 +291,38 @@ function handle_if_then_else!(block::Block, tree::ControlTree, ir::IRCode,
 end
 
 """
-    find_merge_phis(ir, then_block_idx, else_block_idx)
+    is_defined_in_blocks(val, blocks::Set{Int}, ir::IRCode) -> Bool
+
+Check if an SSAValue's definition falls within any of the given blocks' stmt ranges.
+Non-SSAValue values (constants, Arguments) are always considered "not block-local".
+"""
+function is_defined_in_blocks(val, blocks::Set{Int}, ir::IRCode)
+    val isa SSAValue || return false
+    nblocks = length(ir.cfg.blocks)
+    for block_idx in blocks
+        1 <= block_idx <= nblocks || continue
+        bb = ir.cfg.blocks[block_idx]
+        if val.id in first(bb.stmts):last(bb.stmts)
+            return true
+        end
+    end
+    return false
+end
+
+"""
+    find_merge_phis(ir, then_block_idx, else_block_idx; then_blocks, else_blocks)
 
 Find phis in the merge block (common successor of then and else blocks)
 that receive values from both branches.
 
+When a phi has only one incoming edge and the value is branch-local (defined
+within that branch's blocks), `Undef(T)` is used for the dead branch instead
+of duplicating the branch-local SSAValue.
+
 Returns a vector of NamedTuples: (ssa_idx, then_val, else_val)
 """
-function find_merge_phis(ir::IRCode, then_block_idx::Int, else_block_idx::Int)
+function find_merge_phis(ir::IRCode, then_block_idx::Int, else_block_idx::Int;
+                         then_blocks::Set{Int}=Set{Int}(), else_blocks::Set{Int}=Set{Int}())
     merge_phis = NamedTuple{(:ssa_idx, :then_val, :else_val), Tuple{Int, Any, Any}}[]
     nblocks = length(ir.cfg.blocks)
 
@@ -324,15 +355,24 @@ function find_merge_phis(ir::IRCode, then_block_idx::Int, else_block_idx::Int)
 
         # Include phis with values from at least one branch.
         # In SSA form, a phi with only one incoming edge means the value is live on that
-        # path alone. A structured IfOp must yield equal arity from both branches, so we
-        # duplicate the present value for the missing branch (it is dead, guarded by the
-        # branch condition). This is the standard approach in MLIR's SCF dialect.
+        # path alone. A structured IfOp must yield equal arity from both branches.
         if then_val !== nothing && else_val !== nothing
             push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=else_val))
         elseif then_val !== nothing
-            push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=then_val))
+            # Only then branch has a value. If branch-local, the other path gets Undef
+            # (the value is dead there, guarded by the branch condition).
+            if is_defined_in_blocks(then_val, then_blocks, ir)
+                push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=Undef(ir.stmts.type[si])))
+            else
+                # Value is visible in both scopes (e.g., Argument, constant, or outer SSA)
+                push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=then_val))
+            end
         elseif else_val !== nothing
-            push!(merge_phis, (ssa_idx=si, then_val=else_val, else_val=else_val))
+            if is_defined_in_blocks(else_val, else_blocks, ir)
+                push!(merge_phis, (ssa_idx=si, then_val=Undef(ir.stmts.type[si]), else_val=else_val))
+            else
+                push!(merge_phis, (ssa_idx=si, then_val=else_val, else_val=else_val))
+            end
         end
     end
 
@@ -383,8 +423,11 @@ function handle_if_then!(block::Block, tree::ControlTree, ir::IRCode,
     # For if-then, the merge block is the common successor of cond_idx and then_block_idx.
     # cond_idx acts as the "else" path since it has a direct edge to merge when condition is false.
     # Use exit block (not entry block) for multi-block then regions
-    then_block_idx = get_exit_block(then_tree, ir)
-    merge_phis = find_merge_phis(ir, then_block_idx, cond_idx)
+    then_rblocks = get_region_blocks(then_tree, ir)
+    then_block_idx = get_exit_block(then_tree, ir, then_rblocks)
+    merge_phis = find_merge_phis(ir, then_block_idx, cond_idx;
+                                 then_blocks=then_rblocks,
+                                 else_blocks=Set{Int}((cond_idx,)))
 
     # Add YieldOp terminators with phi values
     then_blk.terminator, else_blk.terminator = if !isempty(merge_phis)
@@ -784,7 +827,7 @@ function find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
         for si in first(bb.stmts):last(bb.stmts)
             stmt = ir.stmts.stmt[si]
             if stmt isa GotoIfNot && stmt.dest ∉ loop_blocks
-                return (; cond=stmt.cond, idx=si, block=block_idx)
+                return (; cond=stmt.cond, idx=si, block=block_idx, dest=stmt.dest)
             end
         end
     end
@@ -878,21 +921,59 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         end
     end
 
-    # 5. Build exit control flow
+    # 5. Scan exit target phis for extra body-computed values that need exporting.
+    # When exit phis reference values computed inside the loop body, those values
+    # must be exported via BreakOp and re-exposed in the outer scope via getfield.
+    # We place the getfield at the body-local SSA index (not the exit phi index),
+    # so that outer merge phi yields can reference the value by its original SSA index.
+    extra_exits = @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
+
+    if exit !== nothing
+        exit_dest = exit.dest  # block the GotoIfNot jumps to (loop exit target)
+        if 1 <= exit_dest <= nblocks
+            exit_bb = ir.cfg.blocks[exit_dest]
+            phi_indices_set = Set(phi_indices)
+            for si in first(exit_bb.stmts):last(exit_bb.stmts)
+                stmt = stmts[si]
+                stmt isa PhiNode || continue
+                si ∈ phi_indices_set && continue  # already handled as header phi
+
+                # Find value from loop blocks
+                loop_val = nothing
+                for (edge_idx, edge) in enumerate(stmt.edges)
+                    if isassigned(stmt.values, edge_idx) && edge ∈ loop_blocks
+                        loop_val = stmt.values[edge_idx]
+                    end
+                end
+
+                if loop_val !== nothing
+                    # Place getfield at the body-local SSA index so outer yields find it
+                    gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                    push!(extra_exits, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
+                end
+            end
+        end
+    end
+
+    # 6. Build exit control flow
     if exit !== nothing
         cond_value = convert_phi_value(exit.cond)
 
         then_blk.terminator = ContinueOp(copy(carried_values))
 
         else_blk = Block()
-        else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
+        break_values = IRValue[SSAValue(idx) for idx in phi_indices]
+        for ex in extra_exits
+            push!(break_values, ex.value)
+        end
+        else_blk.terminator = BreakOp(break_values)
 
         push!(body, exit.idx, IfOp(cond_value, then_blk, else_blk), Nothing)
     else
         body.terminator = ContinueOp(copy(carried_values))
     end
 
-    # 6. BlockArgs + substitutions
+    # 7. BlockArgs + substitutions
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         arg = BlockArg(i, phi_type)
@@ -902,6 +983,13 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     apply_substitutions!(body, subs)
 
     loop_op = LoopOp(body, init_values)
+
+    # Append extra exit getfield indices to header phi indices
+    for ex in extra_exits
+        push!(phi_indices, ex.getfield_idx)
+        push!(phi_types, ex.type)
+    end
+
     return loop_op, phi_indices, phi_types
 end
 
