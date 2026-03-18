@@ -1289,16 +1289,26 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         process_child_region!(target, child, ir, ctx)
     end
 
-    # 5. Find and pad extra exit values into the loop-carry chain.
+    # 5. BlockArgs for header phis + substitutions
+    # NOTE: must happen before pad_extra_exits! so body.args order matches
+    # init_values/carried_values order (header phis first, then extra exits).
+    n_header_phis = length(phi_indices)
+    subs = Substitutions()
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
+        arg = BlockArg(i, phi_type)
+        push!(body.args, arg)
+        subs[phi_idx] = arg
+    end
+
+    # 6. Find and pad extra exit values into the loop-carry chain.
     extra_exits = if exit !== nothing
         find_extra_exit_values(ir, exit.dest, natural_blocks, Set(phi_indices))
     else
         @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
     end
-    n_header_phis = length(phi_indices)
     pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_header_phis)
 
-    # 6. Build exit control flow
+    # 7. Build exit control flow
     if exit !== nothing
         cond_value = convert_phi_value(exit.cond)
 
@@ -1317,13 +1327,6 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         body.terminator = ContinueOp(copy(carried_values))
     end
 
-    # 7. BlockArgs for header phis + substitutions
-    subs = Substitutions()
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
-        arg = BlockArg(i, phi_type)
-        push!(body.args, arg)
-        subs[phi_idx] = arg
-    end
     apply_substitutions!(body, subs)
 
     loop_op = LoopOp(body, init_values)
@@ -1418,6 +1421,18 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
         @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
     end
     n_phi = length(phi_indices)
+
+    # Create BlockArgs for header phis BEFORE padding extra exits,
+    # so body.args order matches init_values/carried_values order
+    # (header phis first, then extra exits).
+    subs = Substitutions()
+    subs[iv_phi_idx] = iv_arg  # IV at index 1
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
+        arg = BlockArg(i + 1, phi_type)
+        push!(body.args, arg)
+        subs[phi_idx] = arg
+    end
+
     pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_phi + 1)
 
     # ContinueOp with non-IV carried values (including extra exits)
@@ -1427,17 +1442,6 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
     lower = convert_phi_value(for_info.lower)
     upper = convert_phi_value(for_info.upper)
     step = convert_phi_value(for_info.step)
-
-    # Create BlockArgs and apply substitutions immediately
-    subs = Substitutions()
-    subs[iv_phi_idx] = iv_arg  # IV at index 1
-
-    # Non-IV loop-carried values at indices 2, 3, ...
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
-        arg = BlockArg(i + 1, phi_type)
-        push!(body.args, arg)
-        subs[phi_idx] = arg
-    end
 
     apply_substitutions!(body, subs)
 
