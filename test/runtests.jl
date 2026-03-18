@@ -777,6 +777,44 @@ end
     @test length(inner_for.body.args) == 3
 end
 
+@testset "for-in-range loop exit condition in non-header block" begin
+    # Regression test: Julia's `for i in 1:n` generates IR where the loop header's
+    # GotoIfNot (i == upper?) is an inner branch (both targets inside the loop),
+    # NOT the loop exit. The actual exit condition (not_at_upper) is in a later
+    # merge block. The old code incorrectly used the header's GotoIfNot as the
+    # exit condition, which meant:
+    #   1. The iterator advance (add_int for i+1) was missing from the loop body
+    #   2. The exit condition used === (inner comparison) instead of not_int (actual exit)
+    function mysum(n::Int)
+        s = 0
+        for i in 1:n
+            s += i
+        end
+        s
+    end
+
+    # Verify the loop body has the correct structure:
+    # - add_int for accumulator (s += i)
+    # - === for inner comparison (i == upper)
+    # - add_int for iterator advance (i + 1) — was MISSING without the fix
+    # - not_int for the actual exit condition — was MISPLACED without the fix
+    # - if/continue/break using the correct exit condition
+    @test @filecheck begin
+        code_structured(mysum, Tuple{Int})
+        @check "loop"
+        @check "add_int"   # accumulator: s += i
+        @check "==="       # inner comparison: i == upper
+        @check "add_int"   # iterator advance: i + 1
+        @check "not_int"   # exit condition computation
+        @check "if"        # exit IfOp uses not_int result
+        @check "continue"
+        @check "break"
+    end
+
+    sci, _ = only(code_structured(mysum, Tuple{Int}))
+    validate_scf(sci)
+end
+
 @testset "unreachable blocks are ignored" begin
     # IR with unreachable blocks (e.g., from :meta nodes placed in dead blocks)
     # should be handled gracefully by skipping them during structurization.

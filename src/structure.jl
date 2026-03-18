@@ -810,33 +810,40 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
 
     body = Block()
 
-    # Find the condition for loop exit and its SSA index
+    # Find the condition for loop exit: a GotoIfNot whose target is OUTSIDE the loop.
+    # Search the header first, then all loop blocks.
     condition = nothing
     condition_idx = nothing
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa GotoIfNot
-            condition = stmt.cond
-            condition_idx = si
-            break
+    exit_block_idx = nothing
+
+    # Search all loop blocks for the exit GotoIfNot
+    for block_idx in loop_blocks
+        bb = ir.cfg.blocks[block_idx]
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = stmts[si]
+            if stmt isa GotoIfNot && stmt.dest ∉ loop_blocks
+                condition = stmt.cond
+                condition_idx = si
+                exit_block_idx = block_idx
+                break
+            end
         end
+        condition !== nothing && break
     end
 
-    # Collect header statements (excluding phi nodes and control flow)
-    for si in header_range
-        stmt = stmts[si]
-        if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-            push!(body, si, stmt, types[si])
+    if condition !== nothing && exit_block_idx == header_idx
+        # Exit condition is in the header — standard loop pattern
+        # Collect header statements
+        for si in header_range
+            stmt = stmts[si]
+            if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
+                push!(body, si, stmt, types[si])
+            end
         end
-    end
 
-    # Create the conditional structure inside the loop body
-    if condition !== nothing
         cond_value = convert_phi_value(condition)
 
         then_blk = Block()
-
-        # Process loop body blocks (excluding header)
         for child in children(tree)
             child_idx = node_index(child)
             if child_idx != header_idx
@@ -851,14 +858,38 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         if_op = IfOp(cond_value, then_blk, else_blk)
         push!(body, condition_idx, if_op, Nothing)
     else
-        # No condition - process children directly
+        # Exit condition is NOT in the header (or doesn't exist).
+        # Process all children including compound regions rooted at the header.
+        # Unlike the header-exit case, we don't skip the header here because
+        # handle_block_region! properly handles merge phis for compound regions.
         for child in children(tree)
-            child_idx = node_index(child)
-            if child_idx != header_idx
-                handle_block_region!(body, child, ir, ctx)
-            end
+            handle_block_region!(body, child, ir, ctx)
         end
-        body.terminator = ContinueOp(copy(carried_values))
+
+        if condition !== nothing
+            # The exit condition is in a non-header block.
+            # Collect statements from that block (avoiding duplicates).
+            exit_bb = ir.cfg.blocks[exit_block_idx]
+            for si in first(exit_bb.stmts):last(exit_bb.stmts)
+                stmt = stmts[si]
+                if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
+                    if get(body.body, si, nothing) === nothing
+                        push!(body, si, stmt, types[si])
+                    end
+                end
+            end
+
+            cond_value = convert_phi_value(condition)
+            # GotoIfNot: if NOT cond, goto outside (break); if cond, stay (continue)
+            then_blk = Block()
+            then_blk.terminator = ContinueOp(copy(carried_values))
+            else_blk = Block()
+            else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
+            if_op = IfOp(cond_value, then_blk, else_blk)
+            push!(body, condition_idx, if_op, Nothing)
+        else
+            body.terminator = ContinueOp(copy(carried_values))
+        end
     end
 
     # Create BlockArgs and apply substitutions immediately
