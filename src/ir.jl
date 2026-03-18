@@ -343,6 +343,11 @@ end
 
 General loop with dynamic exit via BreakOp/ContinueOp.
 init_values = initial values for loop-carried variables.
+
+Arity contract:
+- `init_values`, `body.args`, and `ContinueOp.values` must have equal length (loop-carry chain).
+- `BreakOp.values` may be longer: the first N values correspond to loop-carried variables,
+  additional values are body-computed results exported only on loop exit.
 """
 mutable struct LoopOp <: ControlFlowOp
     body::Block
