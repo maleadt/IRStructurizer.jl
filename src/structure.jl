@@ -181,8 +181,6 @@ function tree_to_block(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         handle_termination!(block, tree, ir, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, ir, ctx)
-    elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, ir, ctx)
     elseif rtype == REGION_PROPER
         handle_proper_region!(block, tree, ir, ctx)
     else
@@ -244,8 +242,6 @@ function handle_nested_region!(block::Block, tree::ControlTree, ir::IRCode,
         handle_termination!(block, tree, ir, ctx)
     elseif rtype == REGION_FOR_LOOP || rtype == REGION_WHILE_LOOP || rtype == REGION_NATURAL_LOOP
         handle_loop!(block, tree, ir, ctx)
-    elseif rtype == REGION_SWITCH
-        handle_switch!(block, tree, ir, ctx)
     elseif rtype == REGION_PROPER
         handle_proper_region!(block, tree, ir, ctx)
     else
@@ -543,20 +539,6 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
         iv_type = ctx.ssavaluetypes[iv_phi_idx]
         push!(block, iv_phi_idx, loop_op.upper, iv_type)
     end
-end
-
-"""
-    handle_switch!(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-
-Handle REGION_SWITCH. Not yet implemented — Julia's compiler does not generate
-N-way branch patterns that produce this region type. Falls through to
-`handle_block_region!` so the unhandled GotoIfNots trigger `UnstructuredControlFlowError`
-during validation.
-"""
-function handle_switch!(block::Block, tree::ControlTree, ir::IRCode,
-                        ctx::StructurizationContext)
-    @debug "REGION_SWITCH encountered at block $(node_index(tree)); not yet implemented, falling through"
-    handle_block_region!(block, tree, ir, ctx)
 end
 
 """
