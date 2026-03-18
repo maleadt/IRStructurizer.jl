@@ -323,8 +323,10 @@ function find_merge_phis(ir::IRCode, then_block_idx::Int, else_block_idx::Int)
         end
 
         # Include phis with values from at least one branch.
-        # Partial phis (one branch missing) arise from Julia's iterator protocol;
-        # duplicate the present value — the missing-branch value is dead (guarded by a condition).
+        # In SSA form, a phi with only one incoming edge means the value is live on that
+        # path alone. A structured IfOp must yield equal arity from both branches, so we
+        # duplicate the present value for the missing branch (it is dead, guarded by the
+        # branch condition). This is the standard approach in MLIR's SCF dialect.
         if then_val !== nothing && else_val !== nothing
             push!(merge_phis, (ssa_idx=si, then_val=then_val, else_val=else_val))
         elseif then_val !== nothing
@@ -771,6 +773,25 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
 end
 
 """
+    find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
+
+Find the GotoIfNot in `loop_blocks` whose target exits the loop.
+Returns `(; cond, idx, block)` or `nothing`.
+"""
+function find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
+    for block_idx in loop_blocks
+        bb = ir.cfg.blocks[block_idx]
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            if stmt isa GotoIfNot && stmt.dest ∉ loop_blocks
+                return (; cond=stmt.cond, idx=si, block=block_idx)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
     build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
         -> Tuple{LoopOp, Vector{Int}, Vector{Any}}
 
@@ -779,6 +800,10 @@ Returns (loop_op, phi_indices, phi_types) where:
 - loop_op: The constructed LoopOp
 - phi_indices: SSA indices of the header phi nodes (for getfield generation)
 - phi_types: Julia types of the header phi nodes
+
+Uses a two-phase child processing approach: children up to and including the one
+containing the exit condition go into the loop body; children after go into the
+continue branch. This handles both header-exit and non-header-exit loops uniformly.
 """
 function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
     stmts = ir.stmts.stmt
@@ -791,6 +816,7 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     header_bb = ir.cfg.blocks[header_idx]
     header_range = first(header_bb.stmts):last(header_bb.stmts)
 
+    # 1. Extract phis from header
     init_values = IRValue[]
     carried_values = IRValue[]
     phi_indices = Int[]
@@ -809,7 +835,6 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
             for (edge_idx, edge) in enumerate(phi.edges)
                 if isassigned(phi.values, edge_idx)
                     val = phi.values[edge_idx]
-                    # In IRCode, edge IS the block index directly
                     if edge ∈ loop_blocks
                         carried_val = val
                     else
@@ -823,101 +848,51 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         end
     end
 
-    body = Block()
+    # 2. Find exit condition
+    exit = find_loop_exit_condition(ir, loop_blocks)
 
-    # Find the condition for loop exit: a GotoIfNot whose target is OUTSIDE the loop.
-    # Search the header first, then all loop blocks.
-    condition = nothing
-    condition_idx = nothing
-    exit_block_idx = nothing
-
-    # Search all loop blocks for the exit GotoIfNot
-    for block_idx in loop_blocks
-        bb = ir.cfg.blocks[block_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = stmts[si]
-            if stmt isa GotoIfNot && stmt.dest ∉ loop_blocks
-                condition = stmt.cond
-                condition_idx = si
-                exit_block_idx = block_idx
+    # 3. Determine which child contains the exit block
+    exit_child_idx = nothing
+    if exit !== nothing
+        for (i, child) in enumerate(children(tree))
+            if exit.block ∈ get_region_blocks(child, ir)
+                exit_child_idx = i
                 break
             end
         end
-        condition !== nothing && break
     end
 
-    if condition !== nothing && exit_block_idx == header_idx
-        # Exit condition is in the header — standard loop pattern
-        # Collect header statements
-        for si in header_range
-            stmt = stmts[si]
-            if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-                push!(body, si, stmt, types[si])
-            end
-        end
+    # 4. Process children in two phases:
+    #    - Up to and including the exit child → body (pre-condition stmts)
+    #    - After the exit child → then_blk (post-condition stmts, continue branch)
+    body = Block()
+    then_blk = Block()
 
-        cond_value = convert_phi_value(condition)
-
-        then_blk = Block()
-        for child in children(tree)
-            child_idx = node_index(child)
-            if child_idx != header_idx
-                child_rtype = region_type(child)
-                if child_rtype == REGION_BLOCK
-                    handle_block_region!(then_blk, child, ir, ctx)
-                else
-                    handle_nested_region!(then_blk, child, ir, ctx)
-                end
-            end
+    for (i, child) in enumerate(children(tree))
+        target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
+        child_rtype = region_type(child)
+        if child_rtype == REGION_BLOCK
+            handle_block_region!(target, child, ir, ctx)
+        else
+            handle_nested_region!(target, child, ir, ctx)
         end
+    end
+
+    # 5. Build exit control flow
+    if exit !== nothing
+        cond_value = convert_phi_value(exit.cond)
+
         then_blk.terminator = ContinueOp(copy(carried_values))
 
         else_blk = Block()
         else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
 
-        if_op = IfOp(cond_value, then_blk, else_blk)
-        push!(body, condition_idx, if_op, Nothing)
+        push!(body, exit.idx, IfOp(cond_value, then_blk, else_blk), Nothing)
     else
-        # Exit condition is NOT in the header (or doesn't exist).
-        # Process all children including compound regions rooted at the header.
-        # Unlike the header-exit case, we don't skip the header here because
-        # handle_block_region! properly handles merge phis for compound regions.
-        for child in children(tree)
-            child_rtype = region_type(child)
-            if child_rtype == REGION_BLOCK
-                handle_block_region!(body, child, ir, ctx)
-            else
-                handle_nested_region!(body, child, ir, ctx)
-            end
-        end
-
-        if condition !== nothing
-            # The exit condition is in a non-header block.
-            # Collect statements from that block (avoiding duplicates).
-            exit_bb = ir.cfg.blocks[exit_block_idx]
-            for si in first(exit_bb.stmts):last(exit_bb.stmts)
-                stmt = stmts[si]
-                if !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-                    if get(body.body, si, nothing) === nothing
-                        push!(body, si, stmt, types[si])
-                    end
-                end
-            end
-
-            cond_value = convert_phi_value(condition)
-            # GotoIfNot: if NOT cond, goto outside (break); if cond, stay (continue)
-            then_blk = Block()
-            then_blk.terminator = ContinueOp(copy(carried_values))
-            else_blk = Block()
-            else_blk.terminator = BreakOp(IRValue[SSAValue(idx) for idx in phi_indices])
-            if_op = IfOp(cond_value, then_blk, else_blk)
-            push!(body, condition_idx, if_op, Nothing)
-        else
-            body.terminator = ContinueOp(copy(carried_values))
-        end
+        body.terminator = ContinueOp(copy(carried_values))
     end
 
-    # Create BlockArgs and apply substitutions immediately
+    # 6. BlockArgs + substitutions
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         arg = BlockArg(i, phi_type)
@@ -926,7 +901,6 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     end
     apply_substitutions!(body, subs)
 
-    # Create loop op with init_values
     loop_op = LoopOp(body, init_values)
     return loop_op, phi_indices, phi_types
 end
