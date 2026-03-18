@@ -1,6 +1,7 @@
 # structured IR validation
 
-export UnstructuredControlFlowError, UnsubstitutedPhiError, InvalidTerminatorError
+export UnstructuredControlFlowError, UnsubstitutedPhiError, InvalidTerminatorError,
+       UndefinedSSAError
 
 """
 Exception thrown when unstructured control flow is detected in structured IR.
@@ -207,4 +208,129 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
     # LoopOp body can have various terminators (BreakOp, ContinueOp, etc.)
     # Just recursively validate nested ops
     validate_terminators!(errors, sci, op.body)
+end
+
+#=============================================================================
+ SSA Definition Validation
+=============================================================================#
+
+"""
+Exception thrown when SSA values are used but never defined in the structured IR.
+"""
+struct UndefinedSSAError <: Exception
+    undefined::Vector{Int}
+end
+
+function Base.showerror(io::IO, e::UndefinedSSAError)
+    print(io, "UndefinedSSAError: SSA values used but not defined: ",
+          join(("%$id" for id in e.undefined), ", "))
+end
+
+"""
+    validate_ssa_defs(sci::StructuredIRCode) -> Bool
+
+Validate that all SSAValue references in the structured IR have definitions.
+Collects all SSA ids defined in block bodies and all SSA ids referenced in
+statements and terminators, then checks that every used id is defined.
+
+Throws `UndefinedSSAError` if any SSAValue is used but never defined.
+"""
+function validate_ssa_defs(sci::StructuredIRCode)
+    defs = Set{Int}()
+    uses = Set{Int}()
+    collect_ssa_defs_uses!(defs, uses, sci.entry)
+    undefined = sort!(collect(setdiff(uses, defs)))
+    isempty(undefined) || throw(UndefinedSSAError(undefined))
+    return true
+end
+
+function collect_ssa_defs_uses!(defs::Set{Int}, uses::Set{Int}, block::Block)
+    # Collect definitions and uses from body statements
+    for (idx, entry) in block.body
+        push!(defs, idx)
+        collect_ssa_uses!(defs, uses, entry.stmt)
+    end
+
+    # Collect uses from terminator
+    collect_terminator_uses!(uses, block.terminator)
+end
+
+# Collect SSAValue references from a statement (two-arg: non-nested statements)
+function collect_ssa_uses!(::Set{Int}, ::Set{Int}, stmt)
+    # Leaf types that don't reference SSAValues
+end
+
+function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, val::SSAValue)
+    push!(uses, val.id)
+end
+
+function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, expr::Expr)
+    for arg in expr.args
+        arg isa SSAValue && push!(uses, arg.id)
+    end
+end
+
+function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, node::GotoIfNot)
+    node.cond isa SSAValue && push!(uses, node.cond.id)
+end
+
+function collect_ssa_uses!(::Set{Int}, uses::Set{Int}, node::ReturnNode)
+    if isdefined(node, :val) && node.val isa SSAValue
+        push!(uses, node.val.id)
+    end
+end
+
+function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::IfOp)
+    op.condition isa SSAValue && push!(uses, op.condition.id)
+    collect_ssa_defs_uses!(defs, uses, op.then_region)
+    collect_ssa_defs_uses!(defs, uses, op.else_region)
+end
+
+function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::LoopOp)
+    for v in op.init_values
+        v isa SSAValue && push!(uses, v.id)
+    end
+    collect_ssa_defs_uses!(defs, uses, op.body)
+end
+
+function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::WhileOp)
+    for v in op.init_values
+        v isa SSAValue && push!(uses, v.id)
+    end
+    collect_ssa_defs_uses!(defs, uses, op.before)
+    collect_ssa_defs_uses!(defs, uses, op.after)
+end
+
+function collect_ssa_uses!(defs::Set{Int}, uses::Set{Int}, op::ForOp)
+    op.lower isa SSAValue && push!(uses, op.lower.id)
+    op.upper isa SSAValue && push!(uses, op.upper.id)
+    op.step isa SSAValue && push!(uses, op.step.id)
+    for v in op.init_values
+        v isa SSAValue && push!(uses, v.id)
+    end
+    collect_ssa_defs_uses!(defs, uses, op.body)
+end
+
+# Collect SSAValue references from terminators
+function collect_terminator_uses!(uses::Set{Int}, term)
+    # nothing terminator or unrecognized — no uses
+end
+
+function collect_terminator_uses!(uses::Set{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
+    for v in term.values
+        v isa SSAValue && push!(uses, v.id)
+    end
+end
+
+function collect_terminator_uses!(uses::Set{Int}, term::ConditionOp)
+    term.condition isa SSAValue && push!(uses, term.condition.id)
+    for v in term.args
+        v isa SSAValue && push!(uses, v.id)
+    end
+end
+
+function collect_terminator_uses!(uses::Set{Int}, term::ReturnNode)
+    if isdefined(term, :val) && term.val isa SSAValue
+        push!(uses, term.val.id)
+    end
 end
