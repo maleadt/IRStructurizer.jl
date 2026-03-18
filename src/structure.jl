@@ -638,7 +638,7 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
     # Dispatch based on region type
     post_loop_blocks = Int[]
     if rtype == REGION_FOR_LOOP
-        loop_op, phi_indices, phi_types = build_for_op(block, tree, ir, ctx)
+        loop_op, phi_indices, phi_types = build_for_op(tree, ir, ctx)
     elseif rtype == REGION_WHILE_LOOP
         loop_op, phi_indices, phi_types = build_while_op(tree, ir, ctx)
     else  # REGION_NATURAL_LOOP or other cyclic regions
@@ -1344,13 +1344,13 @@ Returns (for_op, phi_indices, phi_types) where:
 
 The ForOp structure:
 - lower: Lower bound from ForLoopInfo
-- upper: Upper bound (adjusted +1 if is_inclusive)
+- upper: Upper bound from ForLoopInfo
 - step: Step value from ForLoopInfo
 - iv_arg: BlockArg for the induction variable
 - body: Loop body statements + ContinueOp with carried values
 - init_values: Non-IV loop-carried values
 """
-function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
+function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
     header_idx = node_index(tree)
@@ -1428,17 +1428,6 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     upper = convert_phi_value(for_info.upper)
     step = convert_phi_value(for_info.step)
 
-    # If is_inclusive (Julia's 1:n), insert upper+1 in the parent block
-    if for_info.is_inclusive
-        adj_ssa_idx = ctx.next_ssa_idx
-        ctx.next_ssa_idx += 1
-        adj_upper = convert_phi_value(for_info.upper)
-        upper_type = get_value_type(for_info.upper, ir)
-        add_int_expr = Expr(:call, GlobalRef(Base, :add_int), adj_upper, one(upper_type))
-        push!(block, adj_ssa_idx, add_int_expr, upper_type)
-        upper = SSAValue(adj_ssa_idx)
-    end
-
     # Create BlockArgs and apply substitutions immediately
     subs = Substitutions()
     subs[iv_phi_idx] = iv_arg  # IV at index 1
@@ -1452,7 +1441,7 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
 
     apply_substitutions!(body, subs)
 
-    for_op = ForOp(lower, for_info.is_inclusive ? for_info.upper : upper, step, iv_arg, body, init_values)
+    for_op = ForOp(lower, upper, step, iv_arg, body, init_values)
 
     return for_op, phi_indices, phi_types
 end
