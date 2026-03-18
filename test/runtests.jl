@@ -1131,36 +1131,33 @@ end
 end
 
 @testset "constant-bound for-loop with post-loop use" begin
-    function const_bound_loop(x::Int32)
-        acc = Int32(0)
-        for i in Int32(1):Int32(4)
-            acc += i
+    @test @filecheck begin
+        code_structured(Tuple{Int32}) do x::Int32
+            acc = Int32(0)
+            @check "loop init"
+            for i in Int32(1):Int32(4)
+                @check "add_int"
+                acc += i
+            end
+            @check "add_int"
+            @check "return"
+            return acc + x
         end
-        return acc + x
     end
-
-    sci, _ = only(code_structured(const_bound_loop, Tuple{Int32}))
-    validate_scf(sci)
-    validate_ssa_defs(sci)
-    @test sci isa StructuredIRCode
-
-    # The return must be at the top level, not inside the loop body
-    @test sci.entry.terminator isa ReturnNode
 end
 
-@testset "runtime-bound for-loop with post-loop use (regression)" begin
-    function runtime_bound_loop(x::Int32, n::Int32)
-        acc = Int32(0)
-        for i in Int32(1):n
-            acc += i
+@testset "runtime-bound for-loop with post-loop use" begin
+    @test @filecheck begin
+        code_structured(Tuple{Int32, Int32}) do x::Int32, n::Int32
+            acc = Int32(0)
+            for i in Int32(1):n
+                acc += i
+            end
+            @check "add_int"
+            @check "return"
+            return acc + x
         end
-        return acc + x
     end
-
-    sci, _ = only(code_structured(runtime_bound_loop, Tuple{Int32, Int32}))
-    validate_scf(sci)
-    validate_ssa_defs(sci)
-    @test sci isa StructuredIRCode
 end
 
 end  # Julia for-in-range integration
