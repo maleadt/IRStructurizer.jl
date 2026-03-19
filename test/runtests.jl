@@ -362,6 +362,22 @@ end  # CFG analysis
     @test for_op.step == 1
 end
 
+@testset "inclusive bound (<=) gets exclusive adjustment" begin
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n::Int
+            i = 0
+            acc = 0
+            @check "add_int(_2, 1)::Int64"
+            @check "for %arg1 = 0:1:%{{.*}}"
+            while i <= n
+                acc += i
+                i += 1
+            end
+            return acc
+        end
+    end
+end
+
 @testset "bounded counter with accumulator" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int

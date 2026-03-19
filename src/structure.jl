@@ -638,7 +638,7 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
     # Dispatch based on region type
     post_loop_blocks = Int[]
     if rtype == REGION_FOR_LOOP
-        loop_op, phi_indices, phi_types = build_for_op(tree, ir, ctx)
+        loop_op, phi_indices, phi_types = build_for_op(block, tree, ir, ctx)
     elseif rtype == REGION_WHILE_LOOP
         loop_op, phi_indices, phi_types = build_while_op(tree, ir, ctx)
     else  # REGION_NATURAL_LOOP or other cyclic regions
@@ -1347,13 +1347,13 @@ Returns (for_op, phi_indices, phi_types) where:
 
 The ForOp structure:
 - lower: Lower bound from ForLoopInfo
-- upper: Upper bound from ForLoopInfo
+- upper: Exclusive upper bound (adjusted +1 for inclusive patterns like `<=`)
 - step: Step value from ForLoopInfo
 - iv_arg: BlockArg for the induction variable
 - body: Loop body statements + ContinueOp with carried values
 - init_values: Non-IV loop-carried values
 """
-function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
+function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
     header_idx = node_index(tree)
@@ -1438,10 +1438,21 @@ function build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext
     # ContinueOp with non-IV carried values (including extra exits)
     body.terminator = ContinueOp(copy(carried_values))
 
-    # Build ForOp with bounds from ForLoopInfo
+    # Build ForOp with bounds from ForLoopInfo.
+    # ForOp uses exclusive upper bound semantics (loop iterates while iv < upper).
     lower = convert_phi_value(for_info.lower)
     upper = convert_phi_value(for_info.upper)
     step = convert_phi_value(for_info.step)
+
+    # Normalize inclusive bounds (e.g., `while j <= n`) to exclusive (upper + 1)
+    if for_info.is_inclusive
+        adj_ssa_idx = ctx.next_ssa_idx
+        ctx.next_ssa_idx += 1
+        upper_type = get_value_type(for_info.upper, ir)
+        add_int_expr = Expr(:call, GlobalRef(Base, :add_int), upper, one(upper_type))
+        push!(block, adj_ssa_idx, add_int_expr, upper_type)
+        upper = SSAValue(adj_ssa_idx)
+    end
 
     apply_substitutions!(body, subs)
 

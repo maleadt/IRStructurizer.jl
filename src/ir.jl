@@ -299,6 +299,7 @@ end
     ForOp
 
 Counted for-loop with lower/upper/step bounds.
+Iterates while iv < upper (exclusive upper bound).
 init_values = initial values for loop-carried variables.
 
 Arity contract (all equal):
