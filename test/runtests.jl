@@ -541,19 +541,19 @@ end
     # Regression test: when the step is an SSA value defined inside the loop body
     # (e.g., a non-inlinable call), ForOp detection must reject it because the step
     # reference would be undefined at the ForOp level.
-    sci, _ = code_structured(Tuple{Int}) do n::Int
-        i = 0
-        while i < n
-            i += _STEP_REF[]
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n::Int
+            i = 0
+            @check_not "for"
+            @check "while"
+            while i < n
+                @check "getfield"
+                @check "add_int"
+                i += _STEP_REF[]
+            end
+            return i
         end
-        return i
-    end |> only
-
-    # Must NOT be ForOp — step SSA is inside the loop
-    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
-    @test isempty(for_ops)
-    loop_ops = filter(x -> x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
-    @test length(loop_ops) >= 1
+    end
 end
 
 end  # WhileOp/LoopOp fallback
