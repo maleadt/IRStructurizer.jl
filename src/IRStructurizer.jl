@@ -4,7 +4,8 @@ using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
             GotoNode, GotoIfNot, ReturnNode, PhiNode, PiNode, QuoteNode, GlobalRef
 
 using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
-                     construct_domtree, DomTree, dominates, bb_unreachable
+                     construct_domtree, DomTree, dominates, bb_unreachable,
+                     widenconst
 using Base: code_ircode
 
 # auxiliary data structures and analyses

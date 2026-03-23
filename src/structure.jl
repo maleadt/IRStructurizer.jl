@@ -128,17 +128,18 @@ Get the Julia type of a value that could be SSAValue, SlotNumber, Argument, or a
 """
 function get_value_type(val, ir::IRCode)
     if val isa SSAValue
-        return ir.stmts.type[val.id]
+        return widenconst(ir.stmts.type[val.id])
     elseif val isa SlotNumber
-        return ir.argtypes[val.id]
+        return widenconst(ir.argtypes[val.id])
     elseif val isa Argument
         # Argument(n) maps directly to slottypes[n]
-        return ir.argtypes[val.n]
+        return widenconst(ir.argtypes[val.n])
     else
         # Constant value
         return typeof(val)
     end
 end
+
 
 """
     HeaderPhiInfo

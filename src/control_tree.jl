@@ -463,8 +463,9 @@ function try_detect_for_loop(header_idx::Int, ir::IRCode;
     step = find_step_from_carried_value(stmts, phi.carried_val, SSAValue(match.iv_phi_idx))
     step === nothing && return nothing
 
-    # Step 5: Check loop-invariance of bound
+    # Step 5: Check loop-invariance of bound and step
     is_loop_invariant(match.bound, header_idx, ir) || return nothing
+    is_loop_invariant(step, header_idx, ir) || return nothing
 
     # Success: construct ForLoopInfo
     return ForLoopInfo(match.iv_phi_idx, phi.entry_val, match.bound, step, match.is_inclusive)
