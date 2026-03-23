@@ -140,8 +140,6 @@ function get_value_type(val, ir::IRCode)
     end
 end
 
-# Unwrap Core.Const/Core.PartialStruct to get the runtime type
-widenconst(@nospecialize(t)) = Core.Compiler.widenconst(t)
 
 """
     HeaderPhiInfo

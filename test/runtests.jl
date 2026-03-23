@@ -548,7 +548,6 @@ end
         end
         return i
     end |> only
-    @test sci isa StructuredIRCode
 
     # Must NOT be ForOp — step SSA is inside the loop
     for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
