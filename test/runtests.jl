@@ -378,6 +378,28 @@ end
     end
 end
 
+@testset "inclusive bound with Core.Const upper type" begin
+    # Regression test: when the upper bound SSA value has Core.Const inferred type,
+    # the inclusive→exclusive adjustment must still work (one() needs a concrete type).
+    function const_upper(n::Int32)
+        i = Int32(0)
+        acc = Int32(0)
+        upper = n + Int32(0)
+        while i <= upper
+            acc += i
+            i += Int32(1)
+        end
+        return acc
+    end
+    ir, _ = only(code_ircode(const_upper, (Int32,)))
+    # Patch the upper bound SSA type to Core.Const (simulates custom interpreters
+    # that infer constant return types without folding)
+    ir.stmts.type[1] = Core.Const(Int32(10))
+    sci = StructuredIRCode(ir)
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
+    @test length(for_ops) == 1
+end
+
 @testset "bounded counter with accumulator" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
