@@ -9,6 +9,9 @@ using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
 using Core: SSAValue, ReturnNode
 using Base: code_ircode
 
+# Used by "step defined inside loop body" test — must be module-level const
+const _STEP_REF = Ref(2)
+
 @testset "IRStructurizer" verbose=true begin
 
 #=============================================================================
@@ -531,6 +534,26 @@ end  # WhileOp detection
 
     # Should have some loop op (not ForOp since step changes)
     loop_ops = filter(x -> x isa ForOp || x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
+    @test length(loop_ops) >= 1
+end
+
+@testset "step defined inside loop body" begin
+    # Regression test: when the step is an SSA value defined inside the loop body
+    # (e.g., a non-inlinable call), ForOp detection must reject it because the step
+    # reference would be undefined at the ForOp level.
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        while i < n
+            i += _STEP_REF[]
+        end
+        return i
+    end |> only
+    @test sci isa StructuredIRCode
+
+    # Must NOT be ForOp — step SSA is inside the loop
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
+    @test isempty(for_ops)
+    loop_ops = filter(x -> x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
     @test length(loop_ops) >= 1
 end
 
