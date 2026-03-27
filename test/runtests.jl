@@ -1499,11 +1499,15 @@ end
 end
 
 @testset "carries push!" begin
-    body = Block()
+    entry = Block()
     iv = BlockArg(1, Int)
-    # ForOp stores IV in iv_arg, not in body.args
+    body = Block()
     body.terminator = ContinueOp(IRStructurizer.IRValue[])
     op = ForOp(1, 10, 1, iv, body, IRStructurizer.IRValue[])
+    push!(entry.body, (1, op, Nothing))
+    sci = StructuredIRCode(Any[], Any[], entry, 1)
+    entry.parent = sci
+    body.parent = entry
 
     c = carries(op)
     @test length(c) == 0
@@ -1631,6 +1635,15 @@ end
 
     op = LoopOp(body, Any[SSAValue(100)])
 
+    # Wrap in SCI so root() works for push!(carries, ...)
+    entry = Block()
+    push!(entry.body, (11, op, Nothing))
+    sci = StructuredIRCode(Any[], Any[], entry, 11)
+    entry.parent = sci
+    body.parent = entry
+    then_blk.parent = body
+    else_blk.parent = body
+
     c = carries(op)
     @test length(c) == 1
 
@@ -1728,7 +1741,7 @@ end
     @test all(b -> b isa Block, all_blocks)
 end
 
-@testset "block_for_inst(sci, ssa_idx)" begin
+@testset "findblock(sci, inst)" begin
     sci, _ = code_structured(Tuple{Int}) do x::Int
         y = x + 1
         return y
@@ -1736,11 +1749,89 @@ end
 
     # Find an instruction in the entry block
     inst = first(instructions(sci.entry))
-    found = block_for_inst(sci, inst.ssa_idx)
+    found = findblock(sci, inst)
     @test found === sci.entry
 
-    # Non-existent SSA index returns nothing
-    @test block_for_inst(sci, 999999) === nothing
+    # Non-existent instruction returns nothing
+    @test findblock(sci, Inst(999999, nothing, Nothing)) === nothing
+end
+
+@testset "pushfirst!(block, stmt, typ)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    old_first = first(instructions(sci.entry))
+    new_inst = pushfirst!(sci.entry, Expr(:call, :sentinel), Int)
+    @test new_inst isa Inst
+    @test first(instructions(sci.entry)) == new_inst
+    @test collect(instructions(sci.entry))[2] == old_first
+end
+
+@testset "update_type!(block, inst, new_type)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    inst = first(instructions(sci.entry))
+    old_type = value_type(inst)
+    update_type!(sci.entry, inst, Float64)
+
+    # Re-read from block to verify
+    updated = first(instructions(sci.entry))
+    @test value_type(updated) == Float64
+end
+
+@testset "new_block_arg!(block, typ)" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        while i < n
+            i += 1
+        end
+        return i
+    end |> only
+
+    # Find a loop body block with args
+    for inst in instructions(sci.entry)
+        op = stmt(inst)
+        op isa ForOp || continue
+
+        old_n = length(arguments(op.body))
+        new_arg = new_block_arg!(op.body, Float32)
+        @test new_arg isa BlockArg
+        @test new_arg.type == Float32
+        @test length(arguments(op.body)) == old_n + 1
+        @test arguments(op.body)[end] === new_arg
+        break
+    end
+end
+
+@testset "walk_uses! extensibility" begin
+    using IRStructurizer: walk_uses!, IndexedUseRef
+
+    # Custom statement type
+    mutable struct TestCustomNode
+        operands::Vector{Any}
+    end
+
+    # Define walk_uses! for our custom type
+    IRStructurizer.walk_uses!(f, node::TestCustomNode) =
+        for i in 1:length(node.operands); f(IndexedUseRef(node.operands, i)); end
+
+    block = Block()
+    push!(block.body, (1, TestCustomNode([SSAValue(0), SSAValue(0)]), Int))
+    push!(block.body, (2, Expr(:call, GlobalRef(Base, :+), SSAValue(1)), Int))
+    block.terminator = ReturnNode(SSAValue(2))
+
+    # uses() should find operands inside our custom node
+    idx = uses(block)
+    @test length(idx[SSAValue(0)]) == 2  # two operands in TestCustomNode
+
+    # replace_uses! should work through custom nodes
+    replace_uses!(block, SSAValue(0), SSAValue(99))
+    idx2 = uses(block)
+    @test isempty(idx2[SSAValue(0)])
+    @test length(idx2[SSAValue(99)]) == 2
 end
 
 end  # utilities

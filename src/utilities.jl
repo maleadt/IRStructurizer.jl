@@ -1,7 +1,8 @@
 # Utilities for structured IR
 #
-# Block mutation: parent, root, push!, insert_before!, insert_after!, delete!
-# Block traversal: eachblock, block_for_inst
+# Block mutation: parent, root, push!, pushfirst!, insert_before!, insert_after!,
+#                 delete!, update_type!, new_block_arg!
+# Block traversal: eachblock, findblock
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
 
@@ -10,8 +11,9 @@
  Block mutation (SSA-allocating operations)
 =============================================================================#
 
-public root, parent
-export insert_before!, insert_after!, eachblock, block_for_inst
+public root, parent, walk_uses!, IndexedUseRef
+export insert_before!, insert_after!, eachblock, findblock,
+       update_type!, new_block_arg!
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -56,6 +58,51 @@ function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ))
         end
     end
     return Inst(idx, stmt, typ)
+end
+
+"""
+    pushfirst!(block::Block, stmt, typ) -> Inst
+
+Prepend a new instruction at the beginning of the block, auto-allocating an SSA index.
+"""
+function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ))
+    sci = root(block)
+    sci.max_ssa_idx += 1
+    idx = sci.max_ssa_idx
+    pushfirst!(block.body.ssa_idxes, idx)
+    pushfirst!(block.body.stmts, stmt)
+    pushfirst!(block.body.types, typ)
+    if stmt isa ControlFlowOp
+        for b in blocks(stmt)
+            b.parent = block
+        end
+    end
+    return Inst(idx, stmt, typ)
+end
+
+"""
+    update_type!(block::Block, inst::Inst, new_type)
+
+Update the type annotation for an existing instruction.
+"""
+function update_type!(block::Block, inst::Inst, @nospecialize(new_type))
+    pos = findfirst(==(inst.ssa_idx), block.body.ssa_idxes)
+    pos === nothing && throw(KeyError(inst.ssa_idx))
+    block.body.types[pos] = new_type
+    return nothing
+end
+
+"""
+    new_block_arg!(block::Block, typ) -> BlockArg
+
+Add a new BlockArg to a block, allocating a fresh ID from the root StructuredIRCode.
+"""
+function new_block_arg!(block::Block, @nospecialize(typ))
+    sci = root(block)
+    sci.max_ssa_idx += 1
+    arg = BlockArg(sci.max_ssa_idx, typ)
+    push!(block.args, arg)
+    return arg
 end
 
 """
@@ -189,10 +236,11 @@ function walk_uses!(f, block::Block)
         stmt = block.body.stmts[i]
         if stmt isa ControlFlowOp
             walk_uses!(f, stmt)
-        elseif stmt isa Expr
-            walk_uses!(f, stmt)
         elseif stmt isa ReturnNode
             isdefined(stmt, :val) && f(ReturnNodeUseRef(block.body.stmts, i))
+        else
+            # Dispatch to user-defined methods for Expr, custom node types, etc.
+            walk_uses!(f, stmt)
         end
     end
     term = block.terminator
@@ -203,6 +251,9 @@ function walk_uses!(f, block::Block)
         walk_uses!(f, term)
     end
 end
+
+# Fallback for unknown statement types (no-op)
+walk_uses!(f, ::Any) = nothing
 
 # Expr: walk operands
 function walk_uses!(f, expr::Expr)
@@ -512,12 +563,9 @@ function Base.push!(carries::LoopCarries, init_val, @nospecialize(body_arg_type)
     op = carries.op
     body = body_block(op)
 
-    # Allocate a new BlockArg ID
-    next_id = isempty(body.args) ? 1 : maximum(a.id for a in body.args) + 1
-    new_arg = BlockArg(next_id, body_arg_type)
+    new_arg = new_block_arg!(body, body_arg_type)
 
     push!(op.init_values, init_val)
-    push!(body.args, new_arg)
 
     # Thread through all reachable terminators
     for term in carries.terminators
@@ -530,9 +578,7 @@ function Base.push!(carries::LoopCarries, init_val, @nospecialize(body_arg_type)
 
     # WhileOp: also add to after block args
     if op isa WhileOp
-        after_id = isempty(op.after.args) ? 1 : maximum(a.id for a in op.after.args) + 1
-        after_arg = BlockArg(after_id, body_arg_type)
-        push!(op.after.args, after_arg)
+        after_arg = new_block_arg!(op.after, body_arg_type)
     end
 
     return CarryRef(carries, length(op.init_values))
@@ -568,14 +614,14 @@ function _collect_blocks!(out, block::Block)
 end
 
 """
-    block_for_inst(sci::StructuredIRCode, ssa_idx::Int) -> Union{Block, Nothing}
+    findblock(sci::StructuredIRCode, inst::Inst) -> Union{Block, Nothing}
 
-Find the Block containing the instruction with the given SSA index.
+Find the Block containing the given instruction.
 Returns `nothing` if not found.
 """
-function block_for_inst(sci::StructuredIRCode, ssa_idx::Int)
+function findblock(sci::StructuredIRCode, inst::Inst)
     for block in eachblock(sci)
-        haskey(block.body, ssa_idx) && return block
+        haskey(block.body, inst.ssa_idx) && return block
     end
     return nothing
 end
