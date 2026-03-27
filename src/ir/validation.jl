@@ -35,11 +35,10 @@ function validate_no_gotos!(bad::Vector{Int}, block::Block)
         stmt = entry.stmt
         if stmt isa GotoNode || stmt isa GotoIfNot
             push!(bad, idx)
-        elseif stmt isa IfOp
-            validate_no_gotos!(bad, stmt.then_region)
-            validate_no_gotos!(bad, stmt.else_region)
-        elseif stmt isa LoopOp
-            validate_no_gotos!(bad, stmt.body)
+        elseif stmt isa ControlFlowOp
+            for b in blocks(stmt)
+                validate_no_gotos!(bad, b)
+            end
         end
     end
 end
@@ -65,11 +64,10 @@ function validate_no_phis!(bad::Vector{Int}, block::Block)
         stmt = entry.stmt
         if stmt isa PhiNode
             push!(bad, idx)
-        elseif stmt isa IfOp
-            validate_no_phis!(bad, stmt.then_region)
-            validate_no_phis!(bad, stmt.else_region)
-        elseif stmt isa LoopOp
-            validate_no_phis!(bad, stmt.body)
+        elseif stmt isa ControlFlowOp
+            for b in blocks(stmt)
+                validate_no_phis!(bad, b)
+            end
         end
     end
 end
@@ -190,48 +188,19 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
         push!(errors, "LoopOp at %$idx: init_values length ($n_init) != body.args length ($n_args)")
     end
 
-    # Collect all ContinueOps and BreakOps reachable from the body
-    # (recurse into nested IfOps but NOT into nested loop ops)
-    continues = ContinueOp[]
-    breaks = BreakOp[]
-    _collect_loop_terminators!(continues, breaks, op.body)
-
-    # All ContinueOps must match loop-carry length
-    for cont in continues
-        nc = length(cont.values)
-        if nc != n_init
-            push!(errors, "LoopOp at %$idx: ContinueOp has $nc values, expected $n_init (loop-carry length)")
-        end
-    end
-
-    # All BreakOps must have exactly n_init values (same as loop-carry length)
-    for brk in breaks
-        nb = length(brk.values)
-        if nb != n_init
-            push!(errors, "LoopOp at %$idx: BreakOp has $nb values, expected $n_init (loop-carry length)")
+    # Validate all reachable ContinueOps and BreakOps match loop-carry length
+    for term in reachable_terminators(op.body)
+        if term isa ContinueOp
+            nc = length(term.values)
+            nc == n_init || push!(errors, "LoopOp at %$idx: ContinueOp has $nc values, expected $n_init (loop-carry length)")
+        elseif term isa BreakOp
+            nb = length(term.values)
+            nb == n_init || push!(errors, "LoopOp at %$idx: BreakOp has $nb values, expected $n_init (loop-carry length)")
         end
     end
 
     # Recursively validate nested ops
     validate_terminators!(errors, sci, op.body)
-end
-
-"""
-Collect all ContinueOp and BreakOp terminators reachable from `block`,
-recursing into nested IfOps but NOT into nested loop ops (which have their own scope).
-"""
-function _collect_loop_terminators!(continues::Vector{ContinueOp}, breaks::Vector{BreakOp}, block::Block)
-    if block.terminator isa ContinueOp
-        push!(continues, block.terminator)
-    elseif block.terminator isa BreakOp
-        push!(breaks, block.terminator)
-    end
-    for stmt in statements(block.body)
-        if stmt isa IfOp
-            _collect_loop_terminators!(continues, breaks, stmt.then_region)
-            _collect_loop_terminators!(continues, breaks, stmt.else_region)
-        end
-    end
 end
 
 #=============================================================================
@@ -389,3 +358,35 @@ end
 
 check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
     check_stmt_uses!(s, v, term)
+
+#=============================================================================
+ Type Resolution for IRValues
+=============================================================================#
+
+"""
+    resolve_type(sci::StructuredIRCode, value::IRValue) -> Any
+
+Resolve the Julia type of an IRValue.
+Returns `nothing` if the type cannot be resolved.
+"""
+function resolve_type end
+
+resolve_type(sci::StructuredIRCode, value::Undef) = value.type
+
+resolve_type(sci::StructuredIRCode, value::BlockArg) = value.type
+
+resolve_type(sci::StructuredIRCode, value::Argument) = sci.argtypes[value.n]
+
+resolve_type(sci::StructuredIRCode, value::SlotNumber) = sci.argtypes[value.id]
+
+# Constants: return their runtime type
+resolve_type(sci::StructuredIRCode, value) = typeof(value)
+
+# SSAValue: search the structured IR for its definition
+function resolve_type(sci::StructuredIRCode, value::SSAValue)
+    for block in eachblock(sci)
+        entry = get(block.body, value.id, nothing)
+        entry !== nothing && return entry.typ
+    end
+    return nothing
+end

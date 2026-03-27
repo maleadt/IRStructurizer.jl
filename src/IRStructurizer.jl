@@ -16,14 +16,20 @@ include("cfg.jl")
 include("control_tree.jl")
 
 # structured IR definitions
-include("ir.jl")
-include("show.jl")
+include("ir/types.jl")
+include("ir/show.jl")
 
 # control tree to structured IR
-include("structure.jl")
+include("structurize/substitutions.jl")
+include("structurize/helpers.jl")
+include("structurize/regions.jl")
+include("structurize/loops.jl")
 
-# validation and public API
-include("validation.jl")
+# IR utilities & validation
+include("ir/utilities.jl")
+include("ir/validation.jl")
+
+# public API
 include("interface.jl")
 include("precompile.jl")
 
