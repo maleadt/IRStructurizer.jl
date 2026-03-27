@@ -1834,6 +1834,151 @@ end
     @test length(idx2[SSAValue(99)]) == 2
 end
 
+@testset "insert_before!/after! with SSAValue ref" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    insts = collect(instructions(sci.entry))
+    ref = first(insts)
+    ref_ssaval = SSAValue(ref)
+
+    # insert_before! with SSAValue reference
+    before = insert_before!(sci.entry, ref_ssaval, Expr(:call, :before_ssa), Int32)
+    @test before isa Inst
+
+    # insert_after! with SSAValue reference
+    after = insert_after!(sci.entry, ref_ssaval, Expr(:call, :after_ssa), Int64)
+    @test after isa Inst
+
+    # Verify ordering: before < ref < after
+    all_insts = collect(instructions(sci.entry))
+    bp = findfirst(i -> i == before, all_insts)
+    rp = findfirst(i -> i == ref, all_insts)
+    ap = findfirst(i -> i == after, all_insts)
+    @test bp < rp < ap
+
+    # Chaining: insert_after! the just-inserted instruction
+    chained = insert_after!(sci.entry, SSAValue(after), Expr(:call, :chained), Bool)
+    all_insts2 = collect(instructions(sci.entry))
+    cp = findfirst(i -> i == chained, all_insts2)
+    ap2 = findfirst(i -> i == after, all_insts2)
+    @test cp == ap2 + 1
+end
+
+@testset "resolve_call" begin
+    using IRStructurizer: resolve_call
+
+    # :call expression with GlobalRef
+    expr_call = Expr(:call, GlobalRef(Base, :+), SSAValue(1), SSAValue(2))
+    result = resolve_call(expr_call)
+    @test result !== nothing
+    func, operands = result
+    @test func === Base.:+
+    @test length(operands) == 2
+    @test operands[1] == SSAValue(1)
+
+    # :invoke expression
+    mi = first(methods(+, (Int, Int)))
+    expr_invoke = Expr(:invoke, mi, GlobalRef(Base, :+), SSAValue(1), SSAValue(2))
+    result2 = resolve_call(expr_invoke)
+    @test result2 !== nothing
+    func2, operands2 = result2
+    @test func2 === Base.:+
+    @test length(operands2) == 2
+
+    # Non-call returns nothing
+    @test resolve_call(42) === nothing
+    @test resolve_call(Expr(:new, :Foo)) === nothing
+
+    # Inst overload
+    inst = Inst(1, expr_call, Int)
+    result3 = resolve_call(inst)
+    @test result3 !== nothing
+    @test first(result3) === Base.:+
+end
+
+@testset "iscall / callee / callargs" begin
+    using IRStructurizer: iscall, callee, callargs
+
+    expr_call = Expr(:call, GlobalRef(Base, :+), SSAValue(1), SSAValue(2))
+    @test iscall(expr_call)
+    @test callee(expr_call) == GlobalRef(Base, :+)
+    @test length(callargs(expr_call)) == 2
+    @test callargs(expr_call)[1] == SSAValue(1)
+
+    mi = first(methods(+, (Int, Int)))
+    expr_invoke = Expr(:invoke, mi, GlobalRef(Base, :*), SSAValue(3))
+    @test iscall(expr_invoke)
+    @test callee(expr_invoke) == GlobalRef(Base, :*)
+    @test length(callargs(expr_invoke)) == 1
+
+    @test !iscall(42)
+    @test !iscall(Expr(:new, :Foo))
+
+    # Inst overloads
+    inst = Inst(1, expr_call, Int)
+    @test iscall(inst)
+    @test callee(inst) == GlobalRef(Base, :+)
+    @test length(callargs(inst)) == 2
+end
+
+@testset "carries: per-terminator replacement (mwe.jl pattern)" begin
+    # This test verifies the pattern from cuTile's mwe.jl:
+    # push!(carries, ...) threads a placeholder, then term_value! replaces
+    # per-terminator with different values based on control flow path.
+    using IRStructurizer: term_value!, carries, body_arg, init_value
+
+    # Build: LoopOp with IfOp inside body (BreakOp in then, ContinueOp in else)
+    then_blk = Block()
+    then_blk.terminator = BreakOp([SSAValue(99)])     # 1 user carry
+    else_blk = Block()
+    else_blk.terminator = ContinueOp([SSAValue(88)])   # 1 user carry
+
+    body = Block()
+    push!(body.args, BlockArg(1, Int))  # 1 user block arg
+    ifop = IfOp(SSAValue(50), then_blk, else_blk)
+    push!(body.body, (10, ifop, Nothing))
+    body.terminator = nothing
+
+    op = LoopOp(body, Any[SSAValue(100)])  # 1 user init value
+
+    # Wire parents
+    entry = Block()
+    push!(entry.body, (11, op, Nothing))
+    sci = StructuredIRCode(Any[], Any[], entry, 100)
+    entry.parent = sci
+    body.parent = entry
+    then_blk.parent = body
+    else_blk.parent = body
+
+    # Push a token carry — placeholder threads through both terminators
+    c = carries(op)
+    cr = push!(c, SSAValue(200), Float64)
+    placeholder = body_arg(cr)
+
+    @test then_blk.terminator.values[2] === placeholder
+    @test else_blk.terminator.values[2] === placeholder
+
+    # Now simulate what the token ordering pass does:
+    # Replace per-terminator with DIFFERENT values
+    new_token = SSAValue(999)   # post-memory-op token for break path
+    tok_arg = placeholder       # unchanged body arg for continue path
+
+    term_value!(cr, then_blk.terminator, new_token)
+    term_value!(cr, else_blk.terminator, tok_arg)
+
+    # Verify: different values per terminator
+    @test then_blk.terminator.values[2] === new_token
+    @test else_blk.terminator.values[2] === tok_arg
+    @test then_blk.terminator.values[2] !== else_blk.terminator.values[2]
+
+    # Init value and user carries are unchanged
+    @test init_value(cr) == SSAValue(200)
+    @test then_blk.terminator.values[1] == SSAValue(99)
+    @test else_blk.terminator.values[1] == SSAValue(88)
+end
+
 end  # utilities
 
 end  # @testset "IRStructurizer"

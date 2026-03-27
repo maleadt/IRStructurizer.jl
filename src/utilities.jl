@@ -5,6 +5,7 @@
 # Block traversal: eachblock, findblock
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
+# Expression inspection: resolve_call, iscall, callee, callargs
 
 
 #=============================================================================
@@ -13,7 +14,8 @@
 
 public root, parent, walk_uses!, IndexedUseRef
 export insert_before!, insert_after!, eachblock, findblock,
-       update_type!, new_block_arg!
+       update_type!, new_block_arg!,
+       resolve_call, iscall, callee, callargs
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -145,6 +147,42 @@ function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ)
     insert!(m.ssa_idxes, pos + 1, new_idx)
     insert!(m.stmts, pos + 1, stmt)
     insert!(m.types, pos + 1, typ)
+end
+
+"""
+    insert_before!(block::Block, ref::SSAValue, stmt, typ) -> Inst
+
+Insert a new instruction before the instruction at SSA index `ref.id`.
+"""
+function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ))
+    sci = root(block)
+    sci.max_ssa_idx += 1
+    idx = sci.max_ssa_idx
+    insert_before_idx!(block.body, ref.id, idx, stmt, typ)
+    if stmt isa ControlFlowOp
+        for b in blocks(stmt)
+            b.parent = block
+        end
+    end
+    return Inst(idx, stmt, typ)
+end
+
+"""
+    insert_after!(block::Block, ref::SSAValue, stmt, typ) -> Inst
+
+Insert a new instruction after the instruction at SSA index `ref.id`.
+"""
+function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ))
+    sci = root(block)
+    sci.max_ssa_idx += 1
+    idx = sci.max_ssa_idx
+    insert_after_idx!(block.body, ref.id, idx, stmt, typ)
+    if stmt isa ControlFlowOp
+        for b in blocks(stmt)
+            b.parent = block
+        end
+    end
+    return Inst(idx, stmt, typ)
 end
 
 
@@ -625,3 +663,103 @@ function findblock(sci::StructuredIRCode, inst::Inst)
     end
     return nothing
 end
+
+
+#=============================================================================
+ Expression inspection
+=============================================================================#
+
+"""
+    resolve_call(stmt) -> (resolved_func, operands) or nothing
+
+Extract the resolved function and operands from a `:call` or `:invoke` Expr.
+For `:call`, `stmt.args[1]` is the function reference and args 2+ are operands.
+For `:invoke`, `stmt.args[2]` is the function reference and args 3+ are operands.
+GlobalRef values are resolved to their bound value.
+Returns `nothing` if `stmt` is not a call expression or the function cannot be resolved.
+"""
+function resolve_call(@nospecialize(stmt))
+    stmt isa Expr || return nothing
+    if stmt.head === :call
+        func_ref = stmt.args[1]
+        operands = @view stmt.args[2:end]
+    elseif stmt.head === :invoke
+        func_ref = stmt.args[2]
+        operands = @view stmt.args[3:end]
+    else
+        return nothing
+    end
+    resolved = if func_ref isa GlobalRef
+        try; getfield(func_ref.mod, func_ref.name); catch; nothing; end
+    else
+        func_ref
+    end
+    resolved === nothing && return nothing
+    return (resolved, operands)
+end
+
+"""
+    resolve_call(inst::Inst) -> (resolved_func, operands) or nothing
+
+Convenience overload: extracts the statement from an `Inst`.
+"""
+resolve_call(inst::Inst) = resolve_call(inst.stmt)
+
+"""
+    iscall(stmt) -> Bool
+
+Check whether a statement is a `:call` or `:invoke` expression.
+"""
+iscall(@nospecialize(stmt)) = stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
+
+"""
+    iscall(inst::Inst) -> Bool
+
+Convenience overload: checks the underlying statement.
+"""
+iscall(inst::Inst) = iscall(inst.stmt)
+
+"""
+    callee(stmt::Expr) -> Any
+
+Get the raw function reference from a `:call` or `:invoke` expression.
+For `:call`, returns `stmt.args[1]`. For `:invoke`, returns `stmt.args[2]`.
+Does NOT resolve GlobalRef — use `resolve_call` for that.
+"""
+function callee(stmt::Expr)
+    if stmt.head === :call
+        return stmt.args[1]
+    elseif stmt.head === :invoke
+        return stmt.args[2]
+    end
+    throw(ArgumentError("callee() requires a :call or :invoke Expr, got :$(stmt.head)"))
+end
+
+"""
+    callee(inst::Inst) -> Any
+
+Convenience overload: extracts callee from the underlying statement.
+"""
+callee(inst::Inst) = callee(inst.stmt::Expr)
+
+"""
+    callargs(stmt::Expr) -> SubArray
+
+Get the operand arguments of a `:call` or `:invoke` expression (excludes function ref).
+Returns a view into `stmt.args`.
+"""
+function callargs(stmt::Expr)
+    if stmt.head === :call
+        return @view stmt.args[2:end]
+    elseif stmt.head === :invoke
+        return @view stmt.args[3:end]
+    end
+    throw(ArgumentError("callargs() requires a :call or :invoke Expr, got :$(stmt.head)"))
+end
+
+"""
+    callargs(inst::Inst) -> SubArray
+
+Convenience overload: extracts call arguments from the underlying statement.
+"""
+callargs(inst::Inst) = callargs(inst.stmt::Expr)
