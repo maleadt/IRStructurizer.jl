@@ -1,7 +1,7 @@
 # structured IR definitions
 
 export StructuredIRCode, Undef, Inst, instructions, arguments, value_type, stmt,
-       insert_before!, insert_after!, terminator
+       insert_before!, insert_after!, terminator, terminator!, operands
 
 #=============================================================================
  Block Arguments (for loop carried values)
@@ -223,6 +223,15 @@ ConditionOp(cond::IRValue) = ConditionOp(cond, IRValue[])
 
 const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, ConditionOp, Nothing}
 
+"""
+    operands(term) -> Vector{IRValue}
+
+Get the carried-value operands of a terminator. Provides uniform access
+regardless of whether the terminator stores them in `.values` or `.args`.
+"""
+operands(t::Union{ContinueOp, BreakOp, YieldOp}) = t.values
+operands(t::ConditionOp) = t.args
+
 #=============================================================================
  Abstract Control Flow Type
 =============================================================================#
@@ -327,6 +336,13 @@ arguments(block::Block) = block.args
 Get the block's terminator. Analogous to LLVM's `getTerminator()`.
 """
 terminator(block::Block) = block.terminator
+
+"""
+    terminator!(block::Block, term) -> term
+
+Set the block's terminator.
+"""
+terminator!(block::Block, term) = (block.terminator = term; term)
 
 """
     isempty(block::Block) -> Bool

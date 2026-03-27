@@ -53,9 +53,13 @@ for inst in instructions(block)
 end
 ```
 
-#### `terminator(block::Block)` → `Terminator`
+#### `terminator(block::Block)` / `terminator!(block, term)`
 
-Get the block's terminator (`ReturnNode`, `YieldOp`, `ContinueOp`, `BreakOp`, `ConditionOp`, or `nothing`).
+Get or set the block's terminator (`ReturnNode`, `YieldOp`, `ContinueOp`, `BreakOp`, `ConditionOp`, or `nothing`).
+
+#### `operands(term)` → `Vector{IRValue}`
+
+Get the carried-value operands of a terminator. Provides uniform access regardless of terminator type (`.values` for `YieldOp`/`ContinueOp`/`BreakOp`, `.args` for `ConditionOp`).
 
 #### `arguments(block::Block)` → `Vector{BlockArg}`
 
@@ -65,6 +69,22 @@ Get the block arguments (loop-carried values, induction variables).
 
 Get the immediate sub-blocks of a control flow operation (non-recursive, one level only).
 
+#### `parent(block::Block)` / `root(block::Block)`
+
+Navigate the block tree. `parent` returns the containing block (or `StructuredIRCode` for the entry block). `root` walks up to the `StructuredIRCode`.
+
+### Traversal
+
+#### `walk(f, root; order=:preorder)`
+
+Walk all instructions in the IR, calling `f(inst, block)` for each. The callback returns a control symbol:
+
+- `:advance` — continue normally (default if callback returns `nothing`)
+- `:skip` — don't recurse into this op's sub-blocks (preorder only)
+- `:interrupt` — stop the walk immediately
+
+Supports `:preorder` (default) and `:postorder` via the `order` keyword.
+
 #### `eachblock(sci_or_block)` → `Vector{Block}`
 
 Pre-order traversal of all blocks, recursing into nested control flow ops.
@@ -73,13 +93,9 @@ Pre-order traversal of all blocks, recursing into nested control flow ops.
 
 Find the block containing a given instruction.
 
-#### `terminators(block::Block)` → `Vector{Terminator}`
+#### `reachable_terminators(block::Block)` → `Vector{Terminator}`
 
 Collect the block's own terminator plus all loop exits (`ContinueOp`/`BreakOp`) reachable through nested `IfOp`s. `YieldOp` and `ConditionOp` are captured by their enclosing `IfOp`/`WhileOp` and not propagated outward.
-
-#### `parent(block::Block)` / `root(block::Block)`
-
-Navigate the block tree. `parent` returns the containing block (or `StructuredIRCode` for the entry block). `root` walks up to the `StructuredIRCode`.
 
 ### Expression Inspection
 
@@ -156,7 +172,8 @@ Supports iteration, indexed access, `filter!`, `deleteat!`, and `push!`.
 Each element of a `LoopCarries` is a `CarryRef` with read/write access:
 
 - `init_value(c)` / `init_value!(c, val)` — the value passed into the loop
-- `body_arg(c)` — the `BlockArg` visible inside the loop body
+- `body_arg(c)` — the `BlockArg` visible inside the loop body (`before` region for `WhileOp`)
+- `after_arg(c)` — the `after`-region `BlockArg` (`WhileOp` only)
 - `term_value(c, terminator)` / `term_value!(c, terminator, val)` — the value passed back at a `ContinueOp`, `BreakOp`, `YieldOp`, or `ConditionOp`
 
 #### Bulk mutation

@@ -1325,7 +1325,7 @@ end
     @test blocks(sci) == (sci.entry,)
 end
 
-@testset "terminators(block)" begin
+@testset "reachable_terminators(block)" begin
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
@@ -1337,7 +1337,7 @@ end
     for inst in instructions(sci.entry)
         op = stmt(inst)
         if op isa ForOp
-            terms = terminators(op.body)
+            terms = reachable_terminators(op.body)
             @test !isempty(terms)
             @test any(t -> t isa ContinueOp, terms)
             break
@@ -1345,10 +1345,10 @@ end
     end
 end
 
-@testset "terminators() excludes IfOp YieldOps" begin
+@testset "reachable_terminators() excludes IfOp YieldOps" begin
     # LoopOp body with an IfOp that produces a result (YieldOps in branches)
     # plus a ContinueOp at the body level.
-    # terminators() should return only ContinueOp, not the IfOp YieldOps.
+    # reachable_terminators() should return only ContinueOp, not the IfOp YieldOps.
     then_blk = Block()
     then_blk.terminator = YieldOp(Any[SSAValue(30)])
     else_blk = Block()
@@ -1363,13 +1363,13 @@ end
 
     op = LoopOp(body, Any[SSAValue(100)])
 
-    terms = terminators(op.body)
+    terms = reachable_terminators(op.body)
     @test length(terms) == 1
     @test terms[1] isa ContinueOp
     @test !any(t -> t isa YieldOp, terms)
 end
 
-@testset "terminators() collects BreakOp through IfOp but not YieldOp" begin
+@testset "reachable_terminators() collects BreakOp through IfOp but not YieldOp" begin
     # IfOp with one branch breaking and one yielding
     then_blk = Block()
     then_blk.terminator = BreakOp(Any[SSAValue(50)])
@@ -1385,7 +1385,7 @@ end
 
     op = LoopOp(body, Any[SSAValue(100)])
 
-    terms = terminators(op.body)
+    terms = reachable_terminators(op.body)
     @test length(terms) == 2  # ContinueOp + BreakOp
     @test any(t -> t isa ContinueOp, terms)
     @test any(t -> t isa BreakOp, terms)
@@ -1436,11 +1436,11 @@ end
     op = WhileOp(before, after, Any[])
 
     # The after-block's YieldOp is a top-level terminator, not nested in an IfOp
-    terms_after = terminators(op.after)
+    terms_after = reachable_terminators(op.after)
     @test length(terms_after) == 1
     @test terms_after[1] isa YieldOp
 
-    terms_before = terminators(op.before)
+    terms_before = reachable_terminators(op.before)
     @test length(terms_before) == 1
     @test terms_before[1] isa ConditionOp
 end
@@ -1785,7 +1785,7 @@ end
 
     @test isempty(collect(instructions(block)))
     @test isempty(uses(block).index)
-    @test isempty(terminators(block))
+    @test isempty(reachable_terminators(block))
     @test isempty(block)
 end
 
@@ -2077,6 +2077,125 @@ end
     @test init_value(cr) == SSAValue(200)
     @test then_blk.terminator.values[1] == SSAValue(99)
     @test else_blk.terminator.values[1] == SSAValue(88)
+end
+
+@testset "operands(term)" begin
+    # YieldOp, ContinueOp, BreakOp → .values
+    y = YieldOp([SSAValue(1), SSAValue(2)])
+    @test operands(y) === y.values
+    @test operands(y) == [SSAValue(1), SSAValue(2)]
+
+    c = ContinueOp([SSAValue(3)])
+    @test operands(c) === c.values
+
+    b = BreakOp([SSAValue(4)])
+    @test operands(b) === b.values
+
+    # ConditionOp → .args
+    co = ConditionOp(SSAValue(10), [SSAValue(5), SSAValue(6)])
+    @test operands(co) === co.args
+    @test operands(co) == [SSAValue(5), SSAValue(6)]
+
+    # Mutation through operands
+    operands(y)[1] = SSAValue(99)
+    @test y.values[1] == SSAValue(99)
+    operands(co)[1] = SSAValue(88)
+    @test co.args[1] == SSAValue(88)
+end
+
+@testset "terminator!(block, term)" begin
+    block = Block()
+    @test terminator(block) === nothing
+
+    ret = ReturnNode(SSAValue(1))
+    @test terminator!(block, ret) === ret
+    @test terminator(block) === ret
+
+    y = YieldOp([SSAValue(2)])
+    terminator!(block, y)
+    @test terminator(block) === y
+end
+
+@testset "walk(f, root)" begin
+    # Build a simple IR: entry with an IfOp containing instructions
+    sci, _ = code_structured(x -> x > 0 ? x + 1 : x - 1, Tuple{Int}) |> only
+
+    # Preorder: collect all instructions
+    pre_insts = Inst[]
+    walk(sci) do inst, block
+        push!(pre_insts, inst)
+        return :advance
+    end
+    @test !isempty(pre_insts)
+
+    # Postorder: collect all instructions
+    post_insts = Inst[]
+    walk(sci; order=:postorder) do inst, block
+        push!(post_insts, inst)
+        return :advance
+    end
+    @test length(post_insts) == length(pre_insts)
+    @test Set(i.ssa_idx for i in post_insts) == Set(i.ssa_idx for i in pre_insts)
+
+    # In preorder, the IfOp should come before instructions inside it
+    ifop_idx = findfirst(i -> stmt(i) isa IfOp, pre_insts)
+    @test ifop_idx !== nothing
+    # Instructions after the IfOp in preorder should include nested ones
+    @test length(pre_insts) > ifop_idx
+
+    # In postorder, the IfOp should come after instructions inside it
+    ifop_idx_post = findfirst(i -> stmt(i) isa IfOp, post_insts)
+    @test ifop_idx_post > 1  # nested instructions come first
+
+    # Skip: don't recurse into IfOp
+    skip_insts = Inst[]
+    walk(sci) do inst, block
+        push!(skip_insts, inst)
+        stmt(inst) isa IfOp && return :skip
+        return :advance
+    end
+    @test length(skip_insts) < length(pre_insts)
+
+    # Interrupt: stop after first instruction
+    first_only = Inst[]
+    walk(sci) do inst, block
+        push!(first_only, inst)
+        return :interrupt
+    end
+    @test length(first_only) == 1
+
+    # Nothing return treated as :advance
+    nothing_insts = Inst[]
+    walk(sci) do inst, block
+        push!(nothing_insts, inst)
+        nothing
+    end
+    @test length(nothing_insts) == length(pre_insts)
+
+    # Invalid order
+    @test_throws ArgumentError walk((inst, block) -> :advance, sci; order=:invalid)
+end
+
+@testset "after_arg(carry_ref) for WhileOp" begin
+    # Build a WhileOp with carries
+    before = Block()
+    after = Block()
+    before_arg = BlockArg(100, Int)
+    after_blk_arg = BlockArg(101, Int)
+    push!(before.args, before_arg)
+    push!(after.args, after_blk_arg)
+    before.terminator = ConditionOp(SSAValue(1), [before_arg])
+    after.terminator = YieldOp([after_blk_arg])
+    op = WhileOp(before, after, IRStructurizer.IRValue[SSAValue(50)])
+
+    sci = StructuredIRCode(Any[], Any[], Block(), 200)
+    push!(sci.entry, 10, op, Nothing)
+
+    c = carries(op)
+    @test length(c) == 1
+    cr = c[1]
+    @test body_arg(cr) === before_arg
+    @test after_arg(cr) === after_blk_arg
 end
 
 end  # utilities

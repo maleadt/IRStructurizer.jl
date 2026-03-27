@@ -16,7 +16,7 @@ public root, parent, walk_uses!, IndexedUseRef
 export insert_before!, insert_after!, eachblock, findblock,
        update_type!, new_block_arg!,
        resolve_call, iscall, callee, callargs,
-       terminators
+       reachable_terminators, walk, after_arg
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -323,12 +323,14 @@ end
 
 # Terminators
 function walk_uses!(f, term::Union{ContinueOp, BreakOp, YieldOp})
-    for i in 1:length(term.values); f(IndexedUseRef(term.values, i)); end
+    vals = operands(term)
+    for i in 1:length(vals); f(IndexedUseRef(vals, i)); end
 end
 
 function walk_uses!(f, term::ConditionOp)
     f(MutableFieldUseRef(term, :condition))
-    for i in 1:length(term.args); f(IndexedUseRef(term.args, i)); end
+    args = operands(term)
+    for i in 1:length(args); f(IndexedUseRef(args, i)); end
 end
 
 # ReturnNode as terminator — handled in Block walk, not here
@@ -451,9 +453,9 @@ end
 Get a view over the loop's carried values. Supports iteration, indexed
 access, `filter!`, `deleteat!`, and `push!`.
 """
-carries(op::ForOp) = LoopCarries(op, terminators(op.body))
-carries(op::LoopOp) = LoopCarries(op, terminators(op.body))
-carries(op::WhileOp) = LoopCarries(op, [terminators(op.before); terminators(op.after)])
+carries(op::ForOp) = LoopCarries(op, reachable_terminators(op.body))
+carries(op::LoopOp) = LoopCarries(op, reachable_terminators(op.body))
+carries(op::WhileOp) = LoopCarries(op, [reachable_terminators(op.before); reachable_terminators(op.after)])
 
 """
     CarryRef(carries, index)
@@ -481,24 +483,17 @@ function body_arg(c::CarryRef)
     block.args[c.index]
 end
 
+"""Get the after-region BlockArg for this carry (WhileOp only)."""
+after_arg(c::CarryRef) = (c.carries.op::WhileOp).after.args[c.index]
+
 """Get the terminator value for this carry from a specific terminator."""
-function term_value(c::CarryRef, t::Union{ContinueOp, BreakOp, YieldOp})
-    t.values[c.index]
-end
-function term_value(c::CarryRef, t::ConditionOp)
-    t.args[c.index]
-end
+term_value(c::CarryRef, t) = operands(t)[c.index]
 
 """Set the init value for this carry."""
 init_value!(c::CarryRef, val) = (c.carries.op.init_values[c.index] = val; val)
 
 """Set the terminator value for this carry in a specific terminator."""
-function term_value!(c::CarryRef, t::Union{ContinueOp, BreakOp, YieldOp}, val)
-    t.values[c.index] = val
-end
-function term_value!(c::CarryRef, t::ConditionOp, val)
-    t.args[c.index] = val
-end
+term_value!(c::CarryRef, t, val) = (operands(t)[c.index] = val)
 
 # Iteration
 Base.length(c::LoopCarries) = length(c.op.init_values)
@@ -570,14 +565,9 @@ function remove_carries!(carries::LoopCarries, keep::BitVector)
 
         # Remove from all reachable terminators
         for term in carries.terminators
-            if term isa ContinueOp || term isa BreakOp || term isa YieldOp
-                if i <= length(term.values)
-                    deleteat!(term.values, i)
-                end
-            elseif term isa ConditionOp
-                if i <= length(term.args)
-                    deleteat!(term.args, i)
-                end
+            ops = operands(term)
+            if i <= length(ops)
+                deleteat!(ops, i)
             end
         end
 
@@ -608,11 +598,7 @@ function Base.push!(carries::LoopCarries, init_val, @nospecialize(body_arg_type)
 
     # Thread through all reachable terminators
     for term in carries.terminators
-        if term isa ContinueOp || term isa BreakOp || term isa YieldOp
-            push!(term.values, new_arg)
-        elseif term isa ConditionOp
-            push!(term.args, new_arg)
-        end
+        push!(operands(term), new_arg)
     end
 
     # WhileOp: also add to after block args
@@ -629,7 +615,7 @@ end
 =============================================================================#
 
 """
-    terminators(block::Block) -> Vector{Terminator}
+    reachable_terminators(block::Block) -> Vector{Terminator}
 
 Collect the block's own terminator plus all loop exits reachable through
 nested IfOps. Each terminator type is scoped to a specific parent:
@@ -637,7 +623,7 @@ ContinueOp/BreakOp target the enclosing loop, while YieldOp targets the
 nearest enclosing result-producing op. Because IfOp captures YieldOp, only
 ContinueOp/BreakOp are visible through nested IfOps.
 """
-function terminators(outer::Block)
+function reachable_terminators(outer::Block)
     result = Terminator[]
 
     # outer terminator.
@@ -710,6 +696,59 @@ function findblock(sci::StructuredIRCode, inst::Inst)
         haskey(block.body, inst.ssa_idx) && return block
     end
     return nothing
+end
+
+
+#=============================================================================
+ walk — operation/block walker with control flow (cf. MLIR walk())
+=============================================================================#
+
+"""
+    walk(f, root::Union{Block, StructuredIRCode}; order=:preorder)
+
+Walk all instructions, calling `f(inst, block)` for each. The callback
+returns a `Symbol` controlling traversal:
+
+- `:advance` — continue normally (default if callback returns `nothing`)
+- `:skip` — do not recurse into this op's sub-blocks (only meaningful for `ControlFlowOp`s)
+- `:interrupt` — stop the walk immediately
+
+Supports `:preorder` (visit before recursing, default) and `:postorder`
+(visit after recursing). Analogous to MLIR's `walk()` with `WalkOrder`
+and `WalkResult`.
+"""
+function walk(f, root::Union{Block, StructuredIRCode}; order::Symbol=:preorder)
+    block = root isa StructuredIRCode ? root.entry : root
+    order === :preorder  && return _walk_pre!(f, block)
+    order === :postorder && return _walk_post!(f, block)
+    throw(ArgumentError("walk: order must be :preorder or :postorder, got :$order"))
+end
+
+function _walk_pre!(f, block::Block)
+    for inst in instructions(block)
+        result = f(inst, block)
+        result === :interrupt && return :interrupt
+        if stmt(inst) isa ControlFlowOp && result !== :skip
+            for b in blocks(stmt(inst))
+                _walk_pre!(f, b) === :interrupt && return :interrupt
+            end
+        end
+    end
+    return :advance
+end
+
+function _walk_post!(f, block::Block)
+    for inst in instructions(block)
+        if stmt(inst) isa ControlFlowOp
+            for b in blocks(stmt(inst))
+                _walk_post!(f, b) === :interrupt && return :interrupt
+            end
+        end
+        result = f(inst, block)
+        result === :interrupt && return :interrupt
+        # :skip is meaningless in postorder (children already visited)
+    end
+    return :advance
 end
 
 
