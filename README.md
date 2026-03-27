@@ -155,10 +155,6 @@ Find all use sites of `val` in a block. Linear scan — for repeated queries, pr
 
 Replace all uses of `old` with `new_val` (recursively).
 
-#### `walk_uses!(f, node)`
-
-Low-level visitor: calls `f(::UseRef)` for every operand slot in `node` and everything nested below it. Each `UseRef` supports `ref[]` (read) and `ref[] = v` (replace).
-
 ### Loop Carries
 
 #### `carries(op)` → `LoopCarries`
