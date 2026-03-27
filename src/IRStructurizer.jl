@@ -22,6 +22,9 @@ include("show.jl")
 # control tree to structured IR
 include("structure.jl")
 
+# IR utilities (use tracking, value walking)
+include("utilities.jl")
+
 # validation and public API
 include("validation.jl")
 include("interface.jl")

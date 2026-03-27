@@ -1,6 +1,7 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef
+export StructuredIRCode, Undef, Inst, instructions, arguments, value_type, stmt,
+       insert_before!, insert_after!
 
 #=============================================================================
  Block Arguments (for loop carried values)
@@ -47,6 +48,46 @@ Base.show(io::IO, u::Undef) = print(io, "undef::$(u.type)")
 # - Undef: structurization artifact for dead branches
 # - Raw values (Integer, Float, etc.): compile-time constants
 const IRValue = Any
+
+#=============================================================================
+ Inst - instruction bundling SSA index + statement + type
+=============================================================================#
+
+"""
+    Inst
+
+An instruction in the structured IR, bundling an SSA index with its statement
+and type. Analogous to LLVM's `Instruction` which IS a `Value` carrying its type.
+
+Yielded by `instructions(block)`. Can be used as a key in `UseIndex`.
+"""
+struct Inst
+    ssa_idx::Int
+    stmt::Any
+    typ::Any
+end
+
+"""Get the Julia type of the instruction result."""
+value_type(i::Inst) = i.typ
+
+"""Get the underlying statement (Expr, ControlFlowOp, etc.)."""
+stmt(i::Inst) = i.stmt
+
+"""Convert to SSAValue for use in operand positions."""
+Core.SSAValue(i::Inst) = SSAValue(i.ssa_idx)
+
+Base.:(==)(a::Inst, b::Inst) = a.ssa_idx == b.ssa_idx
+Base.hash(i::Inst, h::UInt) = hash(i.ssa_idx, h)
+
+function Base.show(io::IO, i::Inst)
+    print(io, "Inst(%$(i.ssa_idx)")
+    if i.stmt isa ControlFlowOp
+        print(io, " = ", typeof(i.stmt))
+    elseif i.stmt isa Expr
+        print(io, " = ", i.stmt.head, "(...)")
+    end
+    print(io, ")")
+end
 
 #=============================================================================
  SSAMap - ordered map from SSA index to (stmt, type)
@@ -108,6 +149,25 @@ end
 indices(m::SSAMap) = (idx for idx in m.ssa_idxes)
 statements(m::SSAMap) = (stmt for stmt in m.stmts)
 types(m::SSAMap) = (typ for typ in m.types)
+
+# Mutation: setindex! for replacing a statement in-place
+function Base.setindex!(m::SSAMap, entry::NamedTuple{(:stmt, :typ)}, ssa_idx::Int)
+    i = findfirst(==(ssa_idx), m.ssa_idxes)
+    i === nothing && throw(KeyError(ssa_idx))
+    m.stmts[i] = entry.stmt
+    m.types[i] = entry.typ
+    return entry
+end
+
+# Mutation: delete! for removing a statement
+function Base.delete!(m::SSAMap, ssa_idx::Int)
+    i = findfirst(==(ssa_idx), m.ssa_idxes)
+    i === nothing && throw(KeyError(ssa_idx))
+    deleteat!(m.ssa_idxes, i)
+    deleteat!(m.stmts, i)
+    deleteat!(m.types, i)
+    return m
+end
 
 #=============================================================================
  Terminator Operations
@@ -232,9 +292,10 @@ mutable struct Block
     args::Vector{BlockArg}
     body::SSAMap
     terminator::Terminator
+    parent::Any  # containing Block, or StructuredIRCode for entry block, or nothing
 end
 
-Block() = Block(BlockArg[], SSAMap(), nothing)
+Block() = Block(BlockArg[], SSAMap(), nothing, nothing)
 
 """
     push!(block::Block, idx::Int, stmt, typ)
@@ -254,11 +315,48 @@ function Base.show(io::IO, block::Block)
     print(io, ")")
 end
 
-# Iteration protocol for Block - yields (idx, stmt, typ) triples
+# Iteration protocol for Block - yields (idx, stmt, typ) triples (legacy)
 Base.iterate(block::Block) = iterate(block.body)
 Base.iterate(block::Block, state) = iterate(block.body, state)
 Base.length(block::Block) = length(block.body)
 Base.eltype(::Type{Block}) = Tuple{Int,Any,Any}
+
+#=============================================================================
+ Block accessors (LLVM.jl-style)
+=============================================================================#
+
+"""
+    instructions(block::Block)
+
+Iterate over the instructions in a block, yielding `Inst` objects.
+Each `Inst` bundles the SSA index, statement, and type — users never
+need to interact with SSAMap directly.
+
+Analogous to LLVM.jl's `instructions(bb::BasicBlock)`.
+"""
+instructions(block::Block) = InstructionIterator(block.body)
+
+struct InstructionIterator
+    body::SSAMap
+end
+
+Base.length(it::InstructionIterator) = length(it.body)
+Base.eltype(::Type{InstructionIterator}) = Inst
+
+function Base.iterate(it::InstructionIterator, state::Int=1)
+    m = it.body
+    state > length(m.ssa_idxes) && return nothing
+    inst = Inst(m.ssa_idxes[state], m.stmts[state], m.types[state])
+    return inst, state + 1
+end
+
+"""
+    arguments(block::Block) -> Vector{BlockArg}
+
+Get the block arguments. Analogous to LLVM.jl's `parameters(f)`.
+"""
+arguments(block::Block) = block.args
+
 
 #=============================================================================
  Structurization Context
@@ -366,6 +464,57 @@ function Base.show(io::IO, op::LoopOp)
         print(io, "init_values=", length(op.init_values))
     end
     print(io, ")")
+end
+
+#=============================================================================
+ Block iteration (following LLVM.jl's blocks(function) pattern)
+=============================================================================#
+
+export blocks, terminators
+
+"""
+    blocks(sci::StructuredIRCode)
+
+Get the top-level blocks of the structured IR (just the entry block).
+"""
+blocks(sci) = (sci.entry,)  # defined fully after StructuredIRCode
+
+"""
+    blocks(op::ControlFlowOp)
+
+Get the immediate sub-blocks of a control flow operation.
+Non-recursive: returns only one level of nesting.
+"""
+blocks(op::IfOp) = (op.then_region, op.else_region)
+blocks(op::ForOp) = (op.body,)
+blocks(op::WhileOp) = (op.before, op.after)
+blocks(op::LoopOp) = (op.body,)
+blocks(::ControlFlowOp) = ()
+
+"""
+    terminators(block::Block) -> Vector{Terminator}
+
+Find all ContinueOp/BreakOp/YieldOp terminators reachable from `block`,
+recursing into IfOps but not into nested loops (which have their own scope).
+"""
+function terminators(block::Block)
+    result = Terminator[]
+    _collect_terminators!(result, block)
+    return result
+end
+
+function _collect_terminators!(result, block::Block)
+    term = block.terminator
+    if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
+        push!(result, term)
+    end
+    for (_, entry) in block.body
+        if entry.stmt isa IfOp
+            for b in blocks(entry.stmt)
+                _collect_terminators!(result, b)
+            end
+        end
+    end
 end
 
 #=============================================================================
@@ -484,6 +633,9 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         sci.max_ssa_idx = ctx.next_ssa_idx - 1
     end
 
+    # Set parent back-references on all blocks
+    set_parent!(sci.entry, sci)
+
     if validate
         validate_scf(sci.entry)
         validate_no_phis(sci.entry)
@@ -492,6 +644,25 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     end
 
     return sci
+end
+
+"""
+    set_parent!(block::Block, parent)
+
+Recursively set parent references on all blocks in the IR tree.
+The entry block's parent is the `StructuredIRCode`; nested blocks point
+to their containing block (like LLVM's BasicBlock::getParent → Function,
+Instruction::getParent → BasicBlock).
+"""
+function set_parent!(block::Block, parent)
+    block.parent = parent
+    for (_, entry) in block.body
+        if entry.stmt isa ControlFlowOp
+            for b in blocks(entry.stmt)
+                set_parent!(b, block)
+            end
+        end
+    end
 end
 
 #=============================================================================

@@ -5,7 +5,7 @@ using IRStructurizer
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
                       validate_scf, validate_terminators, validate_ssa_defs,
-                      SSAMap, statements
+                      SSAMap, statements, BlockArg, root, CarryRef, LoopCarries
 using Core: SSAValue, ReturnNode
 using Base: code_ircode
 
@@ -1258,5 +1258,264 @@ end
 end
 
 end  # Julia for-in-range integration
+
+#=============================================================================
+ Utilities Tests
+=============================================================================#
+
+@testset "utilities" begin
+
+@testset "instructions(block)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    insts = collect(instructions(sci.entry))
+    @test !isempty(insts)
+    @test all(i -> i isa Inst, insts)
+
+    # Each Inst bundles ssa_idx, stmt, typ
+    inst = first(insts)
+    @test value_type(inst) isa Type
+    @test SSAValue(inst) isa SSAValue
+end
+
+@testset "arguments(block)" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        return acc
+    end |> only
+
+    # Entry block has no arguments
+    @test isempty(arguments(sci.entry))
+
+    # ForOp body has arguments (IV + carries)
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa ForOp
+            body_args = arguments(stmt(inst).body)
+            @test !isempty(body_args)
+            @test all(a -> a isa BlockArg, body_args)
+            break
+        end
+    end
+end
+
+@testset "blocks(op)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            bs = blocks(stmt(inst))
+            @test length(bs) == 2
+            @test all(b -> b isa Block, bs)
+            break
+        end
+    end
+
+    # blocks(sci) returns the entry block
+    @test blocks(sci) == (sci.entry,)
+end
+
+@testset "terminators(block)" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        while i < n
+            i += 1
+        end
+        return i
+    end |> only
+
+    for inst in instructions(sci.entry)
+        op = stmt(inst)
+        if op isa ForOp
+            terms = terminators(op.body)
+            @test !isempty(terms)
+            @test any(t -> t isa ContinueOp, terms)
+            break
+        end
+    end
+end
+
+@testset "parent chain and root" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    # Entry block parent is the SCI
+    @test parent(sci.entry) === sci
+
+    # Nested block parent is the entry block
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            then_blk = stmt(inst).then_region
+            @test parent(then_blk) === sci.entry
+            @test root(then_blk) === sci
+            break
+        end
+    end
+end
+
+@testset "push! / insert_before! / insert_after!" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    old_max = sci.max_ssa_idx
+
+    # push! returns Inst with auto-allocated SSA
+    new_inst = push!(sci.entry, Expr(:call, :dummy), Int)
+    @test new_inst isa Inst
+    @test new_inst.ssa_idx == old_max + 1
+    @test sci.max_ssa_idx == old_max + 1
+
+    # insert_before! / insert_after!
+    insts = collect(instructions(sci.entry))
+    ref = first(insts)
+    before = insert_before!(sci.entry, ref, Expr(:call, :before), Int32)
+    after = insert_after!(sci.entry, ref, Expr(:call, :after), Int64)
+    @test before isa Inst && after isa Inst
+
+    all_insts = collect(instructions(sci.entry))
+    bp = findfirst(i -> i == before, all_insts)
+    rp = findfirst(i -> i == ref, all_insts)
+    ap = findfirst(i -> i == after, all_insts)
+    @test bp < rp < ap
+end
+
+@testset "delete!(block, inst)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    n_before = length(collect(instructions(sci.entry)))
+    dummy = push!(sci.entry, Expr(:call, :dummy), Int)
+    @test length(collect(instructions(sci.entry))) == n_before + 1
+
+    delete!(sci.entry, dummy)
+    @test length(collect(instructions(sci.entry))) == n_before
+end
+
+@testset "uses(block) and UseIndex" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        y = x + 1
+        z = y * 2
+        return z
+    end |> only
+
+    idx = uses(sci.entry)
+
+    # Every instruction result should have the right use count
+    for inst in instructions(sci.entry)
+        refs = idx[inst]
+        @test refs isa Vector
+    end
+
+    # Int key normalization works
+    for inst in instructions(sci.entry)
+        @test idx[inst.ssa_idx] == idx[SSAValue(inst.ssa_idx)]
+    end
+end
+
+@testset "uses(block, val)" begin
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        x + y
+    end |> only
+
+    # In do-block syntax, Argument(1) is the closure, Argument(2) is x, Argument(3) is y
+    # At least one argument should be used in the addition
+    refs_x = uses(sci.entry, Core.Argument(2))
+    refs_y = uses(sci.entry, Core.Argument(3))
+    @test !isempty(refs_x) || !isempty(refs_y)
+end
+
+@testset "replace_uses!" begin
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    push!(block.body, (2, Expr(:call, GlobalRef(Base, :*), SSAValue(1), SSAValue(0)), Int))
+
+    replace_uses!(block, SSAValue(0), SSAValue(99))
+    idx = uses(block)
+    @test isempty(idx[SSAValue(0)])
+    @test length(idx[SSAValue(99)]) == 3
+end
+
+@testset "carries(op)" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        return acc
+    end |> only
+
+    found = false
+    for inst in instructions(sci.entry)
+        op = stmt(inst)
+        op isa ForOp || continue
+        c = carries(op)
+        @test length(c) == length(op.init_values)
+        @test length(c) >= 1
+        @test all(cr -> cr isa CarryRef, collect(c))
+
+        # Access through CarryRef
+        cr = c[1]
+        @test init_value(cr) !== nothing
+        @test body_arg(cr) isa BlockArg
+        found = true
+        break
+    end
+    @test found
+end
+
+@testset "carries filter!" begin
+    # Build a ForOp with 2 carries, filter to keep only the first
+    body = Block()
+    iv = BlockArg(1, Int)
+    a1 = BlockArg(2, Float64)
+    a2 = BlockArg(3, Float64)
+    # ForOp: IV is in iv_arg, body.args are just the carries
+    push!(body.args, a1)
+    push!(body.args, a2)
+    body.terminator = ContinueOp([SSAValue(10), SSAValue(11)])
+    op = ForOp(1, 10, 1, iv, body, [SSAValue(100), SSAValue(101)])
+
+    c = carries(op)
+    @test length(c) == 2
+
+    idx_map = filter!(cr -> init_value(cr) == SSAValue(100), c)
+    @test length(op.init_values) == 1
+    @test length(body.args) == 1  # 1 carry remaining
+    @test length(body.terminator.values) == 1
+    @test idx_map == Dict(1 => 1)
+end
+
+@testset "carries push!" begin
+    body = Block()
+    iv = BlockArg(1, Int)
+    # ForOp stores IV in iv_arg, not in body.args
+    body.terminator = ContinueOp(IRStructurizer.IRValue[])
+    op = ForOp(1, 10, 1, iv, body, IRStructurizer.IRValue[])
+
+    c = carries(op)
+    @test length(c) == 0
+
+    cr = push!(c, SSAValue(42), Float64)
+    @test length(op.init_values) == 1
+    @test length(body.args) == 1  # just the new carry (IV is separate)
+    @test length(body.terminator.values) == 1
+    @test init_value(cr) == SSAValue(42)
+    @test body_arg(cr).type == Float64
+end
+
+end  # utilities
 
 end  # @testset "IRStructurizer"
