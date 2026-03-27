@@ -489,7 +489,7 @@ function Base.show(io::IO, op::LoopOp)
 end
 
 #=============================================================================
- Block iteration (following LLVM.jl's blocks(function) pattern)
+ Block iteration
 =============================================================================#
 
 export blocks, terminators
@@ -522,45 +522,44 @@ ContinueOp/BreakOp target the enclosing loop, while YieldOp targets the
 nearest enclosing result-producing op. Because IfOp captures YieldOp, only
 ContinueOp/BreakOp are visible through nested IfOps.
 """
-function terminators(block::Block)
+function terminators(outer::Block)
     result = Terminator[]
-    _collect_terminators!(result, block)
+
+    # outer terminator.
+    # we have to include yield/condition here because outer may be an IfOp
+    let
+        term = outer.terminator
+        if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
+            push!(result, term)
+        end
+    end
+
+    # nested terminators reachable through nested IfOps.
+    # we have to ignore yield/condition here because that's inner to the IfOp
+    function collect_terminators!(inner::Block)
+        term = inner.terminator
+        if term isa ContinueOp || term isa BreakOp
+            push!(result, term)
+        end
+        for (_, entry) in inner.body
+            if entry.stmt isa IfOp
+                for b in blocks(entry.stmt)
+                    collect_terminators!(b)
+                end
+            end
+        end
+    end
+    for (_, entry) in outer.body
+        if entry.stmt isa IfOp
+            for b in blocks(entry.stmt)
+                collect_terminators!(b)
+            end
+        end
+    end
+
     return result
 end
 
-# Each terminator type is scoped to a specific parent: ContinueOp/BreakOp
-# target the enclosing loop, while YieldOp targets the nearest enclosing
-# result-producing op (IfOp, WhileOp, etc). Because IfOp captures YieldOp,
-# only ContinueOp/BreakOp are visible through nested IfOps.
-function _collect_terminators!(result, block::Block)
-    term = block.terminator
-    if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
-        push!(result, term)
-    end
-    for (_, entry) in block.body
-        if entry.stmt isa IfOp
-            for b in blocks(entry.stmt)
-                _collect_loop_exits!(result, b)
-            end
-        end
-    end
-end
-
-# IfOp captures YieldOp (it produces the IfOp's result), so only
-# ContinueOp/BreakOp — which target the enclosing loop — pass through.
-function _collect_loop_exits!(result, block::Block)
-    term = block.terminator
-    if term isa ContinueOp || term isa BreakOp
-        push!(result, term)
-    end
-    for (_, entry) in block.body
-        if entry.stmt isa IfOp
-            for b in blocks(entry.stmt)
-                _collect_loop_exits!(result, b)
-            end
-        end
-    end
-end
 
 #=============================================================================
  collect_results_ssavals - extract result info from terminators
