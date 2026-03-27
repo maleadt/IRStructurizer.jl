@@ -49,6 +49,11 @@ function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ))
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     push!(block.body, (idx, stmt, typ))
+    if stmt isa ControlFlowOp
+        for b in blocks(stmt)
+            b.parent = block
+        end
+    end
     return Inst(idx, stmt, typ)
 end
 

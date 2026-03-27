@@ -302,7 +302,15 @@ Block() = Block(BlockArg[], SSAMap(), nothing, nothing)
 
 Push a statement or control flow op to a block with its SSA index and type.
 """
-Base.push!(block::Block, idx::Int, stmt, typ) = push!(block.body, (idx, stmt, typ))
+function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(typ))
+    push!(block.body, (idx, stmt, typ))
+    # Set parent on sub-blocks when a CF op is inserted (like LLVM's addNodeToList)
+    if stmt isa ControlFlowOp
+        for b in blocks(stmt)
+            b.parent = block
+        end
+    end
+end
 
 function Base.show(io::IO, block::Block)
     print(io, "Block(")
@@ -633,8 +641,8 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         sci.max_ssa_idx = ctx.next_ssa_idx - 1
     end
 
-    # Set parent back-references on all blocks
-    set_parent!(sci.entry, sci)
+    # Entry block's parent is the SCI (sub-blocks get parents via push!)
+    sci.entry.parent = sci
 
     if validate
         validate_scf(sci.entry)
@@ -646,24 +654,6 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     return sci
 end
 
-"""
-    set_parent!(block::Block, parent)
-
-Recursively set parent references on all blocks in the IR tree.
-The entry block's parent is the `StructuredIRCode`; nested blocks point
-to their containing block (like LLVM's BasicBlock::getParent → Function,
-Instruction::getParent → BasicBlock).
-"""
-function set_parent!(block::Block, parent)
-    block.parent = parent
-    for (_, entry) in block.body
-        if entry.stmt isa ControlFlowOp
-            for b in blocks(entry.stmt)
-                set_parent!(b, block)
-            end
-        end
-    end
-end
 
 #=============================================================================
  Block Substitution (apply SSA → BlockArg mappings)
