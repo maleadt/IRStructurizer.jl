@@ -1,7 +1,7 @@
 # structured IR definitions
 
 export StructuredIRCode, Undef, Inst, instructions, arguments, value_type, stmt,
-       insert_before!, insert_after!
+       insert_before!, insert_after!, terminator
 
 #=============================================================================
  Block Arguments (for loop carried values)
@@ -364,6 +364,20 @@ end
 Get the block arguments. Analogous to LLVM.jl's `parameters(f)`.
 """
 arguments(block::Block) = block.args
+
+"""
+    terminator(block::Block) -> Terminator
+
+Get the block's terminator. Analogous to LLVM's `getTerminator()`.
+"""
+terminator(block::Block) = block.terminator
+
+"""
+    isempty(block::Block) -> Bool
+
+Check whether a block has no instructions (terminator not counted).
+"""
+Base.isempty(block::Block) = isempty(block.body.ssa_idxes)
 
 
 #=============================================================================

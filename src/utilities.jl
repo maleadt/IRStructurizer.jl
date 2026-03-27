@@ -1,6 +1,7 @@
 # Utilities for structured IR
 #
 # Block mutation: parent, root, push!, insert_before!, insert_after!, delete!
+# Block traversal: eachblock, block_for_inst
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
 
@@ -10,7 +11,7 @@
 =============================================================================#
 
 public root, parent
-export insert_before!, insert_after!
+export insert_before!, insert_after!, eachblock, block_for_inst
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -225,28 +226,13 @@ function walk_uses!(f, op::ForOp)
     for b in blocks(op); walk_uses!(f, b); end
 end
 
-function walk_uses!(f, op::WhileOp)
+function walk_uses!(f, op::Union{WhileOp, LoopOp})
     for i in 1:length(op.init_values); f(IndexedUseRef(op.init_values, i)); end
     for b in blocks(op); walk_uses!(f, b); end
 end
-
-function walk_uses!(f, op::LoopOp)
-    for i in 1:length(op.init_values); f(IndexedUseRef(op.init_values, i)); end
-    for b in blocks(op); walk_uses!(f, b); end
-end
-
-walk_uses!(f, ::ControlFlowOp) = nothing
 
 # Terminators
-function walk_uses!(f, term::ContinueOp)
-    for i in 1:length(term.values); f(IndexedUseRef(term.values, i)); end
-end
-
-function walk_uses!(f, term::BreakOp)
-    for i in 1:length(term.values); f(IndexedUseRef(term.values, i)); end
-end
-
-function walk_uses!(f, term::YieldOp)
+function walk_uses!(f, term::Union{ContinueOp, BreakOp, YieldOp})
     for i in 1:length(term.values); f(IndexedUseRef(term.values, i)); end
 end
 
@@ -390,11 +376,6 @@ struct CarryRef
     index::Int
 end
 
-"""Body block args offset: ForOp stores IV in iv_arg, not in body.args."""
-body_args_offset(::ForOp) = 0
-body_args_offset(::LoopOp) = 0
-body_args_offset(::WhileOp) = 0
-
 """Get the body block for a loop op."""
 body_block(op::ForOp) = op.body
 body_block(op::LoopOp) = op.body
@@ -407,7 +388,7 @@ init_value(c::CarryRef) = c.carries.op.init_values[c.index]
 function body_arg(c::CarryRef)
     op = c.carries.op
     block = body_block(op)
-    block.args[c.index + body_args_offset(op)]
+    block.args[c.index]
 end
 
 """Get the terminator value for this carry from a specific terminator."""
@@ -488,15 +469,14 @@ function remove_carries!(carries::LoopCarries, keep::BitVector)
     to_remove = sort([i for i in 1:n if !keep[i]], rev=true)
     isempty(to_remove) && return old_to_new
 
-    offset = body_args_offset(op)
     body = body_block(op)
 
     for i in to_remove
         # Remove init value
         deleteat!(op.init_values, i)
 
-        # Remove body arg (with offset for ForOp IV)
-        deleteat!(body.args, i + offset)
+        # Remove body arg
+        deleteat!(body.args, i)
 
         # Remove from all reachable terminators
         for term in carries.terminators
@@ -513,7 +493,7 @@ function remove_carries!(carries::LoopCarries, keep::BitVector)
 
         # WhileOp: also remove from after block args
         if op isa WhileOp
-            deleteat!(op.after.args, i + offset)
+            deleteat!(op.after.args, i)
         end
     end
 
@@ -556,4 +536,46 @@ function Base.push!(carries::LoopCarries, init_val, @nospecialize(body_arg_type)
     end
 
     return CarryRef(carries, length(op.init_values))
+end
+
+
+#=============================================================================
+ Block traversal
+=============================================================================#
+
+"""
+    eachblock(sci::StructuredIRCode) -> Vector{Block}
+    eachblock(root::Block) -> Vector{Block}
+
+Pre-order traversal of all blocks in the IR, recursing into nested control flow ops.
+"""
+eachblock(sci::StructuredIRCode) = eachblock(sci.entry)
+
+function eachblock(root::Block)
+    result = Block[]
+    _collect_blocks!(result, root)
+    return result
+end
+
+function _collect_blocks!(out, block::Block)
+    push!(out, block)
+    for (_, entry) in block.body
+        entry.stmt isa ControlFlowOp || continue
+        for b in blocks(entry.stmt)
+            _collect_blocks!(out, b)
+        end
+    end
+end
+
+"""
+    block_for_inst(sci::StructuredIRCode, ssa_idx::Int) -> Union{Block, Nothing}
+
+Find the Block containing the instruction with the given SSA index.
+Returns `nothing` if not found.
+"""
+function block_for_inst(sci::StructuredIRCode, ssa_idx::Int)
+    for block in eachblock(sci)
+        haskey(block.body, ssa_idx) && return block
+    end
+    return nothing
 end

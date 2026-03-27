@@ -2,11 +2,13 @@ using Test
 using FileCheck
 
 using IRStructurizer
+using Core: SSAValue, ReturnNode
+
+# Internal types used in tests for type-checking structured IR output
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
                       validate_scf, validate_terminators, validate_ssa_defs,
-                      SSAMap, statements, BlockArg, root, CarryRef, LoopCarries
-using Core: SSAValue, ReturnNode
+                      statements, BlockArg
 using Base: code_ircode
 
 # Used by "step defined inside loop body" test — must be module-level const
@@ -1356,7 +1358,7 @@ end
         if stmt(inst) isa IfOp
             then_blk = stmt(inst).then_region
             @test parent(then_blk) === sci.entry
-            @test root(then_blk) === sci
+            @test IRStructurizer.root(then_blk) === sci
             break
         end
     end
@@ -1464,9 +1466,7 @@ end
         c = carries(op)
         @test length(c) == length(op.init_values)
         @test length(c) >= 1
-        @test all(cr -> cr isa CarryRef, collect(c))
-
-        # Access through CarryRef
+        # Access through carries
         cr = c[1]
         @test init_value(cr) !== nothing
         @test body_arg(cr) isa BlockArg
@@ -1514,6 +1514,233 @@ end
     @test length(body.terminator.values) == 1
     @test init_value(cr) == SSAValue(42)
     @test body_arg(cr).type == Float64
+end
+
+@testset "uses finds all operand positions" begin
+    # uses() should find operands in Expr args and in ReturnNode terminators
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    block.terminator = ReturnNode(SSAValue(1))
+
+    idx = uses(block)
+    @test length(idx[SSAValue(0)]) == 2  # two Expr args
+    @test length(idx[SSAValue(1)]) == 1  # ReturnNode terminator
+end
+
+@testset "replace_uses! mutates all positions" begin
+    # Verify replace_uses! works on Expr args
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    block.terminator = ReturnNode(SSAValue(0))
+
+    replace_uses!(block, SSAValue(0), SSAValue(99))
+
+    # All 3 uses should now be SSAValue(99)
+    idx = uses(block)
+    @test isempty(idx[SSAValue(0)])
+    @test length(idx[SSAValue(99)]) == 3
+
+    # Verify the ReturnNode terminator was actually replaced
+    @test block.terminator == ReturnNode(SSAValue(99))
+end
+
+@testset "replace_uses! on IfOp condition" begin
+    # Build block with IfOp whose condition references SSAValue(5)
+    then_blk = Block()
+    then_blk.terminator = YieldOp()
+    else_blk = Block()
+    else_blk.terminator = YieldOp()
+    block = Block()
+    ifop = IfOp(SSAValue(5), then_blk, else_blk)
+    push!(block.body, (1, ifop, Nothing))
+
+    replace_uses!(block, SSAValue(5), SSAValue(42))
+    @test ifop.condition == SSAValue(42)
+end
+
+@testset "deleteat!(carries, indices)" begin
+    body = Block()
+    iv = BlockArg(1, Int)
+    a1 = BlockArg(2, Float64)
+    a2 = BlockArg(3, Float64)
+    a3 = BlockArg(4, Float64)
+    push!(body.args, a1)
+    push!(body.args, a2)
+    push!(body.args, a3)
+    body.terminator = ContinueOp([SSAValue(10), SSAValue(11), SSAValue(12)])
+    op = ForOp(1, 10, 1, iv, body, Any[SSAValue(100), SSAValue(101), SSAValue(102)])
+
+    c = carries(op)
+    @test length(c) == 3
+
+    idx_map = deleteat!(c, [2])
+    @test length(op.init_values) == 2
+    @test length(body.args) == 2
+    @test length(body.terminator.values) == 2
+    @test idx_map == Dict(1 => 1, 3 => 2)
+end
+
+@testset "carries for WhileOp" begin
+    before = Block()
+    after = Block()
+    a1_before = BlockArg(1, Int)
+    a2_before = BlockArg(2, Float64)
+    push!(before.args, a1_before)
+    push!(before.args, a2_before)
+    before.terminator = ConditionOp(SSAValue(1), Any[a1_before, a2_before])
+
+    a1_after = BlockArg(1, Int)
+    a2_after = BlockArg(2, Float64)
+    push!(after.args, a1_after)
+    push!(after.args, a2_after)
+    after.terminator = YieldOp(Any[SSAValue(20), SSAValue(21)])
+
+    op = WhileOp(before, after, Any[SSAValue(100), SSAValue(101)])
+
+    c = carries(op)
+    @test length(c) == 2
+    @test body_arg(c[1]) === a1_before
+    @test init_value(c[1]) == SSAValue(100)
+
+    # term_value works for ConditionOp and YieldOp
+    @test term_value(c[1], before.terminator) === a1_before
+    @test term_value(c[1], after.terminator) == SSAValue(20)
+
+    # filter! removes from all sites
+    filter!(cr -> init_value(cr) == SSAValue(100), c)
+    @test length(op.init_values) == 1
+    @test length(before.args) == 1
+    @test length(after.args) == 1
+    @test length(before.terminator.args) == 1
+    @test length(after.terminator.values) == 1
+end
+
+@testset "carries for LoopOp" begin
+    # Build LoopOp body with IfOp containing ContinueOp and BreakOp
+    then_blk = Block()
+    then_blk.terminator = BreakOp(Any[SSAValue(50)])
+    else_blk = Block()
+    else_blk.terminator = ContinueOp(Any[SSAValue(60)])
+
+    body = Block()
+    a1 = BlockArg(1, Int)
+    push!(body.args, a1)
+    ifop = IfOp(SSAValue(1), then_blk, else_blk)
+    push!(body.body, (10, ifop, Nothing))
+    body.terminator = nothing
+
+    op = LoopOp(body, Any[SSAValue(100)])
+
+    c = carries(op)
+    @test length(c) == 1
+
+    # push! threads through both ContinueOp and BreakOp
+    cr = push!(c, SSAValue(200), Float64)
+    @test length(op.init_values) == 2
+    @test length(body.args) == 2
+    @test length(then_blk.terminator.values) == 2
+    @test length(else_blk.terminator.values) == 2
+end
+
+@testset "init_value! and term_value! setters" begin
+    body = Block()
+    iv = BlockArg(1, Int)
+    a1 = BlockArg(2, Float64)
+    push!(body.args, a1)
+    body.terminator = ContinueOp(Any[SSAValue(10)])
+    op = ForOp(1, 10, 1, iv, body, Any[SSAValue(100)])
+
+    c = carries(op)
+    cr = c[1]
+
+    # init_value!
+    init_value!(cr, SSAValue(999))
+    @test op.init_values[1] == SSAValue(999)
+
+    # term_value!
+    term_value!(cr, body.terminator, SSAValue(888))
+    @test body.terminator.values[1] == SSAValue(888)
+
+    # term_value! on ConditionOp
+    cond = ConditionOp(SSAValue(1), Any[SSAValue(5)])
+    term_value!(cr, cond, SSAValue(777))
+    @test cond.args[1] == SSAValue(777)
+end
+
+@testset "empty block edge cases" begin
+    block = Block()
+
+    @test isempty(collect(instructions(block)))
+    @test isempty(uses(block).index)
+    @test isempty(terminators(block))
+    @test isempty(block)
+end
+
+@testset "nested uses" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        acc = 0
+        for i in 1:n
+            if i > 5
+                acc += i
+            end
+        end
+        return acc
+    end |> only
+
+    # uses() on the entry block should find use sites at all nesting levels
+    idx = uses(sci.entry)
+    # At minimum, Argument(2) (n) should be used somewhere
+    @test !isempty(idx[Core.Argument(2)])
+end
+
+@testset "terminator(block)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test terminator(sci.entry) === sci.entry.terminator
+    @test terminator(sci.entry) isa ReturnNode
+end
+
+@testset "isempty(block)" begin
+    @test isempty(Block())
+
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+    @test !isempty(sci.entry)
+end
+
+@testset "eachblock(sci)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        if x > 0
+            for i in 1:x
+                x += i
+            end
+        end
+        return x
+    end |> only
+
+    all_blocks = eachblock(sci)
+    @test all_blocks[1] === sci.entry
+    # Should find more than just the entry block (IfOp + ForOp have sub-blocks)
+    @test length(all_blocks) > 1
+    @test all(b -> b isa Block, all_blocks)
+end
+
+@testset "block_for_inst(sci, ssa_idx)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        y = x + 1
+        return y
+    end |> only
+
+    # Find an instruction in the entry block
+    inst = first(instructions(sci.entry))
+    found = block_for_inst(sci, inst.ssa_idx)
+    @test found === sci.entry
+
+    # Non-existent SSA index returns nothing
+    @test block_for_inst(sci, 999999) === nothing
 end
 
 end  # utilities
