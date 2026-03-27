@@ -156,6 +156,20 @@ function Base.setindex!(r::ReturnNodeUseRef, @nospecialize(v))
     r.stmts[r.pos] = ReturnNode(v)
 end
 
+# UseRef for ReturnNode as block terminator (replaces block.terminator)
+struct TerminatorReturnNodeUseRef <: UseRef
+    block::Block
+end
+
+function Base.getindex(r::TerminatorReturnNodeUseRef)
+    rn = r.block.terminator::ReturnNode
+    return rn.val
+end
+
+function Base.setindex!(r::TerminatorReturnNodeUseRef, @nospecialize(v))
+    r.block.terminator = ReturnNode(v)
+end
+
 """
     walk_uses!(f, node)
 
@@ -180,7 +194,13 @@ function walk_uses!(f, block::Block)
             isdefined(stmt, :val) && f(ReturnNodeUseRef(block.body.stmts, i))
         end
     end
-    walk_uses!(f, block.terminator)
+    term = block.terminator
+    if term isa ReturnNode
+        # ReturnNode is immutable — use a specialized UseRef that replaces block.terminator
+        isdefined(term, :val) && f(TerminatorReturnNodeUseRef(block))
+    else
+        walk_uses!(f, term)
+    end
 end
 
 # Expr: walk operands
@@ -235,7 +255,7 @@ function walk_uses!(f, term::ConditionOp)
     for i in 1:length(term.args); f(IndexedUseRef(term.args, i)); end
 end
 
-# ReturnNode as terminator — immutable, can't create mutable UseRef
+# ReturnNode as terminator — handled in Block walk, not here
 walk_uses!(f, ::ReturnNode) = nothing
 
 # Nothing terminator
