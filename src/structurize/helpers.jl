@@ -298,7 +298,7 @@ function find_condition_chain(stmts, header_range, cond_ssa::SSAValue)
     chain = Set{Int}()
     worklist = [cond_ssa.id]
     while !isempty(worklist)
-        idx = popfirst!(worklist)
+        idx = pop!(worklist)
         idx in header_range || continue
         idx in chain && continue
         push!(chain, idx)

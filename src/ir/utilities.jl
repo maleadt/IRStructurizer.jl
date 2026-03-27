@@ -692,10 +692,14 @@ Find the Block containing the given instruction.
 Returns `nothing` if not found.
 """
 function findblock(sci::StructuredIRCode, inst::Inst)
-    for block in eachblock(sci)
-        haskey(block.body, inst.ssa_idx) && return block
+    found = nothing
+    walk(sci) do i, block
+        if i.ssa_idx == inst.ssa_idx
+            found = block
+            return :interrupt
+        end
     end
-    return nothing
+    return found
 end
 
 
