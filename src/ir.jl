@@ -516,8 +516,11 @@ blocks(::ControlFlowOp) = ()
 """
     terminators(block::Block) -> Vector{Terminator}
 
-Find all ContinueOp/BreakOp/YieldOp terminators reachable from `block`,
-recursing into IfOps but not into nested loops (which have their own scope).
+Collect the block's own terminator plus all loop exits reachable through
+nested IfOps. Each terminator type is scoped to a specific parent:
+ContinueOp/BreakOp target the enclosing loop, while YieldOp targets the
+nearest enclosing result-producing op. Because IfOp captures YieldOp, only
+ContinueOp/BreakOp are visible through nested IfOps.
 """
 function terminators(block::Block)
     result = Terminator[]
@@ -525,6 +528,10 @@ function terminators(block::Block)
     return result
 end
 
+# Each terminator type is scoped to a specific parent: ContinueOp/BreakOp
+# target the enclosing loop, while YieldOp targets the nearest enclosing
+# result-producing op (IfOp, WhileOp, etc). Because IfOp captures YieldOp,
+# only ContinueOp/BreakOp are visible through nested IfOps.
 function _collect_terminators!(result, block::Block)
     term = block.terminator
     if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
@@ -533,7 +540,23 @@ function _collect_terminators!(result, block::Block)
     for (_, entry) in block.body
         if entry.stmt isa IfOp
             for b in blocks(entry.stmt)
-                _collect_terminators!(result, b)
+                _collect_loop_exits!(result, b)
+            end
+        end
+    end
+end
+
+# IfOp captures YieldOp (it produces the IfOp's result), so only
+# ContinueOp/BreakOp — which target the enclosing loop — pass through.
+function _collect_loop_exits!(result, block::Block)
+    term = block.terminator
+    if term isa ContinueOp || term isa BreakOp
+        push!(result, term)
+    end
+    for (_, entry) in block.body
+        if entry.stmt isa IfOp
+            for b in blocks(entry.stmt)
+                _collect_loop_exits!(result, b)
             end
         end
     end

@@ -1345,6 +1345,106 @@ end
     end
 end
 
+@testset "terminators() excludes IfOp YieldOps" begin
+    # LoopOp body with an IfOp that produces a result (YieldOps in branches)
+    # plus a ContinueOp at the body level.
+    # terminators() should return only ContinueOp, not the IfOp YieldOps.
+    then_blk = Block()
+    then_blk.terminator = YieldOp(Any[SSAValue(30)])
+    else_blk = Block()
+    else_blk.terminator = YieldOp(Any[SSAValue(31)])
+
+    body = Block()
+    a1 = BlockArg(1, Int)
+    push!(body.args, a1)
+    ifop = IfOp(SSAValue(1), then_blk, else_blk)
+    push!(body.body, (10, ifop, Int))
+    body.terminator = ContinueOp(Any[SSAValue(40)])
+
+    op = LoopOp(body, Any[SSAValue(100)])
+
+    terms = terminators(op.body)
+    @test length(terms) == 1
+    @test terms[1] isa ContinueOp
+    @test !any(t -> t isa YieldOp, terms)
+end
+
+@testset "terminators() collects BreakOp through IfOp but not YieldOp" begin
+    # IfOp with one branch breaking and one yielding
+    then_blk = Block()
+    then_blk.terminator = BreakOp(Any[SSAValue(50)])
+    else_blk = Block()
+    else_blk.terminator = YieldOp(Any[SSAValue(31)])
+
+    body = Block()
+    a1 = BlockArg(1, Int)
+    push!(body.args, a1)
+    ifop = IfOp(SSAValue(1), then_blk, else_blk)
+    push!(body.body, (10, ifop, Int))
+    body.terminator = ContinueOp(Any[SSAValue(40)])
+
+    op = LoopOp(body, Any[SSAValue(100)])
+
+    terms = terminators(op.body)
+    @test length(terms) == 2  # ContinueOp + BreakOp
+    @test any(t -> t isa ContinueOp, terms)
+    @test any(t -> t isa BreakOp, terms)
+    @test !any(t -> t isa YieldOp, terms)
+end
+
+@testset "push!(carries) doesn't pollute IfOp YieldOps" begin
+    # LoopOp body with IfOp producing a result via YieldOps + ContinueOp
+    then_blk = Block()
+    then_blk.terminator = YieldOp(Any[SSAValue(30)])
+    else_blk = Block()
+    else_blk.terminator = YieldOp(Any[SSAValue(31)])
+
+    body = Block()
+    a1 = BlockArg(1, Int)
+    push!(body.args, a1)
+    ifop = IfOp(SSAValue(1), then_blk, else_blk)
+    push!(body.body, (10, ifop, Int))
+    body.terminator = ContinueOp(Any[SSAValue(40)])
+
+    op = LoopOp(body, Any[SSAValue(100)])
+
+    # Wrap in SCI so root() works
+    entry = Block()
+    push!(entry.body, (11, op, Nothing))
+    sci = StructuredIRCode(Any[], Any[], entry, 11)
+    entry.parent = sci
+    body.parent = entry
+    then_blk.parent = body
+    else_blk.parent = body
+
+    c = carries(op)
+    @test length(c) == 1
+
+    # push! should thread through ContinueOp but NOT the IfOp YieldOps
+    push!(c, SSAValue(200), Float64)
+    @test length(body.terminator.values) == 2  # ContinueOp got the new carry
+    @test length(then_blk.terminator.values) == 1  # YieldOp untouched
+    @test length(else_blk.terminator.values) == 1  # YieldOp untouched
+end
+
+@testset "WhileOp after-block YieldOp IS collected" begin
+    before = Block()
+    before.terminator = ConditionOp(SSAValue(1), Any[])
+    after = Block()
+    after.terminator = YieldOp(Any[])
+
+    op = WhileOp(before, after, Any[])
+
+    # The after-block's YieldOp is a top-level terminator, not nested in an IfOp
+    terms_after = terminators(op.after)
+    @test length(terms_after) == 1
+    @test terms_after[1] isa YieldOp
+
+    terms_before = terminators(op.before)
+    @test length(terms_before) == 1
+    @test terms_before[1] isa ConditionOp
+end
+
 @testset "parent chain and root" begin
     sci, _ = code_structured(Tuple{Int}) do x::Int
         x > 0 ? x + 1 : x - 1
