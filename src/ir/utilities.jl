@@ -15,7 +15,8 @@
 public root, parent, walk_uses!, IndexedUseRef
 export insert_before!, insert_after!, eachblock, findblock,
        update_type!, new_block_arg!,
-       resolve_call, iscall, callee, callargs
+       resolve_call, iscall, callee, callargs,
+       terminators
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -626,6 +627,53 @@ end
 #=============================================================================
  Block traversal
 =============================================================================#
+
+"""
+    terminators(block::Block) -> Vector{Terminator}
+
+Collect the block's own terminator plus all loop exits reachable through
+nested IfOps. Each terminator type is scoped to a specific parent:
+ContinueOp/BreakOp target the enclosing loop, while YieldOp targets the
+nearest enclosing result-producing op. Because IfOp captures YieldOp, only
+ContinueOp/BreakOp are visible through nested IfOps.
+"""
+function terminators(outer::Block)
+    result = Terminator[]
+
+    # outer terminator.
+    # we have to include yield/condition here because outer may be an IfOp
+    let
+        term = outer.terminator
+        if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
+            push!(result, term)
+        end
+    end
+
+    # nested terminators reachable through nested IfOps.
+    # we have to ignore yield/condition here because that's inner to the IfOp
+    function collect_terminators!(inner::Block)
+        term = inner.terminator
+        if term isa ContinueOp || term isa BreakOp
+            push!(result, term)
+        end
+        for (_, entry) in inner.body
+            if entry.stmt isa IfOp
+                for b in blocks(entry.stmt)
+                    collect_terminators!(b)
+                end
+            end
+        end
+    end
+    for (_, entry) in outer.body
+        if entry.stmt isa IfOp
+            for b in blocks(entry.stmt)
+                collect_terminators!(b)
+            end
+        end
+    end
+
+    return result
+end
 
 """
     eachblock(sci::StructuredIRCode) -> Vector{Block}

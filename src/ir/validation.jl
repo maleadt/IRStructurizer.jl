@@ -389,3 +389,58 @@ end
 
 check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
     check_stmt_uses!(s, v, term)
+
+#=============================================================================
+ Type Resolution for IRValues
+=============================================================================#
+
+"""
+    resolve_type(sci::StructuredIRCode, value::IRValue) -> Any
+
+Resolve the Julia type of an IRValue.
+Returns `nothing` if the type cannot be resolved.
+"""
+function resolve_type end
+
+resolve_type(sci::StructuredIRCode, value::Undef) = value.type
+
+resolve_type(sci::StructuredIRCode, value::BlockArg) = value.type
+
+resolve_type(sci::StructuredIRCode, value::Argument) = sci.argtypes[value.n]
+
+resolve_type(sci::StructuredIRCode, value::SlotNumber) = sci.argtypes[value.id]
+
+# Constants: return their runtime type
+resolve_type(sci::StructuredIRCode, value) = typeof(value)
+
+# SSAValue: search the structured IR for its definition
+function resolve_type(sci::StructuredIRCode, value::SSAValue)
+    function process(block::Block)
+        entry = get(block.body, value.id, nothing)
+        entry !== nothing && return entry.typ
+
+        # Search nested control flow ops
+        for (_, e) in block.body
+            if e.stmt isa IfOp
+                t = process(e.stmt.then_region)
+                t !== nothing && return t
+                t = process(e.stmt.else_region)
+                t !== nothing && return t
+            elseif e.stmt isa LoopOp
+                t = process(e.stmt.body)
+                t !== nothing && return t
+            elseif e.stmt isa WhileOp
+                t = process(e.stmt.before)
+                t !== nothing && return t
+                t = process(e.stmt.after)
+                t !== nothing && return t
+            elseif e.stmt isa ForOp
+                t = process(e.stmt.body)
+                t !== nothing && return t
+            end
+        end
+        return nothing
+    end
+
+    return process(sci.entry)
+end
