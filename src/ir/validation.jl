@@ -360,6 +360,28 @@ check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
     check_stmt_uses!(s, v, term)
 
 #=============================================================================
+ SSA Uniqueness Validation
+=============================================================================#
+
+"""
+    validate_ssa_uniqueness(sci::StructuredIRCode) -> Bool
+
+Validate that no SSA index is defined in more than one block.
+"""
+function validate_ssa_uniqueness(sci::StructuredIRCode)
+    seen = Set{Int}()
+    dups = Int[]
+    for block in eachblock(sci)
+        for (idx, _) in block.body
+            idx in seen ? push!(dups, idx) : push!(seen, idx)
+        end
+    end
+    isempty(dups) || error("internal error: SSA indices defined in multiple blocks: ",
+                           join(("%$id" for id in sort!(unique!(dups))), ", "))
+    return true
+end
+
+#=============================================================================
  Type Resolution for IRValues
 =============================================================================#
 

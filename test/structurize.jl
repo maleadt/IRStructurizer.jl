@@ -742,6 +742,22 @@ end
     @test inner_for.body.args[1].id == 2  # id 1 = IV, id 2 = first non-IV arg
 end
 
+@testset "extra exit values don't collide with loop body defs" begin
+    # Regression: pad_extra_exits! reused the loop-body SSA index for the outer
+    # getfield extraction, producing duplicate SSA defs across scopes.
+    # validate_ssa_uniqueness (called by StructuredIRCode constructor) catches this.
+    sci, _ = code_structured(Tuple{Int, Int}) do n::Int, m::Int
+        acc = 0
+        i = 0
+        while i < n
+            acc += i * m
+            i += 1
+        end
+        return acc
+    end |> only
+    @test sci isa StructuredIRCode
+end
+
 @testset "for-in-range loop exit condition in non-header block" begin
     # Regression test: Julia's `for i in 1:n` generates IR where the loop header's
     # GotoIfNot (i == upper?) is an inner branch (both targets inside the loop),

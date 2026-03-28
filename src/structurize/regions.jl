@@ -199,6 +199,18 @@ function emit_if_op!(block::Block, cond_idx::Int,
             something(else_blk.terminator, YieldOp())
         end
 
+        # Rename inner defs that collide with outer getfield indices.
+        # A nested IfOp may have placed a getfield at phi.ssa_idx inside a branch;
+        # rename it to a fresh index so the outer getfield can claim the original.
+        for phi in merge_phis
+            for blk in (then_blk, else_blk)
+                if rename_ssa_def!(blk, phi.ssa_idx, ctx.next_ssa_idx)
+                    replace_uses!(blk, SSAValue(phi.ssa_idx), SSAValue(ctx.next_ssa_idx))
+                    ctx.next_ssa_idx += 1
+                end
+            end
+        end
+
         if_op = IfOp(cond_value, then_blk, else_blk)
         phi_indices = Int[phi.ssa_idx for phi in merge_phis]
         phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
@@ -274,6 +286,8 @@ function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int
 
             if loop_val !== nothing
                 gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                gf_idx ∈ already_exported && continue
+                gf_idx ∈ seen && continue
                 push!(extra, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
                 push!(seen, gf_idx)
             end
@@ -549,6 +563,8 @@ function handle_proper_region!(block::Block, tree::ControlTree, ir::IRCode,
                           region_blocks, ir, ctx, subtree_map)
     build_proper_branch!(else_blk, false_target, entry_idx, merge_idx, merge_phis,
                           region_blocks, ir, ctx, subtree_map)
+
+    deduplicate_branch_defs!(then_blk, else_blk, ctx)
 
     # Emit IfOp with merge phi results
     if_op = IfOp(cond_value, then_blk, else_blk)
