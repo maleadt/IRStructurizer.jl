@@ -241,11 +241,12 @@ end
 """
     find_extra_exit_values(ir, exit_dest, loop_blocks, already_exported) -> Vector{NamedTuple}
 
-Find loop-internal values referenced in the exit target block that are not already
+Find loop-internal values referenced outside the loop that are not already
 exported via header phis. Returns a vector of `(; value, getfield_idx, type)` tuples.
 
-Scans both PhiNodes (with edges from loop blocks) and non-phi statements whose
-Expr arguments are SSAValues defined inside the loop.
+Scans ALL blocks outside the loop (not just the exit target) because loop-internal
+values may be referenced in blocks far beyond the immediate exit — e.g., when two
+sequential for-loops share an accumulator.
 """
 function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int},
                                 already_exported::Set{Int})
@@ -255,45 +256,65 @@ function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int
     nblocks = length(ir.cfg.blocks)
     1 <= exit_dest <= nblocks || return extra
 
-    exit_bb = ir.cfg.blocks[exit_dest]
     seen = Set{Int}()  # track getfield_idx to avoid duplicates
 
-    for si in first(exit_bb.stmts):last(exit_bb.stmts)
-        stmt = stmts[si]
+    for blk_idx in 1:nblocks
+        blk_idx ∈ loop_blocks && continue
+        bb = ir.cfg.blocks[blk_idx]
 
-        if stmt isa PhiNode
-            si ∈ already_exported && continue
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = stmts[si]
 
-            # Find value from loop blocks
-            loop_val = nothing
-            for (edge_idx, edge) in enumerate(stmt.edges)
-                if isassigned(stmt.values, edge_idx) && edge ∈ loop_blocks
-                    loop_val = stmt.values[edge_idx]
+            if stmt isa PhiNode
+                si ∈ already_exported && continue
+
+                # Find value from loop blocks
+                loop_val = nothing
+                for (edge_idx, edge) in enumerate(stmt.edges)
+                    if isassigned(stmt.values, edge_idx) && edge ∈ loop_blocks
+                        loop_val = stmt.values[edge_idx]
+                    end
                 end
-            end
 
-            if loop_val !== nothing
-                gf_idx = loop_val isa SSAValue ? loop_val.id : si
-                gf_idx ∈ already_exported && continue
-                gf_idx ∈ seen && continue
-                push!(extra, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
-                push!(seen, gf_idx)
-            end
-        else
-            # Non-phi statement: check if any Expr arg is an SSAValue defined in loop blocks
-            stmt isa Expr || continue
-            for arg in stmt.args
-                if arg isa SSAValue && is_defined_in_blocks(arg, loop_blocks, ir)
-                    arg.id ∈ already_exported && continue
-                    arg.id ∈ seen && continue
-                    push!(extra, (; value=arg, getfield_idx=arg.id, type=types[arg.id]))
-                    push!(seen, arg.id)
+                if loop_val !== nothing
+                    gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                    gf_idx ∈ seen && continue
+                    push!(extra, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
+                    push!(seen, gf_idx)
+                end
+            else
+                # Check all SSAValue references in statements outside the loop
+                for arg in _stmt_ssa_uses(stmt)
+                    if is_defined_in_blocks(arg, loop_blocks, ir)
+                        arg.id ∈ already_exported && continue
+                        arg.id ∈ seen && continue
+                        push!(extra, (; value=arg, getfield_idx=arg.id, type=types[arg.id]))
+                        push!(seen, arg.id)
+                    end
                 end
             end
         end
     end
 
     return extra
+end
+
+"""
+    _stmt_ssa_uses(stmt) -> iterator of SSAValue
+
+Extract all SSAValue references from a statement (Expr args, GotoIfNot cond,
+ReturnNode val, PhiNode values are handled separately).
+"""
+function _stmt_ssa_uses(stmt)
+    if stmt isa Expr
+        return Iterators.filter(x -> x isa SSAValue, stmt.args)
+    elseif stmt isa GotoIfNot && stmt.cond isa SSAValue
+        return (stmt.cond,)
+    elseif stmt isa ReturnNode && isdefined(stmt, :val) && stmt.val isa SSAValue
+        return (stmt.val,)
+    else
+        return ()
+    end
 end
 
 """
@@ -472,10 +493,12 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
         push!(block, iv_phi_idx, loop_op.upper, iv_type)
     end
 
-    # Emit post-loop content: blocks that were in the control tree but outside
-    # the natural loop (e.g., exit-target blocks absorbed by TERMINATION regions).
-    for blk_idx in post_loop_blocks
-        collect_block_statements!(block, blk_idx, ir)
+    # Emit post-loop content: children that were in the control tree but outside
+    # the natural loop (e.g., exit-target subtrees absorbed by TERMINATION regions).
+    # These are processed as full structured regions, not flattened blocks,
+    # because they may contain loops or other complex control flow.
+    for child in post_loop_blocks
+        process_child_region!(block, child, ir, ctx)
     end
 end
 

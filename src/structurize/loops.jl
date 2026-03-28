@@ -216,9 +216,28 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     apply_substitutions!(body, subs)
 
     loop_op = LoopOp(body, init_values)
-    post_loop_blocks = sort!(collect(post_loop_set))
 
-    return loop_op, phi_indices, phi_types, post_loop_blocks
+    # Collect post-loop children: children entirely outside the natural loop,
+    # or the post-loop subtrees of mixed children (e.g., TERMINATION regions
+    # that span loop exit + post-loop code).
+    post_loop_children = ControlTree[]
+    for (i, child) in enumerate(children(tree))
+        child_blocks = child_block_cache[i]
+        if !isempty(post_loop_set) && issubset(child_blocks, post_loop_set)
+            # Entirely post-loop child — needs full structurization
+            push!(post_loop_children, child)
+        elseif !isempty(post_loop_set) && !isempty(intersect(child_blocks, post_loop_set))
+            # Mixed child — extract the post-loop subtrees
+            for sub in children(child)
+                sub_blocks = get_region_blocks(sub, ir)
+                if issubset(sub_blocks, post_loop_set)
+                    push!(post_loop_children, sub)
+                end
+            end
+        end
+    end
+
+    return loop_op, phi_indices, phi_types, post_loop_children
 end
 
 """
