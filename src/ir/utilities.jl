@@ -425,18 +425,50 @@ function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
 end
 
 """
-    replace_ssa_uses!(block::Block, old_id::Int, new_id::Int)
+    rebuildssa!(root::Block, next_ssa_idx::Int) -> Int
 
-Replace all uses of `SSAValue(old_id)` with `SSAValue(new_id)` in `block` (recursively).
-Unlike `replace_uses!`, this only matches actual `SSAValue` objects, not bare `Int` literals
-(which may appear as getfield indices, etc.).
+Post-hoc SSA fixup, modelled after LLVM's `StructurizeCFG::rebuildSSA()`.
+Finds SSA indices defined in multiple blocks and renames inner (duplicate) defs
+to fresh indices, updating all uses within their scope.
+
+Processes duplicates bottom-up (innermost first) so that inner replacements
+don't interfere with outer ones.
+
+Returns the updated next available SSA index.
 """
-function replace_ssa_uses!(block::Block, old_id::Int, new_id::Int)
-    new_val = SSAValue(new_id)
-    walk_uses!(block) do ref
-        val = ref[]
-        val isa SSAValue && val.id == old_id && (ref[] = new_val)
+function rebuildssa!(root::Block, next_ssa_idx::Int)
+    # Collect all defs as (ssa_idx → [(block, position)]) in top-down traversal order.
+    defs = Dict{Int, Vector{Tuple{Block, Int}}}()
+    for block in eachblock(root)
+        for (pos, idx) in enumerate(block.body.ssa_idxes)
+            push!(get!(Vector{Tuple{Block, Int}}, defs, idx), (block, pos))
+        end
     end
+
+    # For each multiply-defined index, rename inner defs (bottom-up) and
+    # batch all replacements per block into a single walk_uses! pass.
+    block_replacements = Dict{Block, Vector{Pair{Int, Int}}}()
+    for (idx, locs) in defs
+        length(locs) <= 1 && continue
+        for i in length(locs):-1:2
+            blk, pos = locs[i]
+            blk.body.ssa_idxes[pos] = next_ssa_idx
+            push!(get!(Vector{Pair{Int, Int}}, block_replacements, blk), idx => next_ssa_idx)
+            next_ssa_idx += 1
+        end
+    end
+    for (blk, repls) in block_replacements
+        walk_uses!(blk) do ref
+            val = ref[]
+            if val isa SSAValue
+                for (old, new) in repls
+                    val.id == old && (ref[] = SSAValue(new); break)
+                end
+            end
+        end
+    end
+
+    return next_ssa_idx
 end
 
 

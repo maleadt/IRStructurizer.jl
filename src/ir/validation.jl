@@ -364,47 +364,6 @@ check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
 =============================================================================#
 
 """
-    rebuildssa!(root::Block, next_ssa_idx::Int) -> Int
-
-Post-hoc SSA fixup pass, modelled after LLVM's `StructurizeCFG::rebuildSSA()`.
-Finds SSA indices defined in multiple blocks and renames inner (duplicate) defs
-to fresh indices, updating all uses within their scope via RAUW.
-
-Processes duplicates bottom-up (innermost first) so that inner RAUWs don't
-interfere with outer ones.
-
-Returns the updated next available SSA index.
-"""
-function rebuildssa!(root::Block, next_ssa_idx::Int)
-    # Phase 1: collect all defs, recording (ssa_idx → [blocks]) in traversal order.
-    # eachblock returns top-down order (parent before children).
-    all_blocks = eachblock(root)
-    defs = Dict{Int, Vector{Block}}()
-    for block in all_blocks
-        for (idx, _) in block.body
-            push!(get!(Vector{Block}, defs, idx), block)
-        end
-    end
-
-    # Phase 2: for each multiply-defined index, rename inner defs.
-    # Process bottom-up (last in traversal = deepest) so inner RAUW
-    # clears references before outer RAUW runs.
-    for (idx, blocks) in defs
-        length(blocks) <= 1 && continue
-        for i in length(blocks):-1:2
-            inner_blk = blocks[i]
-            pos = findfirst(==(idx), inner_blk.body.ssa_idxes)
-            pos === nothing && continue
-            inner_blk.body.ssa_idxes[pos] = next_ssa_idx
-            replace_ssa_uses!(inner_blk, idx, next_ssa_idx)
-            next_ssa_idx += 1
-        end
-    end
-
-    return next_ssa_idx
-end
-
-"""
     validate_ssa_uniqueness(sci::StructuredIRCode) -> Bool
 
 Validate that no SSA index is defined in more than one block.

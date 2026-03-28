@@ -524,7 +524,6 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         ctx = StructurizationContext(types, n + 1)
         ctree = ControlTree(ir)
         sci.entry = control_tree_to_structured_ir(ctree, ir, ctx)
-        # Fix duplicate SSA defs introduced by index-reusing getfield extractions.
         ctx.next_ssa_idx = rebuildssa!(sci.entry, ctx.next_ssa_idx)
         sci.max_ssa_idx = ctx.next_ssa_idx - 1
     end
