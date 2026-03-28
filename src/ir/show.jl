@@ -55,7 +55,7 @@ function child_printer(p::IRPrinter, nested_block::Block, cont_prefix::String)
 end
 
 # Print region header: "├ label:" or "└ label:" for last/empty region
-function print_region_header(p::IRPrinter, label::String, args::Vector{BlockArg}; is_last::Bool=false)
+function print_region_header(p::IRPrinter, label::String, args::Vector{BlockArgument}; is_last::Bool=false)
     print_indent(p)
     print_colored(p, is_last ? "└" : "├", :light_black)
     print(p.io, " ", label)
@@ -90,7 +90,7 @@ function print_value(p::IRPrinter, v::SSAValue)
     print(p.io, "%", v.id)
 end
 
-function print_value(p::IRPrinter, v::BlockArg)
+function print_value(p::IRPrinter, v::BlockArgument)
     print(p.io, "%arg", v.id)
 end
 
@@ -123,7 +123,7 @@ end
 function format_value(p::IRPrinter, v::SSAValue)
     string("%", v.id)
 end
-function format_value(p::IRPrinter, v::BlockArg)
+function format_value(p::IRPrinter, v::BlockArgument)
     string("%arg", v.id)
 end
 function format_value(p::IRPrinter, v::Argument)
@@ -243,7 +243,7 @@ function print_expr(p::IRPrinter, v)
 end
 
 # Print block arguments (for loops and structured control flow)
-function print_block_args(p::IRPrinter, args::Vector{BlockArg})
+function print_block_args(p::IRPrinter, args::Vector{BlockArgument})
     if isempty(args)
         return
     end
@@ -258,14 +258,14 @@ function print_block_args(p::IRPrinter, args::Vector{BlockArg})
 end
 
 # Print initial values (carries) with their types
-function print_init_values(p::IRPrinter, carry_args::Vector{BlockArg}, init_values::Vector{IRValue})
+function print_init_values(p::IRPrinter, carry_args::Vector{BlockArgument}, init_values::Vector{IRValue})
     if isempty(carry_args)
         return
     end
     print(p.io, " init(")
     for (i, (arg, init)) in enumerate(zip(carry_args, init_values))
         i > 1 && print(p.io, ", ")
-        # Use same naming as BlockArg print_value for consistency
+        # Use same naming as BlockArgument print_value for consistency
         print(p.io, "%arg", arg.id, " = ")
         print_value(p, init)
         print_colored(p, string("::", format_type(arg.type)), :cyan)
@@ -273,7 +273,7 @@ function print_init_values(p::IRPrinter, carry_args::Vector{BlockArg}, init_valu
     print(p.io, ")")
 end
 
-function print_loop_args(p::IRPrinter, block_args::Vector{BlockArg}, init_values::Vector{IRValue})
+function print_loop_args(p::IRPrinter, block_args::Vector{BlockArgument}, init_values::Vector{IRValue})
     print_init_values(p, block_args, init_values)
 end
 

@@ -46,7 +46,7 @@ end
 """
     validate_no_phis(entry::Block) -> Bool
 
-Validate that all phi nodes have been converted to BlockArgs.
+Validate that all phi nodes have been converted to BlockArguments.
 Errors if PhiNode expressions remain (indicates a bug in structurization).
 """
 function validate_no_phis(entry::Block)
@@ -397,7 +397,7 @@ function resolve_type end
 
 resolve_type(sci::StructuredIRCode, value::Undef) = value.type
 
-resolve_type(sci::StructuredIRCode, value::BlockArg) = value.type
+resolve_type(sci::StructuredIRCode, value::BlockArgument) = value.type
 
 resolve_type(sci::StructuredIRCode, value::Argument) = sci.argtypes[value.n]
 

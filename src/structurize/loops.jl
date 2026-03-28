@@ -56,12 +56,12 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
     collect_loop_body_stmts!(after, tree, header_idx, ir, ctx)
     after.terminator = YieldOp(copy(carried_values))
 
-    # Create BlockArgs and apply substitutions immediately
+    # Create BlockArguments and apply substitutions immediately
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        arg = BlockArg(i, phi_type)
+        arg = BlockArgument(i, phi_type)
         push!(before.args, arg)
-        push!(after.args, BlockArg(i, phi_type))
+        push!(after.args, BlockArgument(i, phi_type))
         subs[phi_idx] = arg
     end
     apply_substitutions!(before, subs)
@@ -175,13 +175,13 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         process_child_region!(target, child, ir, ctx)
     end
 
-    # 5. BlockArgs for header phis + substitutions
+    # 5. BlockArguments for header phis + substitutions
     # NOTE: must happen before pad_extra_exits! so body.args order matches
     # init_values/carried_values order (header phis first, then extra exits).
     n_header_phis = length(phi_indices)
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
-        arg = BlockArg(i, phi_type)
+        arg = BlockArgument(i, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
     end
@@ -235,7 +235,7 @@ The ForOp structure:
 - lower: Lower bound from ForLoopInfo
 - upper: Exclusive upper bound (adjusted +1 for inclusive patterns like `<=`)
 - step: Step value from ForLoopInfo
-- iv_arg: BlockArg for the induction variable
+- iv_arg: BlockArgument for the induction variable
 - body: Loop body statements + ContinueOp with carried values
 - init_values: Non-IV loop-carried values
 """
@@ -269,8 +269,8 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     # Get IV type
     iv_type = types[iv_phi_idx]
 
-    # Create BlockArg for IV (id=1, first in ForOp's block args)
-    iv_arg = BlockArg(1, iv_type)
+    # Create BlockArgument for IV (id=1, first in ForOp's block args)
+    iv_arg = BlockArgument(1, iv_type)
 
     # Build the body block
     body = Block()
@@ -308,13 +308,13 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     end
     n_phi = length(phi_indices)
 
-    # Create BlockArgs for header phis BEFORE padding extra exits,
+    # Create BlockArguments for header phis BEFORE padding extra exits,
     # so body.args order matches init_values/carried_values order
     # (header phis first, then extra exits).
     subs = Substitutions()
     subs[iv_phi_idx] = iv_arg  # IV at index 1
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
-        arg = BlockArg(i + 1, phi_type)
+        arg = BlockArgument(i + 1, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
     end
