@@ -12,9 +12,9 @@
 
     insts = collect(instructions(sci.entry))
     @test !isempty(insts)
-    @test all(i -> i isa Inst, insts)
+    @test all(i -> i isa Instruction, insts)
 
-    # Each Inst bundles ssa_idx, stmt, typ
+    # Each Instruction bundles ssa_idx, stmt, typ
     inst = first(insts)
     @test value_type(inst) isa Type
     @test SSAValue(inst) isa SSAValue
@@ -39,7 +39,7 @@ end
         if stmt(inst) isa ForOp
             body_args = arguments(stmt(inst).body)
             @test !isempty(body_args)
-            @test all(a -> a isa BlockArg, body_args)
+            @test all(a -> a isa BlockArgument, body_args)
             break
         end
     end
@@ -129,9 +129,9 @@ end  # types & accessors
 
     old_max = sci.max_ssa_idx
 
-    # push! returns Inst with auto-allocated SSA
+    # push! returns Instruction with auto-allocated SSA
     new_inst = push!(sci.entry, Expr(:call, :dummy), Int)
-    @test new_inst isa Inst
+    @test new_inst isa Instruction
     @test new_inst.ssa_idx == old_max + 1
     @test sci.max_ssa_idx == old_max + 1
 
@@ -140,7 +140,7 @@ end  # types & accessors
     ref = first(insts)
     before = insert_before!(sci.entry, ref, Expr(:call, :before), Int32)
     after = insert_after!(sci.entry, ref, Expr(:call, :after), Int64)
-    @test before isa Inst && after isa Inst
+    @test before isa Instruction && after isa Instruction
 
     all_insts = collect(instructions(sci.entry))
     bp = findfirst(i -> i == before, all_insts)
@@ -156,7 +156,7 @@ end
 
     old_first = first(instructions(sci.entry))
     new_inst = pushfirst!(sci.entry, Expr(:call, :sentinel), Int)
-    @test new_inst isa Inst
+    @test new_inst isa Instruction
     @test first(instructions(sci.entry)) == new_inst
     @test collect(instructions(sci.entry))[2] == old_first
 end
@@ -204,7 +204,7 @@ end
 
         old_n = length(arguments(op.body))
         new_arg = new_block_arg!(op.body, Float32)
-        @test new_arg isa BlockArg
+        @test new_arg isa BlockArgument
         @test new_arg.type == Float32
         @test length(arguments(op.body)) == old_n + 1
         @test arguments(op.body)[end] === new_arg
@@ -223,11 +223,11 @@ end
 
     # insert_before! with SSAValue reference
     before = insert_before!(sci.entry, ref_ssaval, Expr(:call, :before_ssa), Int32)
-    @test before isa Inst
+    @test before isa Instruction
 
     # insert_after! with SSAValue reference
     after = insert_after!(sci.entry, ref_ssaval, Expr(:call, :after_ssa), Int64)
-    @test after isa Inst
+    @test after isa Instruction
 
     # Verify ordering: before < ref < after
     all_insts = collect(instructions(sci.entry))
@@ -249,7 +249,7 @@ end
         x + 1
     end |> only
 
-    bad_ref = Inst(999999, nothing, Nothing)
+    bad_ref = Instruction(999999, nothing, Nothing)
     @test_throws KeyError insert_before!(sci.entry, bad_ref, Expr(:call, :x), Int)
 end
 
@@ -305,7 +305,7 @@ end
     @test found === sci.entry
 
     # Non-existent instruction returns nothing
-    @test findblock(sci, Inst(999999, nothing, Nothing)) === nothing
+    @test findblock(sci, Instruction(999999, nothing, Nothing)) === nothing
 end
 
 @testset "reachable_terminators(block)" begin
@@ -338,7 +338,7 @@ end
     else_blk.terminator = YieldOp(Any[SSAValue(31)])
 
     body = Block()
-    a1 = BlockArg(1, Int)
+    a1 = BlockArgument(1, Int)
     push!(body.args, a1)
     ifop = IfOp(SSAValue(1), then_blk, else_blk)
     push!(body.body, (10, ifop, Int))
@@ -360,7 +360,7 @@ end
     else_blk.terminator = YieldOp(Any[SSAValue(31)])
 
     body = Block()
-    a1 = BlockArg(1, Int)
+    a1 = BlockArgument(1, Int)
     push!(body.args, a1)
     ifop = IfOp(SSAValue(1), then_blk, else_blk)
     push!(body.body, (10, ifop, Int))
@@ -398,7 +398,7 @@ end
     sci, _ = code_structured(x -> x > 0 ? x + 1 : x - 1, Tuple{Int}) |> only
 
     # Preorder: collect all instructions
-    pre_insts = Inst[]
+    pre_insts = Instruction[]
     walk(sci) do inst, block
         push!(pre_insts, inst)
         return :advance
@@ -406,7 +406,7 @@ end
     @test !isempty(pre_insts)
 
     # Postorder: collect all instructions
-    post_insts = Inst[]
+    post_insts = Instruction[]
     walk(sci; order=:postorder) do inst, block
         push!(post_insts, inst)
         return :advance
@@ -417,7 +417,7 @@ end
     # In preorder, the IfOp should come before instructions inside it
     ifop_idx = findfirst(i -> stmt(i) isa IfOp, pre_insts)
     @test ifop_idx !== nothing
-    # Instructions after the IfOp in preorder should include nested ones
+    # Instructionructions after the IfOp in preorder should include nested ones
     @test length(pre_insts) > ifop_idx
 
     # In postorder, the IfOp should come after instructions inside it
@@ -425,7 +425,7 @@ end
     @test ifop_idx_post > 1  # nested instructions come first
 
     # Skip: don't recurse into IfOp
-    skip_insts = Inst[]
+    skip_insts = Instruction[]
     walk(sci) do inst, block
         push!(skip_insts, inst)
         stmt(inst) isa IfOp && return :skip
@@ -434,7 +434,7 @@ end
     @test length(skip_insts) < length(pre_insts)
 
     # Interrupt: stop after first instruction
-    first_only = Inst[]
+    first_only = Instruction[]
     walk(sci) do inst, block
         push!(first_only, inst)
         return :interrupt
@@ -442,7 +442,7 @@ end
     @test length(first_only) == 1
 
     # Nothing return treated as :advance
-    nothing_insts = Inst[]
+    nothing_insts = Instruction[]
     walk(sci) do inst, block
         push!(nothing_insts, inst)
         nothing
@@ -622,7 +622,7 @@ end  # use tracking
         # Access through carries
         cr = c[1]
         @test init_value(cr) !== nothing
-        @test body_arg(cr) isa BlockArg
+        @test body_arg(cr) isa BlockArgument
         found = true
         break
     end
@@ -632,9 +632,9 @@ end
 @testset "carries filter!" begin
     # Build a ForOp with 2 carries, filter to keep only the first
     body = Block()
-    iv = BlockArg(1, Int)
-    a1 = BlockArg(2, Float64)
-    a2 = BlockArg(3, Float64)
+    iv = BlockArgument(1, Int)
+    a1 = BlockArgument(2, Float64)
+    a2 = BlockArgument(3, Float64)
     # ForOp: IV is in iv_arg, body.args are just the carries
     push!(body.args, a1)
     push!(body.args, a2)
@@ -653,7 +653,7 @@ end
 
 @testset "carries push!" begin
     entry = Block()
-    iv = BlockArg(1, Int)
+    iv = BlockArgument(1, Int)
     body = Block()
     body.terminator = ContinueOp(IRStructurizer.IRValue[])
     op = ForOp(1, 10, 1, iv, body, IRStructurizer.IRValue[])
@@ -675,10 +675,10 @@ end
 
 @testset "deleteat!(carries, indices)" begin
     body = Block()
-    iv = BlockArg(1, Int)
-    a1 = BlockArg(2, Float64)
-    a2 = BlockArg(3, Float64)
-    a3 = BlockArg(4, Float64)
+    iv = BlockArgument(1, Int)
+    a1 = BlockArgument(2, Float64)
+    a2 = BlockArgument(3, Float64)
+    a3 = BlockArgument(4, Float64)
     push!(body.args, a1)
     push!(body.args, a2)
     push!(body.args, a3)
@@ -697,8 +697,8 @@ end
 
 @testset "init_value! and term_value! setters" begin
     body = Block()
-    iv = BlockArg(1, Int)
-    a1 = BlockArg(2, Float64)
+    iv = BlockArgument(1, Int)
+    a1 = BlockArgument(2, Float64)
     push!(body.args, a1)
     body.terminator = ContinueOp(Any[SSAValue(10)])
     op = ForOp(1, 10, 1, iv, body, Any[SSAValue(100)])
@@ -728,7 +728,7 @@ end
     else_blk.terminator = YieldOp(Any[SSAValue(31)])
 
     body = Block()
-    a1 = BlockArg(1, Int)
+    a1 = BlockArgument(1, Int)
     push!(body.args, a1)
     ifop = IfOp(SSAValue(1), then_blk, else_blk)
     push!(body.body, (10, ifop, Int))
@@ -758,14 +758,14 @@ end
 @testset "carries for WhileOp" begin
     before = Block()
     after = Block()
-    a1_before = BlockArg(1, Int)
-    a2_before = BlockArg(2, Float64)
+    a1_before = BlockArgument(1, Int)
+    a2_before = BlockArgument(2, Float64)
     push!(before.args, a1_before)
     push!(before.args, a2_before)
     before.terminator = ConditionOp(SSAValue(1), Any[a1_before, a2_before])
 
-    a1_after = BlockArg(1, Int)
-    a2_after = BlockArg(2, Float64)
+    a1_after = BlockArgument(1, Int)
+    a2_after = BlockArgument(2, Float64)
     push!(after.args, a1_after)
     push!(after.args, a2_after)
     after.terminator = YieldOp(Any[SSAValue(20), SSAValue(21)])
@@ -798,7 +798,7 @@ end
     else_blk.terminator = ContinueOp(Any[SSAValue(60)])
 
     body = Block()
-    a1 = BlockArg(1, Int)
+    a1 = BlockArgument(1, Int)
     push!(body.args, a1)
     ifop = IfOp(SSAValue(1), then_blk, else_blk)
     push!(body.body, (10, ifop, Nothing))
@@ -830,8 +830,8 @@ end
     # Build a WhileOp with carries
     before = Block()
     after = Block()
-    before_arg = BlockArg(100, Int)
-    after_blk_arg = BlockArg(101, Int)
+    before_arg = BlockArgument(100, Int)
+    after_blk_arg = BlockArgument(101, Int)
     push!(before.args, before_arg)
     push!(after.args, after_blk_arg)
     before.terminator = ConditionOp(SSAValue(1), [before_arg])
@@ -861,7 +861,7 @@ end
     else_blk.terminator = ContinueOp([SSAValue(88)])   # 1 user carry
 
     body = Block()
-    push!(body.args, BlockArg(1, Int))  # 1 user block arg
+    push!(body.args, BlockArgument(1, Int))  # 1 user block arg
     ifop = IfOp(SSAValue(50), then_blk, else_blk)
     push!(body.body, (10, ifop, Nothing))
     body.terminator = nothing
@@ -933,8 +933,8 @@ end  # loop carries
     @test resolve_call(42) === nothing
     @test resolve_call(Expr(:new, :Foo)) === nothing
 
-    # Inst overload
-    inst = Inst(1, expr_call, Int)
+    # Instruction overload
+    inst = Instruction(1, expr_call, Int)
     result3 = resolve_call(inst)
     @test result3 !== nothing
     @test first(result3) === Base.:+
@@ -958,8 +958,8 @@ end
     @test !iscall(42)
     @test !iscall(Expr(:new, :Foo))
 
-    # Inst overloads
-    inst = Inst(1, expr_call, Int)
+    # Instruction overloads
+    inst = Instruction(1, expr_call, Int)
     @test iscall(inst)
     @test callee(inst) == GlobalRef(Base, :+)
     @test length(callargs(inst)) == 2
@@ -972,3 +972,95 @@ end
 end
 
 end  # expression inspection
+
+@testset "value_type(block, val)" begin
+
+@testset "SSAValue in same block" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    inst = first(instructions(sci.entry))
+    typ = value_type(sci.entry, SSAValue(inst))
+    @test typ !== nothing
+    @test typ == value_type(inst)
+end
+
+@testset "SSAValue from parent block" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    # Find an SSAValue defined in the entry block and look it up from a nested block
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            ifop = stmt(inst)
+            then_blk = ifop.then_region
+            # The condition SSAValue is defined in the entry block
+            cond = ifop.condition
+            if cond isa SSAValue
+                typ = value_type(then_blk, cond)
+                @test typ !== nothing
+            end
+            break
+        end
+    end
+end
+
+@testset "BlockArgument" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        return acc
+    end |> only
+
+    found = false
+    for inst in instructions(sci.entry)
+        op = stmt(inst)
+        op isa IRStructurizer.ControlFlowOp || continue
+        for blk in blocks(op)
+            if !isempty(arguments(blk))
+                arg = first(arguments(blk))
+                @test value_type(blk, arg) == arg.type
+                found = true
+                break
+            end
+        end
+        found && break
+    end
+    @test found
+end
+
+@testset "Argument" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    # Argument(1) is the function itself, Argument(2) is x::Int
+    typ = value_type(sci.entry, Core.Argument(2))
+    @test typ !== nothing
+end
+
+@testset "constant" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test value_type(sci.entry, 42) == Int
+    @test value_type(sci.entry, 3.14) == Float64
+    @test value_type(sci.entry, true) == Bool
+end
+
+@testset "unknown SSAValue" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test value_type(sci.entry, SSAValue(999999)) === nothing
+end
+
+end  # value_type(block, val)

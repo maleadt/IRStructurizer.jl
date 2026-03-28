@@ -23,15 +23,15 @@ end
 """
     Substitutions
 
-A mapping from SSA value indices to BlockArgs.
+A mapping from SSA value indices to BlockArguments.
 Used during IR construction to replace phi node references with block arguments.
 """
-const Substitutions = Dict{Int, BlockArg}
+const Substitutions = Dict{Int, BlockArgument}
 
 """
     substitute_ssa(value, subs::Substitutions)
 
-Recursively substitute SSAValues with BlockArgs according to the substitution map.
+Recursively substitute SSAValues with BlockArguments according to the substitution map.
 Used to convert phi node references to block argument references inside loop bodies.
 """
 function substitute_ssa(value, subs::Substitutions)
@@ -60,7 +60,7 @@ end
 substitute_ssa(value) = value
 
 #=============================================================================
- Block Substitution (apply SSA → BlockArg mappings)
+ Block Substitution (apply SSA → BlockArgument mappings)
 =============================================================================#
 
 """
@@ -105,13 +105,13 @@ function apply_substitutions!(op::ForOp, subs::Substitutions)
         op.init_values[j] = substitute_ssa(v, subs)
     end
 
-    # Thread outer BlockArgs through inner loop as invariant carries.
-    # Without this, an outer BlockArg(1) collides with the inner loop's own BlockArg(1) (its IV).
+    # Thread outer BlockArguments through inner loop as invariant carries.
+    # Without this, an outer BlockArgument(1) collides with the inner loop's own BlockArgument(1) (its IV).
     isempty(subs) && return
     inner_subs = Substitutions()
     for (ssa_idx, outer_arg) in subs
         next_id = isempty(op.body.args) ? 2 : maximum(a.id for a in op.body.args) + 1
-        inner_arg = BlockArg(next_id, outer_arg.type)
+        inner_arg = BlockArgument(next_id, outer_arg.type)
         push!(op.body.args, inner_arg)
         push!(op.init_values, outer_arg)
         if op.body.terminator isa ContinueOp
@@ -131,7 +131,7 @@ function apply_substitutions!(op::LoopOp, subs::Substitutions)
     inner_subs = Substitutions()
     for (ssa_idx, outer_arg) in subs
         next_id = isempty(op.body.args) ? 1 : maximum(a.id for a in op.body.args) + 1
-        inner_arg = BlockArg(next_id, outer_arg.type)
+        inner_arg = BlockArgument(next_id, outer_arg.type)
         push!(op.body.args, inner_arg)
         push!(op.init_values, outer_arg)
         _thread_loop_carry!(op.body, inner_arg)
@@ -146,7 +146,7 @@ end
 Push `inner_arg` to every ContinueOp and BreakOp terminator reachable from `block`,
 recursing into nested IfOps (but not into nested loop ops, which have their own scopes).
 """
-function _thread_loop_carry!(block::Block, inner_arg::BlockArg)
+function _thread_loop_carry!(block::Block, inner_arg::BlockArgument)
     if block.terminator isa ContinueOp
         push!(block.terminator.values, inner_arg)
     elseif block.terminator isa BreakOp
@@ -171,7 +171,7 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
     for (ssa_idx, outer_arg) in subs
         # before region
         next_before_id = isempty(op.before.args) ? 1 : maximum(a.id for a in op.before.args) + 1
-        before_arg = BlockArg(next_before_id, outer_arg.type)
+        before_arg = BlockArgument(next_before_id, outer_arg.type)
         push!(op.before.args, before_arg)
         push!(op.init_values, outer_arg)
         if op.before.terminator isa ConditionOp
@@ -180,7 +180,7 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
 
         # after region
         next_after_id = isempty(op.after.args) ? 1 : maximum(a.id for a in op.after.args) + 1
-        after_arg = BlockArg(next_after_id, outer_arg.type)
+        after_arg = BlockArgument(next_after_id, outer_arg.type)
         push!(op.after.args, after_arg)
         if op.after.terminator isa YieldOp
             push!(op.after.terminator.values, after_arg)

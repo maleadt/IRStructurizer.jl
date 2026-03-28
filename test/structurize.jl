@@ -545,9 +545,9 @@ end
     @test before.terminator isa ConditionOp
     cond_op = before.terminator
 
-    # The result should be BlockArg, not SSAValue
+    # The result should be BlockArgument, not SSAValue
     @test !isempty(cond_op.args)
-    @test cond_op.args[1] isa IRStructurizer.BlockArg
+    @test cond_op.args[1] isa IRStructurizer.BlockArgument
 end
 
 @testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin

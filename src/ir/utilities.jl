@@ -38,14 +38,14 @@ function root(block::Block)
     return p::StructuredIRCode
 end
 
-"""Delete an instruction from a block by `Inst`."""
-function Base.delete!(block::Block, inst::Inst)
+"""Delete an instruction from a block by `Instruction`."""
+function Base.delete!(block::Block, inst::Instruction)
     delete!(block.body, inst.ssa_idx)
     return block
 end
 
 """
-    push!(block::Block, stmt, typ) -> Inst
+    push!(block::Block, stmt, typ) -> Instruction
 
 Append a new instruction to the block, auto-allocating an SSA index.
 Requires `block.parent` to be set (see `_set_parent!`).
@@ -60,11 +60,11 @@ function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ))
             b.parent = block
         end
     end
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 """
-    pushfirst!(block::Block, stmt, typ) -> Inst
+    pushfirst!(block::Block, stmt, typ) -> Instruction
 
 Prepend a new instruction at the beginning of the block, auto-allocating an SSA index.
 """
@@ -80,15 +80,15 @@ function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ))
             b.parent = block
         end
     end
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 """
-    update_type!(block::Block, inst::Inst, new_type)
+    update_type!(block::Block, inst::Instruction, new_type)
 
 Update the type annotation for an existing instruction.
 """
-function update_type!(block::Block, inst::Inst, @nospecialize(new_type))
+function update_type!(block::Block, inst::Instruction, @nospecialize(new_type))
     pos = findfirst(==(inst.ssa_idx), block.body.ssa_idxes)
     pos === nothing && throw(KeyError(inst.ssa_idx))
     block.body.types[pos] = new_type
@@ -96,29 +96,66 @@ function update_type!(block::Block, inst::Inst, @nospecialize(new_type))
 end
 
 """
-    new_block_arg!(block::Block, typ) -> BlockArg
+    value_type(block::Block, val) -> Any
 
-Add a new BlockArg to a block, allocating a fresh ID from the root StructuredIRCode.
+Get the Julia type of an arbitrary IR value as visible from `block`.
+
+For `SSAValue`, searches the current block then walks up the parent chain.
+For `BlockArgument` and `Undef`, returns the type stored on the value.
+For `Argument`/`SlotNumber`, looks up in the root `StructuredIRCode.argtypes`.
+For constants, returns `typeof(val)`.
+Returns `nothing` only for an `SSAValue` or `Argument` whose type cannot be found.
+"""
+function value_type(block::Block, @nospecialize(val))
+    if val isa SSAValue
+        entry = get(block.body, val.id, nothing)
+        entry !== nothing && return entry.typ
+        p = block.parent
+        while p isa Block
+            entry = get(p.body, val.id, nothing)
+            entry !== nothing && return entry.typ
+            p = p.parent
+        end
+        return nothing
+    elseif val isa BlockArgument
+        return val.type
+    elseif val isa Undef
+        return val.type
+    elseif val isa Argument
+        sci = root(block)
+        return val.n <= length(sci.argtypes) ? sci.argtypes[val.n] : nothing
+    elseif val isa SlotNumber
+        sci = root(block)
+        return val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
+    else
+        return typeof(val)  # constant
+    end
+end
+
+"""
+    new_block_arg!(block::Block, typ) -> BlockArgument
+
+Add a new BlockArgument to a block, allocating a fresh ID from the root StructuredIRCode.
 """
 function new_block_arg!(block::Block, @nospecialize(typ))
     sci = root(block)
     sci.max_ssa_idx += 1
-    arg = BlockArg(sci.max_ssa_idx, typ)
+    arg = BlockArgument(sci.max_ssa_idx, typ)
     push!(block.args, arg)
     return arg
 end
 
 """
-    insert_before!(block::Block, ref::Inst, stmt, typ) -> Inst
+    insert_before!(block::Block, ref::Instruction, stmt, typ) -> Instruction
 
 Insert a new instruction before `ref`, auto-allocating an SSA index.
 """
-function insert_before!(block::Block, ref::Inst, @nospecialize(stmt), @nospecialize(typ))
+function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ)
@@ -130,16 +167,16 @@ function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ)
 end
 
 """
-    insert_after!(block::Block, ref::Inst, stmt, typ) -> Inst
+    insert_after!(block::Block, ref::Instruction, stmt, typ) -> Instruction
 
 Insert a new instruction after `ref`, auto-allocating an SSA index.
 """
-function insert_after!(block::Block, ref::Inst, @nospecialize(stmt), @nospecialize(typ))
+function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ)
@@ -151,7 +188,7 @@ function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ)
 end
 
 """
-    insert_before!(block::Block, ref::SSAValue, stmt, typ) -> Inst
+    insert_before!(block::Block, ref::SSAValue, stmt, typ) -> Instruction
 
 Insert a new instruction before the instruction at SSA index `ref.id`.
 """
@@ -165,11 +202,11 @@ function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospe
             b.parent = block
         end
     end
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 """
-    insert_after!(block::Block, ref::SSAValue, stmt, typ) -> Inst
+    insert_after!(block::Block, ref::SSAValue, stmt, typ) -> Instruction
 
 Insert a new instruction after the instruction at SSA index `ref.id`.
 """
@@ -183,7 +220,7 @@ function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospec
             b.parent = block
         end
     end
-    return Inst(idx, stmt, typ)
+    return Instruction(idx, stmt, typ)
 end
 
 
@@ -351,7 +388,7 @@ Pre-built index mapping values to their use sites. Created by `uses(block)`.
 Supports `idx[val]` to get use sites, `haskey(idx, val)` for liveness checks.
 
 Accepts any key type that appears in operand positions: `Int` (treated as
-SSAValue index), `SSAValue`, `BlockArg`, `Argument`, etc.
+SSAValue index), `SSAValue`, `BlockArgument`, `Argument`, etc.
 """
 struct UseIndex
     index::Dict{Any, Vector{UseRef}}
@@ -364,10 +401,10 @@ end
 
 Base.haskey(idx::UseIndex, @nospecialize(key)) = haskey(idx.index, normalize_key(key))
 
-# Normalize keys so that SSAValue(5), plain Int 5, and Inst(5,...) map to the same entry
+# Normalize keys so that SSAValue(5), plain Int 5, and Instruction(5,...) map to the same entry
 normalize_key(v::SSAValue) = v
 normalize_key(v::Int) = SSAValue(v)
-normalize_key(v::Inst) = SSAValue(v.ssa_idx)
+normalize_key(v::Instruction) = SSAValue(v.ssa_idx)
 normalize_key(@nospecialize(v)) = v
 
 
@@ -415,7 +452,7 @@ end
     replace_uses!(block::Block, old, new_val)
 
 Replace all uses of `old` with `new_val` in `block` (recursively).
-`old` can be any value type (SSAValue, BlockArg, Inst, Int).
+`old` can be any value type (SSAValue, BlockArgument, Instruction, Int).
 """
 function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     target = normalize_key(old)
@@ -523,14 +560,14 @@ body_block(op::WhileOp) = op.before  # carries enter through before block
 """Get the init value for this carry."""
 init_value(c::CarryRef) = c.carries.op.init_values[c.index]
 
-"""Get the body BlockArg for this carry."""
+"""Get the body BlockArgument for this carry."""
 function body_arg(c::CarryRef)
     op = c.carries.op
     block = body_block(op)
     block.args[c.index]
 end
 
-"""Get the after-region BlockArg for this carry (WhileOp only)."""
+"""Get the after-region BlockArgument for this carry (WhileOp only)."""
 after_arg(c::CarryRef) = (c.carries.op::WhileOp).after.args[c.index]
 
 """Get the terminator value for this carry from a specific terminator."""
@@ -630,7 +667,7 @@ end
 """
     push!(carries::LoopCarries, init_val, body_arg_type) -> CarryRef
 
-Append a new carry to the loop. Creates a new BlockArg for the body,
+Append a new carry to the loop. Creates a new BlockArgument for the body,
 pushes init_val, and threads the new arg through all reachable terminators.
 
 Returns a CarryRef to the new carry.
@@ -733,12 +770,12 @@ function _collect_blocks!(out, block::Block)
 end
 
 """
-    findblock(sci::StructuredIRCode, inst::Inst) -> Union{Block, Nothing}
+    findblock(sci::StructuredIRCode, inst::Instruction) -> Union{Block, Nothing}
 
 Find the Block containing the given instruction.
 Returns `nothing` if not found.
 """
-function findblock(sci::StructuredIRCode, inst::Inst)
+function findblock(sci::StructuredIRCode, inst::Instruction)
     found = nothing
     walk(sci) do i, block
         if i.ssa_idx == inst.ssa_idx
@@ -837,11 +874,11 @@ function resolve_call(@nospecialize(stmt))
 end
 
 """
-    resolve_call(inst::Inst) -> (resolved_func, operands) or nothing
+    resolve_call(inst::Instruction) -> (resolved_func, operands) or nothing
 
-Convenience overload: extracts the statement from an `Inst`.
+Convenience overload: extracts the statement from an `Instruction`.
 """
-resolve_call(inst::Inst) = resolve_call(inst.stmt)
+resolve_call(inst::Instruction) = resolve_call(inst.stmt)
 
 """
     iscall(stmt) -> Bool
@@ -851,11 +888,11 @@ Check whether a statement is a `:call` or `:invoke` expression.
 iscall(@nospecialize(stmt)) = stmt isa Expr && (stmt.head === :call || stmt.head === :invoke)
 
 """
-    iscall(inst::Inst) -> Bool
+    iscall(inst::Instruction) -> Bool
 
 Convenience overload: checks the underlying statement.
 """
-iscall(inst::Inst) = iscall(inst.stmt)
+iscall(inst::Instruction) = iscall(inst.stmt)
 
 """
     callee(stmt::Expr) -> Any
@@ -874,11 +911,11 @@ function callee(stmt::Expr)
 end
 
 """
-    callee(inst::Inst) -> Any
+    callee(inst::Instruction) -> Any
 
 Convenience overload: extracts callee from the underlying statement.
 """
-callee(inst::Inst) = callee(inst.stmt::Expr)
+callee(inst::Instruction) = callee(inst.stmt::Expr)
 
 """
     callargs(stmt::Expr) -> SubArray
@@ -896,8 +933,8 @@ function callargs(stmt::Expr)
 end
 
 """
-    callargs(inst::Inst) -> SubArray
+    callargs(inst::Instruction) -> SubArray
 
 Convenience overload: extracts call arguments from the underlying statement.
 """
-callargs(inst::Inst) = callargs(inst.stmt::Expr)
+callargs(inst::Instruction) = callargs(inst.stmt::Expr)

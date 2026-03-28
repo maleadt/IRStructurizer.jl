@@ -301,13 +301,13 @@ end
 
 Pad extra exit values into the loop-carry chain and append to phi tracking vectors.
 Each extra exit value becomes a loop-carried variable with `Undef` initial value.
-`arg_offset` is the starting BlockArg id for the new args.
+`arg_offset` is the starting BlockArgument id for the new args.
 """
 function pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, arg_offset::Int)
     for (j, ex) in enumerate(extra_exits)
         push!(init_values, Undef(ex.type))
         push!(carried_values, ex.value)
-        push!(body.args, BlockArg(arg_offset + j, ex.type))
+        push!(body.args, BlockArgument(arg_offset + j, ex.type))
     end
     for ex in extra_exits
         push!(phi_indices, ex.getfield_idx)

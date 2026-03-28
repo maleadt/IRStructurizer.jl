@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef, Inst, instructions, arguments, value_type, stmt,
+export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt,
        insert_before!, insert_after!, terminator, terminator!, operands
 
 #=============================================================================
@@ -8,12 +8,12 @@ export StructuredIRCode, Undef, Inst, instructions, arguments, value_type, stmt,
 =============================================================================#
 
 """
-    BlockArg
+    BlockArgument
 
 Represents a block argument (similar to MLIR block arguments).
 Used for loop carried values and condition branch results.
 """
-struct BlockArg
+struct BlockArgument
     id::Int
     type::Any  # Julia type
 end
@@ -44,43 +44,46 @@ Base.show(io::IO, u::Undef) = print(io, "undef::$(u.type)")
 
 # IRValue: Values used in structured IR
 # - SSAValue, Argument, SlotNumber: references to Julia IR values
-# - BlockArg: block arguments for control flow
+# - BlockArgument: block arguments for control flow
 # - Undef: structurization artifact for dead branches
 # - Raw values (Integer, Float, etc.): compile-time constants
 const IRValue = Any
 
 #=============================================================================
- Inst - instruction bundling SSA index + statement + type
+ Instruction - convenience view over an SSAMap entry
 =============================================================================#
 
 """
-    Inst
+    Instruction
 
-An instruction in the structured IR, bundling an SSA index with its statement
-and type. Analogous to LLVM's `Instruction` which IS a `Value` carrying its type.
+A convenience view over an SSAMap entry, bundling an SSA index with its statement
+and type. Yielded by `instructions(block)` and usable as a key in `UseIndex`.
 
-Yielded by `instructions(block)`. Can be used as a key in `UseIndex`.
+Unlike the structural IR elements (`SSAValue`, `BlockArgument`, `Argument`) which appear
+as operands in the IR, an `Instruction` is constructed on-the-fly during iteration
+and provides convenient access to all three aspects of a definition: its identity
+(`ssa_idx`), its statement (`stmt`), and its Julia type (`typ`).
 """
-struct Inst
+struct Instruction
     ssa_idx::Int
     stmt::Any
     typ::Any
 end
 
 """Get the Julia type of the instruction result."""
-value_type(i::Inst) = i.typ
+value_type(i::Instruction) = i.typ
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
-stmt(i::Inst) = i.stmt
+stmt(i::Instruction) = i.stmt
 
 """Convert to SSAValue for use in operand positions."""
-Core.SSAValue(i::Inst) = SSAValue(i.ssa_idx)
+Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)
 
-Base.:(==)(a::Inst, b::Inst) = a.ssa_idx == b.ssa_idx
-Base.hash(i::Inst, h::UInt) = hash(i.ssa_idx, h)
+Base.:(==)(a::Instruction, b::Instruction) = a.ssa_idx == b.ssa_idx
+Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)
 
-function Base.show(io::IO, i::Inst)
-    print(io, "Inst(%$(i.ssa_idx)")
+function Base.show(io::IO, i::Instruction)
+    print(io, "Instruction(%$(i.ssa_idx)")
     if i.stmt isa ControlFlowOp
         print(io, " = ", typeof(i.stmt))
     elseif i.stmt isa Expr
@@ -254,13 +257,13 @@ A block of statements with block arguments and a terminator.
 Body is an SSAMap mapping SSA indices to (stmt, type) entries.
 """
 mutable struct Block
-    args::Vector{BlockArg}
+    args::Vector{BlockArgument}
     body::SSAMap
     terminator::Terminator
     parent::Any  # containing Block, or StructuredIRCode for entry block, or nothing
 end
 
-Block() = Block(BlockArg[], SSAMap(), nothing, nothing)
+Block() = Block(BlockArgument[], SSAMap(), nothing, nothing)
 
 """
     push!(block::Block, idx::Int, stmt, typ)
@@ -301,8 +304,8 @@ Base.eltype(::Type{Block}) = Tuple{Int,Any,Any}
 """
     instructions(block::Block)
 
-Iterate over the instructions in a block, yielding `Inst` objects.
-Each `Inst` bundles the SSA index, statement, and type — users never
+Iterate over the instructions in a block, yielding `Instruction` objects.
+Each `Instruction` bundles the SSA index, statement, and type — users never
 need to interact with SSAMap directly.
 
 Analogous to LLVM.jl's `instructions(bb::BasicBlock)`.
@@ -314,17 +317,17 @@ struct InstructionIterator
 end
 
 Base.length(it::InstructionIterator) = length(it.body)
-Base.eltype(::Type{InstructionIterator}) = Inst
+Base.eltype(::Type{InstructionIterator}) = Instruction
 
 function Base.iterate(it::InstructionIterator, state::Int=1)
     m = it.body
     state > length(m.ssa_idxes) && return nothing
-    inst = Inst(m.ssa_idxes[state], m.stmts[state], m.types[state])
+    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state])
     return inst, state + 1
 end
 
 """
-    arguments(block::Block) -> Vector{BlockArg}
+    arguments(block::Block) -> Vector{BlockArgument}
 
 Get the block arguments. Analogous to LLVM.jl's `parameters(f)`.
 """
@@ -386,7 +389,7 @@ mutable struct ForOp <: ControlFlowOp
     lower::IRValue
     upper::IRValue
     step::IRValue
-    iv_arg::BlockArg
+    iv_arg::BlockArgument
     body::Block
     init_values::Vector{IRValue}
 end
