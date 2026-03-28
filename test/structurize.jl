@@ -321,6 +321,88 @@ end
     end
 end
 
+@testset "sequential while loops" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        # Loop 1: accumulate
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        # Loop 2: uses result from loop 1
+        j = 0
+        result = 0
+        while j < n
+            result += acc
+            j += 1
+        end
+        return result
+    end |> only
+
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
+    @test length(for_ops) == 2
+end
+
+@testset "sequential for loops" begin
+    sci, _ = code_structured(Tuple{Int32}) do n::Int32
+        # Loop 1: accumulate
+        acc = Int32(0)
+        for i in Int32(1):n
+            acc += i
+        end
+        # Loop 2: uses result from loop 1
+        result = Int32(0)
+        for j in Int32(1):n
+            result += acc
+        end
+        return result
+    end |> only
+
+    all_stmts = collect(statements(sci.entry.body))
+    function count_loops(stmts)
+        n = 0
+        for s in stmts
+            if s isa LoopOp
+                n += 1
+            elseif s isa IfOp
+                n += count_loops(collect(statements(s.then_region.body)))
+                n += count_loops(collect(statements(s.else_region.body)))
+            end
+        end
+        n
+    end
+    @test count_loops(all_stmts) == 2
+end
+
+@testset "sequential for loops with constant bounds" begin
+    sci, _ = code_structured(Tuple{Vector{Float32}, Vector{Float32}, Vector{Float32}}) do a::Vector{Float32}, b::Vector{Float32}, c::Vector{Float32}
+        acc = 0.0f0
+        for i in Int32(1):Int32(2)
+            acc += a[i]
+        end
+        for i in Int32(1):Int32(2)
+            c[i] = b[i] + acc
+        end
+        return nothing
+    end |> only
+
+    all_stmts = collect(statements(sci.entry.body))
+    function count_loops(stmts)
+        n = 0
+        for s in stmts
+            if s isa LoopOp || s isa ForOp
+                n += 1
+            elseif s isa IfOp
+                n += count_loops(collect(statements(s.then_region.body)))
+                n += count_loops(collect(statements(s.else_region.body)))
+            end
+        end
+        n
+    end
+    @test count_loops(all_stmts) == 2
+end
+
 end  # ForOp detection
 
 @testset "WhileOp detection" begin

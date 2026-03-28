@@ -96,6 +96,14 @@ end
     all(!in(Edge(v, w), backedges) for w in outneighbors(g, v)) || return nothing
     termination_blocks = filter(w -> isempty(outneighbors(g, w)) && length(inneighbors(g, w)) == 1, outneighbors(g, v))
     isempty(termination_blocks) && return nothing
+    # Don't absorb if all remaining successors are backedge sources — that
+    # would hide the loop's only exit edge, causing downstream structurization
+    # to merge sequential loops into one.
+    remaining = filter(w -> w ∉ termination_blocks, outneighbors(g, v))
+    if !isempty(remaining)
+        backedge_sources = Set(e.src for e in backedges)
+        all(in(backedge_sources), remaining) && return nothing
+    end
     Some(termination_blocks)
 end
 
