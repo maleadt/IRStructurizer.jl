@@ -194,8 +194,6 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     end
     pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_header_phis)
 
-    rename_extra_exit_defs!(extra_exits, ctx, carried_values, body, then_blk)
-
     # 7. Build exit control flow
     if exit !== nothing
         cond_value = convert_phi_value(exit.cond)
@@ -322,8 +320,6 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     end
 
     pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_phi + 1)
-
-    rename_extra_exit_defs!(extra_exits, ctx, carried_values, body)
 
     # ContinueOp with non-IV carried values (including extra exits)
     body.terminator = ContinueOp(copy(carried_values))

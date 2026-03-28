@@ -424,6 +424,21 @@ function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     end
 end
 
+"""
+    replace_ssa_uses!(block::Block, old_id::Int, new_id::Int)
+
+Replace all uses of `SSAValue(old_id)` with `SSAValue(new_id)` in `block` (recursively).
+Unlike `replace_uses!`, this only matches actual `SSAValue` objects, not bare `Int` literals
+(which may appear as getfield indices, etc.).
+"""
+function replace_ssa_uses!(block::Block, old_id::Int, new_id::Int)
+    new_val = SSAValue(new_id)
+    walk_uses!(block) do ref
+        val = ref[]
+        val isa SSAValue && val.id == old_id && (ref[] = new_val)
+    end
+end
+
 
 #=============================================================================
  Loop carries abstraction
