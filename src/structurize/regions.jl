@@ -274,6 +274,8 @@ function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int
 
             if loop_val !== nothing
                 gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                gf_idx ∈ already_exported && continue
+                gf_idx ∈ seen && continue
                 push!(extra, (; value=loop_val, getfield_idx=gf_idx, type=types[si]))
                 push!(seen, gf_idx)
             end

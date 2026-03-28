@@ -524,6 +524,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         ctx = StructurizationContext(types, n + 1)
         ctree = ControlTree(ir)
         sci.entry = control_tree_to_structured_ir(ctree, ir, ctx)
+        ctx.next_ssa_idx = rebuildssa!(sci.entry, ctx.next_ssa_idx)
         sci.max_ssa_idx = ctx.next_ssa_idx - 1
     end
 
@@ -535,6 +536,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         validate_no_phis(sci.entry)
         validate_terminators(sci)
         validate_ssa_defs(sci)
+        validate_ssa_uniqueness(sci)
     end
 
     return sci
