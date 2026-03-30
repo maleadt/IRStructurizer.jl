@@ -575,6 +575,51 @@ end
     @test stmt.args[2] === SSAValue(1)
 end
 
+@testset "users(block, val)" begin
+    # users() returns Instructions (owning operations), not UseRefs (use-sites)
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    push!(block.body, (2, Expr(:call, GlobalRef(Base, :*), SSAValue(1), SSAValue(0)), Int))
+
+    # SSAValue(0) is used in both instructions
+    u = users(block, SSAValue(0))
+    @test length(u) == 2
+    @test all(inst -> inst isa Instruction, u)
+    @test Set(inst.ssa_idx for inst in u) == Set([1, 2])
+
+    # SSAValue(1) is only used in instruction 2
+    u1 = users(block, SSAValue(1))
+    @test length(u1) == 1
+    @test u1[1].ssa_idx == 2
+
+    # SSAValue(99) is not used anywhere
+    @test isempty(users(block, SSAValue(99)))
+end
+
+@testset "users does not count literal integers" begin
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    push!(block.body, (6, Expr(:call, GlobalRef(Base, :f), SSAValue(1), 6, false), Int))
+
+    # users(SSAValue(6)) should not return instruction 6 just because it has a literal 6
+    @test isempty(users(block, SSAValue(6)))
+end
+
+@testset "users with nested control flow" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        acc = 0
+        for i in 1:n
+            acc += i
+        end
+        return acc
+    end |> only
+
+    # Argument(2) (n) should have at least one user instruction
+    u = users(sci.entry, Core.Argument(2))
+    @test !isempty(u)
+    @test all(inst -> inst isa Instruction, u)
+end
+
 @testset "nested uses" begin
     sci, _ = code_structured(Tuple{Int}) do n::Int
         acc = 0

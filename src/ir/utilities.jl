@@ -412,7 +412,7 @@ normalize_key(@nospecialize(v)) = v
  uses() — the public API
 =============================================================================#
 
-export uses, replace_uses!
+export uses, users, replace_uses!
 
 """
     uses(block::Block) -> UseIndex
@@ -471,6 +471,65 @@ function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
         val isa Integer && return
         normalize_key(val) == target && (ref[] = new_val)
     end
+end
+
+"""
+    users(block::Block, val) -> Vector{Instruction}
+
+Find all instructions in `block` (recursively) that reference `val` as an
+operand. Returns `Instruction` objects — the analog of MLIR's
+`Value::getUsers()` which maps use-sites to owning operations.
+
+See also `uses(block, val)` which returns `UseRef`s (use-sites).
+"""
+function users(block::Block, @nospecialize(val))
+    target = normalize_key(val)
+    result = Instruction[]
+    seen = Set{Int}()
+    for b in eachblock(block)
+        for inst in instructions(b)
+            inst.ssa_idx in seen && continue
+            _references(inst.stmt, target) || continue
+            push!(seen, inst.ssa_idx)
+            push!(result, inst)
+        end
+    end
+    return result
+end
+
+"""Check if a statement references `target` in any operand position."""
+function _references(@nospecialize(stmt), @nospecialize(target))
+    if stmt isa Expr
+        start = stmt.head === :invoke ? 3 : 2
+        for i in start:length(stmt.args)
+            v = stmt.args[i]
+            v isa Integer && continue
+            normalize_key(v) == target && return true
+        end
+    elseif stmt isa ControlFlowOp
+        # Check control flow operands (init values, conditions, etc.)
+        if stmt isa IfOp
+            normalize_key(stmt.condition) == target && return true
+        elseif stmt isa ForOp
+            normalize_key(stmt.lower) == target && return true
+            normalize_key(stmt.upper) == target && return true
+            normalize_key(stmt.step) == target && return true
+            for v in stmt.init_values
+                v isa Integer && continue
+                normalize_key(v) == target && return true
+            end
+        elseif stmt isa Union{WhileOp, LoopOp}
+            for v in stmt.init_values
+                v isa Integer && continue
+                normalize_key(v) == target && return true
+            end
+        end
+    elseif stmt isa ReturnNode
+        isdefined(stmt, :val) || return false
+        v = stmt.val
+        !(v isa Integer) && normalize_key(v) == target && return true
+    end
+    return false
 end
 
 """
