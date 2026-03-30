@@ -387,8 +387,8 @@ walk_uses!(f, ::Nothing) = nothing
 Pre-built index mapping values to their use sites. Created by `uses(block)`.
 Supports `idx[val]` to get use sites, `haskey(idx, val)` for liveness checks.
 
-Accepts any key type that appears in operand positions: `Int` (treated as
-SSAValue index), `SSAValue`, `BlockArgument`, `Argument`, etc.
+Accepts any key type that appears in operand positions: `SSAValue`,
+`BlockArgument`, `Argument`, `Instruction`, etc.
 """
 struct UseIndex
     index::Dict{Any, Vector{UseRef}}
@@ -401,9 +401,8 @@ end
 
 Base.haskey(idx::UseIndex, @nospecialize(key)) = haskey(idx.index, normalize_key(key))
 
-# Normalize keys so that SSAValue(5), plain Int 5, and Instruction(5,...) map to the same entry
+# Normalize keys so that SSAValue(5) and Instruction(5,...) map to the same entry
 normalize_key(v::SSAValue) = v
-normalize_key(v::Int) = SSAValue(v)
 normalize_key(v::Instruction) = SSAValue(v.ssa_idx)
 normalize_key(@nospecialize(v)) = v
 
@@ -420,16 +419,12 @@ export uses, users, replace_uses!
 Build a use index for all use sites in `block` (recursively).
 Returns a dict-like object: `idx[val]` gives the `Vector{UseRef}` of all
 sites referencing `val`.
-
-Literal integers are not indexed — `normalize_key(::Int)` maps them to
-`SSAValue`, which would conflate e.g. a constant `6` with `SSAValue(6)`.
 """
 function uses(block::Block)
     index = Dict{Any, Vector{UseRef}}()
     walk_uses!(block) do ref
         val = ref[]
         val === nothing && return
-        val isa Integer && return
         key = normalize_key(val)
         refs = get!(Vector{UseRef}, index, key)
         push!(refs, ref)
@@ -442,16 +437,12 @@ end
 
 Find all use sites of `val` in `block` (recursively). Linear scan — for
 repeated queries, prefer building a `UseIndex` via `uses(block)`.
-
-Literal integers are skipped — see `uses(block::Block)`.
 """
 function uses(block::Block, @nospecialize(val))
     result = UseRef[]
     target = normalize_key(val)
     walk_uses!(block) do ref
-        v = ref[]
-        v isa Integer && return
-        normalize_key(v) == target && push!(result, ref)
+        normalize_key(ref[]) == target && push!(result, ref)
     end
     return result
 end
@@ -460,16 +451,12 @@ end
     replace_uses!(block::Block, old, new_val)
 
 Replace all uses of `old` with `new_val` in `block` (recursively).
-`old` can be any value type (SSAValue, BlockArgument, Instruction, Int).
-
-Literal integers are skipped — see `uses(block::Block)`.
+`old` can be any value type (SSAValue, BlockArgument, Instruction).
 """
 function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     target = normalize_key(old)
     walk_uses!(block) do ref
-        val = ref[]
-        val isa Integer && return
-        normalize_key(val) == target && (ref[] = new_val)
+        normalize_key(ref[]) == target && (ref[] = new_val)
     end
 end
 
@@ -502,9 +489,7 @@ function _references(@nospecialize(stmt), @nospecialize(target))
     if stmt isa Expr
         start = stmt.head === :invoke ? 3 : 2
         for i in start:length(stmt.args)
-            v = stmt.args[i]
-            v isa Integer && continue
-            normalize_key(v) == target && return true
+            normalize_key(stmt.args[i]) == target && return true
         end
     elseif stmt isa ControlFlowOp
         # Check control flow operands (init values, conditions, etc.)
@@ -515,19 +500,16 @@ function _references(@nospecialize(stmt), @nospecialize(target))
             normalize_key(stmt.upper) == target && return true
             normalize_key(stmt.step) == target && return true
             for v in stmt.init_values
-                v isa Integer && continue
                 normalize_key(v) == target && return true
             end
         elseif stmt isa Union{WhileOp, LoopOp}
             for v in stmt.init_values
-                v isa Integer && continue
                 normalize_key(v) == target && return true
             end
         end
     elseif stmt isa ReturnNode
         isdefined(stmt, :val) || return false
-        v = stmt.val
-        !(v isa Integer) && normalize_key(v) == target && return true
+        normalize_key(stmt.val) == target && return true
     end
     return false
 end
