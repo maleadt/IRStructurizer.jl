@@ -552,6 +552,29 @@ end
     @test ifop.condition == SSAValue(42)
 end
 
+@testset "literal integers are not treated as IR references" begin
+    # Literal integer args (e.g. constants) should never be confused with
+    # SSAValue references that happen to share the same numeric id.
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    # %6 uses SSAValue(1) and has a literal integer 6 as a constant arg
+    push!(block.body, (6, Expr(:call, GlobalRef(Base, :f), SSAValue(1), 6, false), Int))
+
+    # uses() should not count the literal 6 as a use of SSAValue(6)
+    idx = uses(block)
+    @test isempty(idx[SSAValue(6)])
+
+    # uses(block, val) should also not find the literal 6
+    @test isempty(uses(block, SSAValue(6)))
+
+    # replace_uses! should not replace the literal 6
+    replace_uses!(block, SSAValue(6), SSAValue(99))
+    stmt = block.body.stmts[2]
+    @test stmt.args[3] === 6
+    @test stmt.args[4] === false
+    @test stmt.args[2] === SSAValue(1)
+end
+
 @testset "nested uses" begin
     sci, _ = code_structured(Tuple{Int}) do n::Int
         acc = 0

@@ -420,12 +420,16 @@ export uses, replace_uses!
 Build a use index for all use sites in `block` (recursively).
 Returns a dict-like object: `idx[val]` gives the `Vector{UseRef}` of all
 sites referencing `val`.
+
+Literal integers are not indexed — `normalize_key(::Int)` maps them to
+`SSAValue`, which would conflate e.g. a constant `6` with `SSAValue(6)`.
 """
 function uses(block::Block)
     index = Dict{Any, Vector{UseRef}}()
     walk_uses!(block) do ref
         val = ref[]
         val === nothing && return
+        val isa Integer && return
         key = normalize_key(val)
         refs = get!(Vector{UseRef}, index, key)
         push!(refs, ref)
@@ -438,12 +442,16 @@ end
 
 Find all use sites of `val` in `block` (recursively). Linear scan — for
 repeated queries, prefer building a `UseIndex` via `uses(block)`.
+
+Literal integers are skipped — see `uses(block::Block)`.
 """
 function uses(block::Block, @nospecialize(val))
     result = UseRef[]
     target = normalize_key(val)
     walk_uses!(block) do ref
-        normalize_key(ref[]) == target && push!(result, ref)
+        v = ref[]
+        v isa Integer && return
+        normalize_key(v) == target && push!(result, ref)
     end
     return result
 end
@@ -453,11 +461,15 @@ end
 
 Replace all uses of `old` with `new_val` in `block` (recursively).
 `old` can be any value type (SSAValue, BlockArgument, Instruction, Int).
+
+Literal integers are skipped — see `uses(block::Block)`.
 """
 function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     target = normalize_key(old)
     walk_uses!(block) do ref
-        normalize_key(ref[]) == target && (ref[] = new_val)
+        val = ref[]
+        val isa Integer && return
+        normalize_key(val) == target && (ref[] = new_val)
     end
 end
 
