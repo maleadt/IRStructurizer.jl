@@ -387,8 +387,8 @@ walk_uses!(f, ::Nothing) = nothing
 Pre-built index mapping values to their use sites. Created by `uses(block)`.
 Supports `idx[val]` to get use sites, `haskey(idx, val)` for liveness checks.
 
-Accepts any key type that appears in operand positions: `Int` (treated as
-SSAValue index), `SSAValue`, `BlockArgument`, `Argument`, etc.
+Accepts any key type that appears in operand positions: `SSAValue`,
+`BlockArgument`, `Argument`, `Instruction`, etc.
 """
 struct UseIndex
     index::Dict{Any, Vector{UseRef}}
@@ -401,9 +401,8 @@ end
 
 Base.haskey(idx::UseIndex, @nospecialize(key)) = haskey(idx.index, normalize_key(key))
 
-# Normalize keys so that SSAValue(5), plain Int 5, and Instruction(5,...) map to the same entry
+# Normalize keys so that SSAValue(5) and Instruction(5,...) map to the same entry
 normalize_key(v::SSAValue) = v
-normalize_key(v::Int) = SSAValue(v)
 normalize_key(v::Instruction) = SSAValue(v.ssa_idx)
 normalize_key(@nospecialize(v)) = v
 
@@ -412,7 +411,7 @@ normalize_key(@nospecialize(v)) = v
  uses() — the public API
 =============================================================================#
 
-export uses, replace_uses!
+export uses, users, replace_uses!
 
 """
     uses(block::Block) -> UseIndex
@@ -452,13 +451,67 @@ end
     replace_uses!(block::Block, old, new_val)
 
 Replace all uses of `old` with `new_val` in `block` (recursively).
-`old` can be any value type (SSAValue, BlockArgument, Instruction, Int).
+`old` can be any value type (SSAValue, BlockArgument, Instruction).
 """
 function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     target = normalize_key(old)
     walk_uses!(block) do ref
         normalize_key(ref[]) == target && (ref[] = new_val)
     end
+end
+
+"""
+    users(block::Block, val) -> Vector{Instruction}
+
+Find all instructions in `block` (recursively) that reference `val` as an
+operand. Returns `Instruction` objects — the analog of MLIR's
+`Value::getUsers()` which maps use-sites to owning operations.
+
+See also `uses(block, val)` which returns `UseRef`s (use-sites).
+"""
+function users(block::Block, @nospecialize(val))
+    target = normalize_key(val)
+    result = Instruction[]
+    seen = Set{Int}()
+    for b in eachblock(block)
+        for inst in instructions(b)
+            inst.ssa_idx in seen && continue
+            _references(inst.stmt, target) || continue
+            push!(seen, inst.ssa_idx)
+            push!(result, inst)
+        end
+    end
+    return result
+end
+
+"""Check if a statement references `target` in any operand position."""
+function _references(@nospecialize(stmt), @nospecialize(target))
+    if stmt isa Expr
+        start = stmt.head === :invoke ? 3 : 2
+        for i in start:length(stmt.args)
+            normalize_key(stmt.args[i]) == target && return true
+        end
+    elseif stmt isa ControlFlowOp
+        # Check control flow operands (init values, conditions, etc.)
+        if stmt isa IfOp
+            normalize_key(stmt.condition) == target && return true
+        elseif stmt isa ForOp
+            normalize_key(stmt.lower) == target && return true
+            normalize_key(stmt.upper) == target && return true
+            normalize_key(stmt.step) == target && return true
+            for v in stmt.init_values
+                normalize_key(v) == target && return true
+            end
+        elseif stmt isa Union{WhileOp, LoopOp}
+            for v in stmt.init_values
+                normalize_key(v) == target && return true
+            end
+        end
+    elseif stmt isa ReturnNode
+        isdefined(stmt, :val) || return false
+        normalize_key(stmt.val) == target && return true
+    end
+    return false
 end
 
 """
