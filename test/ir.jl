@@ -943,9 +943,15 @@ end  # loop carries
 @testset "resolve_call" begin
     using IRStructurizer: resolve_call
 
+    # Use a real SCI to get a block with type information
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+    block = sci.entry
+
     # :call expression with GlobalRef
     expr_call = Expr(:call, GlobalRef(Base, :+), SSAValue(1), SSAValue(2))
-    result = resolve_call(expr_call)
+    result = resolve_call(block, expr_call)
     @test result !== nothing
     func, operands = result
     @test func === Base.:+
@@ -955,21 +961,52 @@ end  # loop carries
     # :invoke expression
     mi = first(methods(+, (Int, Int)))
     expr_invoke = Expr(:invoke, mi, GlobalRef(Base, :+), SSAValue(1), SSAValue(2))
-    result2 = resolve_call(expr_invoke)
+    result2 = resolve_call(block, expr_invoke)
     @test result2 !== nothing
     func2, operands2 = result2
     @test func2 === Base.:+
     @test length(operands2) == 2
 
     # Non-call returns nothing
-    @test resolve_call(42) === nothing
-    @test resolve_call(Expr(:new, :Foo)) === nothing
+    @test resolve_call(block, 42) === nothing
+    @test resolve_call(block, Expr(:new, :Foo)) === nothing
 
     # Instruction overload
     inst = Instruction(1, expr_call, Int)
-    result3 = resolve_call(inst)
+    result3 = resolve_call(block, inst)
     @test result3 !== nothing
     @test first(result3) === Base.:+
+
+    # SSAValue callee resolved via singleton type
+    # Build a :call where args[1] is an SSAValue whose type is a singleton function
+    # Find an instruction in the SCI that is a call, use its SSA index as a fake callee
+    # to test the type-based resolution path
+    callee_ssa_idx = nothing
+    for inst in instructions(block)
+        s = stmt(inst)
+        s isa Expr && s.head === :call || continue
+        # This SSA defines a call result; create a synthetic :call that uses
+        # a different SSA (one typed as a singleton function) as the callee.
+        # Look for a GlobalRef statement whose type is a singleton function type.
+        if s.args[1] isa GlobalRef
+            callee_ssa_idx = inst.ssa_idx
+            break
+        end
+    end
+    # Construct a synthetic indirect call: insert a GlobalRef as a regular
+    # statement, then reference it via SSAValue as the callee.
+    # Instead, we can test resolve_callee directly on an SSAValue.
+    # Find any instruction with a singleton function type (e.g., typeof(+)).
+    using IRStructurizer: resolve_callee
+    for inst in instructions(block)
+        T = value_type(inst)
+        T === nothing && continue
+        singleton = Core.Compiler.singleton_type(T)
+        singleton === nothing && continue
+        # This SSA value has a singleton type — resolve_callee should find it
+        @test resolve_callee(block, SSAValue(inst)) === singleton
+        break
+    end
 end
 
 @testset "iscall / callee / callargs" begin

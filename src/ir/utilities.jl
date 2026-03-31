@@ -127,8 +127,12 @@ function value_type(block::Block, @nospecialize(val))
     elseif val isa SlotNumber
         sci = root(block)
         return val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
+    elseif val isa GlobalRef
+        return typeof(getfield(val.mod, val.name))
+    elseif val isa QuoteNode
+        return typeof(val.value)
     else
-        return typeof(val)  # constant
+        return typeof(val)  # literal constant
     end
 end
 
@@ -898,15 +902,20 @@ end
 =============================================================================#
 
 """
-    resolve_call(stmt) -> (resolved_func, operands) or nothing
+    resolve_call(block::Block, stmt) -> (resolved_func, operands) or nothing
+    resolve_call(block::Block, inst::Instruction) -> (resolved_func, operands) or nothing
 
 Extract the resolved function and operands from a `:call` or `:invoke` Expr.
 For `:call`, `stmt.args[1]` is the function reference and args 2+ are operands.
 For `:invoke`, `stmt.args[2]` is the function reference and args 3+ are operands.
-GlobalRef values are resolved to their bound value.
+
+The callee is resolved via its inferred type using `singleton_type` — the same
+mechanism Julia's compiler uses during inlining. This handles GlobalRef, literal
+values, and SSAValue callees whose type is a singleton function type.
+
 Returns `nothing` if `stmt` is not a call expression or the function cannot be resolved.
 """
-function resolve_call(@nospecialize(stmt))
+function resolve_call(block::Block, @nospecialize(stmt))
     stmt isa Expr || return nothing
     if stmt.head === :call
         func_ref = stmt.args[1]
@@ -917,21 +926,33 @@ function resolve_call(@nospecialize(stmt))
     else
         return nothing
     end
-    resolved = if func_ref isa GlobalRef
-        try; getfield(func_ref.mod, func_ref.name); catch; nothing; end
-    else
-        func_ref
-    end
+    resolved = resolve_callee(block, func_ref)
     resolved === nothing && return nothing
     return (resolved, operands)
 end
 
-"""
-    resolve_call(inst::Instruction) -> (resolved_func, operands) or nothing
+resolve_call(block::Block, inst::Instruction) = resolve_call(block, inst.stmt)
 
-Convenience overload: extracts the statement from an `Instruction`.
 """
-resolve_call(inst::Instruction) = resolve_call(inst.stmt)
+    resolve_callee(block::Block, ref) -> resolved_func or nothing
+
+Resolve a callee reference to a concrete function value. Uses `singleton_type`
+on the inferred type (mirroring Julia's compiler) for SSAValue and other refs
+with singleton types. Falls back to evaluating GlobalRef and literal values
+directly — necessary for non-singleton types like `Core.IntrinsicFunction`
+where all intrinsics share one type and `singleton_type` returns `nothing`.
+"""
+function resolve_callee(block::Block, @nospecialize(ref))
+    T = value_type(block, ref)
+    T === nothing && return nothing
+    resolved = Core.Compiler.singleton_type(T)
+    resolved !== nothing && return resolved
+    # Fallback: evaluate GlobalRef directly (needed for Core.IntrinsicFunction
+    # and other non-singleton types where the value can't be recovered from type alone).
+    # GlobalRefs in optimized IR are guaranteed valid — inference rejects undefined bindings.
+    ref isa GlobalRef && return getfield(ref.mod, ref.name)
+    return nothing
+end
 
 """
     iscall(stmt) -> Bool
