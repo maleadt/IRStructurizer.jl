@@ -174,6 +174,63 @@ end
     @test length(collect(instructions(sci.entry))) == n_before
 end
 
+@testset "empty!(block)" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test !isempty(collect(instructions(sci.entry)))
+    empty!(sci.entry)
+    @test isempty(collect(instructions(sci.entry)))
+    # Args and terminator preserved
+    @test sci.entry.terminator !== nothing
+end
+
+@testset "val in block" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        i = 0
+        acc = 0
+        while i < n
+            acc += i
+            i += 1
+        end
+        acc
+    end |> only
+
+    # SSAValue defined in entry block
+    entry_inst = first(instructions(sci.entry))
+    @test SSAValue(entry_inst) ∈ sci.entry
+
+    # Find a loop and check its body
+    loop_op = nothing
+    for inst in instructions(sci.entry)
+        s = stmt(inst)
+        if s isa ForOp || s isa WhileOp || s isa LoopOp
+            loop_op = s
+            break
+        end
+    end
+    @test loop_op !== nothing
+
+    body = loop_op isa WhileOp ? loop_op.before : loop_op.body
+    if !isempty(collect(instructions(body)))
+        body_inst = first(instructions(body))
+        # Body instruction is in its own block, not in entry
+        @test SSAValue(body_inst) ∈ body
+        @test !(SSAValue(body_inst) ∈ sci.entry)
+    end
+
+    # BlockArguments
+    if !isempty(body.args)
+        @test body.args[1] ∈ body
+        @test !(body.args[1] ∈ sci.entry)
+    end
+
+    # Constants and Arguments are never "in" a block
+    @test !(Core.Argument(1) ∈ sci.entry)
+    @test !(42 ∈ sci.entry)
+end
+
 @testset "update_type!(block, inst, new_type)" begin
     sci, _ = code_structured(Tuple{Int}) do x::Int
         x + 1

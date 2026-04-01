@@ -163,6 +163,14 @@ Insert relative to an existing `Inst` or `SSAValue`.
 
 Remove an instruction from a block.
 
+#### `empty!(block::Block)`
+
+Remove all instructions from the block body, preserving args, terminator, and parent.
+
+#### `val in block` / `val ∈ block` → `Bool`
+
+Check if a value is defined in this block. Returns `true` for `SSAValue`s in the body and `BlockArgument`s in the args; `false` for everything else (constants, `Argument`s, etc.).
+
 #### `update_type!(block, inst, new_type)`
 
 Change the type annotation of an existing instruction.

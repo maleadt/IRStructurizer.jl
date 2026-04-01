@@ -128,6 +128,7 @@ function Base.iterate(m::SSAMap, state::Int=1)
 end
 
 Base.length(m::SSAMap) = length(m.ssa_idxes)
+Base.haskey(m::SSAMap, ssa_idx::Int) = findfirst(==(ssa_idx), m.ssa_idxes) !== nothing
 
 # Lookup by SSA index
 function Base.getindex(m::SSAMap, ssa_idx::Int)
@@ -270,6 +271,16 @@ end
 Block() = Block(BlockArgument[], SSAMap(), nothing, nothing)
 
 """
+    empty!(block::Block)
+
+Remove all instructions from the block body, preserving args, terminator, and parent.
+"""
+function Base.empty!(block::Block)
+    block.body = SSAMap()
+    return block
+end
+
+"""
     push!(block::Block, idx::Int, stmt, typ)
 
 Push a statement or control flow op to a block with its SSA index and type.
@@ -283,6 +294,18 @@ function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(t
         end
     end
 end
+
+"""
+    in(val, block::Block) -> Bool
+    val ∈ block -> Bool
+
+Determine whether a value is defined in this block (not in ancestors or descendants).
+Returns `true` for `SSAValue`s present in the block body and `BlockArgument`s listed
+in the block args. Constants, `Argument`s, and other value types return `false`.
+"""
+Base.in(val::SSAValue, block::Block) = haskey(block.body, val.id)
+Base.in(val::BlockArgument, block::Block) = val in block.args
+Base.in(@nospecialize(_), ::Block) = false
 
 function Base.show(io::IO, block::Block)
     print(io, "Block(")
