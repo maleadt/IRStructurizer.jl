@@ -74,16 +74,31 @@ end
 """
     find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
 
-Find the GotoIfNot in `loop_blocks` whose target exits the loop.
-Returns `(; cond, idx, block)` or `nothing`.
+Find the GotoIfNot in `loop_blocks` that controls the loop exit.
+Returns `(; cond, idx, block, dest, inverted)` or `nothing`.
+
+A `GotoIfNot(cond, dest)` has two successors:
+- `dest` (taken when `cond` is false)
+- fallthrough to the next block (taken when `cond` is true)
+
+When `dest` exits the loop: `inverted=false` (cond=true → stay, cond=false → exit).
+When the fallthrough exits: `inverted=true` (cond=true → exit, cond=false → stay).
 """
 function find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
+    nblocks = length(ir.cfg.blocks)
     for block_idx in loop_blocks
         bb = ir.cfg.blocks[block_idx]
         for si in first(bb.stmts):last(bb.stmts)
             stmt = ir.stmts.stmt[si]
-            if stmt isa GotoIfNot && stmt.dest ∉ loop_blocks
-                return (; cond=stmt.cond, idx=si, block=block_idx, dest=stmt.dest)
+            if stmt isa GotoIfNot
+                if stmt.dest ∉ loop_blocks
+                    return (; cond=stmt.cond, idx=si, block=block_idx, dest=stmt.dest, inverted=false)
+                end
+                # Check fallthrough successor (next block in sequence)
+                fallthrough = block_idx + 1
+                if fallthrough <= nblocks && fallthrough ∉ loop_blocks
+                    return (; cond=stmt.cond, idx=si, block=block_idx, dest=fallthrough, inverted=true)
+                end
             end
         end
     end
@@ -208,7 +223,13 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         end
         else_blk.terminator = BreakOp(break_values)
 
-        push!(body, exit.idx, IfOp(cond_value, then_blk, else_blk), Nothing)
+        if exit.inverted
+            # Exit through fallthrough: cond=true → exit, cond=false → stay in loop
+            push!(body, exit.idx, IfOp(cond_value, else_blk, then_blk), Nothing)
+        else
+            # Exit through goto dest: cond=true → stay in loop, cond=false → exit
+            push!(body, exit.idx, IfOp(cond_value, then_blk, else_blk), Nothing)
+        end
     else
         body.terminator = ContinueOp(copy(carried_values))
     end
