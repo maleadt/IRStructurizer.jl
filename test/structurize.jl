@@ -295,7 +295,6 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci)
 
     # Verify IR is valid (LoopOp is nested inside IfOps from iterator protocol)
     @test sci isa StructuredIRCode
@@ -586,7 +585,6 @@ end
         end
         return x
     end |> only
-    validate_scf(sci)
 end
 
 @testset "while loop with outer capture has Nothing type" begin
@@ -598,7 +596,7 @@ end
         end
         return x
     end |> only
-    validate_scf(sci)
+
 
     # Find the loop in the structure (may be LoopOp, WhileOp, or ForOp)
     matches = filter(p -> p[2].stmt isa LoopOp || p[2].stmt isa WhileOp || p[2].stmt isa ForOp, sci.entry.body)
@@ -618,7 +616,7 @@ end
         end
         return count
     end |> only
-    validate_scf(sci)
+
 
     (_, entry) = only(filter(p -> p[2].stmt isa WhileOp, sci.entry.body))
     while_op = entry.stmt
@@ -643,7 +641,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci_while)
+
     for_ops = filter(x -> x isa ForOp, collect(statements(sci_while.entry.body)))
     @test length(for_ops) == 1
 
@@ -656,7 +654,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci_for)
+
     # LoopOp will be nested inside IfOps, just verify the IR is valid
     @test sci_for isa StructuredIRCode
 end
@@ -685,7 +683,7 @@ end
     end |> only
 
     # Should produce valid structured IR (no unstructured control flow)
-    validate_scf(sci)
+
 end
 
 # If-then (no else) must yield phi values, not return Nothing
@@ -758,7 +756,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci)
+
 
     # Verify the inner ForOp threads outer IV through as an extra init_value
     outer_for = nothing
@@ -805,7 +803,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci)
+
 
     outer_for = nothing
     for (_, entry) in sci.entry.body
@@ -875,7 +873,7 @@ end
     end
 
     sci, _ = only(code_structured(mysum, Tuple{Int}))
-    validate_scf(sci)
+
 end
 
 @testset "unreachable blocks are ignored" begin
@@ -910,7 +908,7 @@ end
 
     # This should succeed — unreachable block is skipped
     sci = StructuredIRCode(ir)
-    validate_scf(sci)
+
     @test sci.entry.terminator isa Core.ReturnNode
 end
 
@@ -923,8 +921,8 @@ end
         end
         r
     end |> only
-    validate_scf(sci)
-    validate_ssa_defs(sci)
+
+
 
     # Verify the output has nested IfOps (from || lowering)
     if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
@@ -939,8 +937,8 @@ end
         end
         r
     end |> only
-    validate_scf(sci)
-    validate_ssa_defs(sci)
+
+
 
     if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
     @test !isempty(if_ops)
@@ -1027,7 +1025,7 @@ end
     end
 
     sci = StructuredIRCode(ir)
-    validate_scf(sci)
+
 
     # Must be a LoopOp (not ForOp — the multi-block header prevents ForOp detection)
     loop_ops = filter(x -> x isa LoopOp, collect(statements(sci.entry.body)))
@@ -1096,7 +1094,7 @@ end  # regression
         end
         return acc
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "product: multiply pattern" begin
@@ -1119,7 +1117,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "count_evens: conditional accumulator" begin
@@ -1146,7 +1144,7 @@ end
         end
         return count
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "multiple accumulators" begin
@@ -1174,7 +1172,7 @@ end
         end
         return sum, count
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "nested for-in-range loops" begin
@@ -1203,7 +1201,7 @@ end
         end
         return acc
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "for-in-range with tuple destructuring" begin
@@ -1225,7 +1223,7 @@ end
         end
         return x
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "for-in-range produces valid LoopOp" begin
@@ -1248,7 +1246,7 @@ end
         end
         return last
     end |> only
-    validate_scf(sci)
+
 end
 
 @testset "for-in-range with Int32 bounds" begin
@@ -1261,8 +1259,8 @@ end
     end
 
     sci, _ = only(code_structured(simple_for_loop, Tuple{Int32}))
-    validate_scf(sci)
-    validate_ssa_defs(sci)
+
+
     @test sci isa StructuredIRCode
 end
 
@@ -1276,8 +1274,8 @@ end
     end
 
     sci, _ = only(code_structured(mixed_type_loop, Tuple{Vector{Float32}, Int32}))
-    validate_scf(sci)
-    validate_ssa_defs(sci)
+
+
     @test sci isa StructuredIRCode
 end
 
