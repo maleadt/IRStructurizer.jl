@@ -249,7 +249,7 @@ end
         x + 1
     end |> only
 
-    bad_ref = Instruction(999999, nothing, Nothing)
+    bad_ref = Instruction(999999, nothing, Nothing, Block())
     @test_throws KeyError insert_before!(sci.entry, bad_ref, Expr(:call, :x), Int)
 end
 
@@ -305,7 +305,7 @@ end
     @test found === sci.entry
 
     # Non-existent instruction returns nothing
-    @test findblock(sci, Instruction(999999, nothing, Nothing)) === nothing
+    @test findblock(sci, Instruction(999999, nothing, Nothing, Block())) === nothing
 end
 
 @testset "reachable_terminators(block)" begin
@@ -972,7 +972,7 @@ end  # loop carries
     @test resolve_call(block, Expr(:new, :Foo)) === nothing
 
     # Instruction overload
-    inst = Instruction(1, expr_call, Int)
+    inst = Instruction(1, expr_call, Int, Block())
     result3 = resolve_call(block, inst)
     @test result3 !== nothing
     @test first(result3) === Base.:+
@@ -1028,7 +1028,7 @@ end
     @test !iscall(Expr(:new, :Foo))
 
     # Instruction overloads
-    inst = Instruction(1, expr_call, Int)
+    inst = Instruction(1, expr_call, Int, Block())
     @test iscall(inst)
     @test callee(inst) == GlobalRef(Base, :+)
     @test length(callargs(inst)) == 2
@@ -1133,3 +1133,195 @@ end
 end
 
 end  # value_type(block, val)
+
+@testset "operands(op::ControlFlowOp)" begin
+
+@testset "IfOp" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            ops = operands(stmt(inst))
+            @test length(ops) == 1
+            @test ops[1] isa SSAValue  # the condition
+            break
+        end
+    end
+end
+
+@testset "ForOp" begin
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        s = 0
+        i = 1
+        while i <= n
+            s += i
+            i += 1
+        end
+        s
+    end |> only
+
+    found = false
+    walk(sci) do inst, block
+        if stmt(inst) isa ForOp
+            op = stmt(inst)
+            ops = operands(op)
+            # lower, upper, step, plus any init_values
+            @test length(ops) >= 3
+            found = true
+        end
+        :advance
+    end
+    @test found
+end
+
+@testset "WhileOp" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        while x > 0
+            x -= 1
+        end
+        x
+    end |> only
+
+    found = false
+    walk(sci) do inst, block
+        if stmt(inst) isa WhileOp
+            op = stmt(inst)
+            ops = operands(op)
+            # init_values only (WhileOp has no explicit bounds)
+            @test ops isa Vector
+            @test length(ops) == length(op.init_values)
+            # operands returns a copy, not a reference
+            @test ops !== op.init_values
+            found = true
+        end
+        :advance
+    end
+    @test found
+end
+
+@testset "LoopOp" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        while true
+            x -= 1
+            x <= 0 && break
+        end
+        x
+    end |> only
+
+    found = false
+    walk(sci) do inst, block
+        if stmt(inst) isa LoopOp
+            op = stmt(inst)
+            ops = operands(op)
+            @test ops isa Vector
+            @test length(ops) == length(op.init_values)
+            found = true
+        end
+        :advance
+    end
+    @test found
+end
+
+end  # operands(op::ControlFlowOp)
+
+@testset "operands(block, inst)" begin
+
+@testset "call expression" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    # Find a call instruction (first instruction may not be an Expr on all Julia versions)
+    found = false
+    for inst in instructions(sci.entry)
+        if iscall(inst)
+            ops = operands(sci.entry, inst)
+            @test ops isa Vector
+            @test !isempty(ops)
+            found = true
+            break
+        end
+    end
+    @test found
+end
+
+@testset "non-call statement" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    # Insert a non-Expr statement to test operands returns empty
+    inst = push!(sci.entry, 42, Int)
+    ops = operands(sci.entry, inst)
+    @test isempty(ops)
+end
+
+end  # operands(block, inst)
+
+@testset "def" begin
+
+@testset "basic lookup" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    # First instruction defines some SSAValue
+    inst1 = first(instructions(sci.entry))
+    result = def(sci, SSAValue(inst1.ssa_idx))
+    @test result !== nothing
+    @test result.ssa_idx == inst1.ssa_idx
+    @test block(result) === sci.entry
+end
+
+@testset "nested block" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    # Find an SSAValue defined inside a nested block (then/else region)
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            op = stmt(inst)
+            inner_inst = first(instructions(op.then_region))
+            result = def(sci, SSAValue(inner_inst.ssa_idx))
+            @test result !== nothing
+            @test result.ssa_idx == inner_inst.ssa_idx
+            @test block(result) === op.then_region
+            break
+        end
+    end
+end
+
+@testset "not found" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test def(sci, SSAValue(999999)) === nothing
+end
+
+@testset "defs" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x > 0 ? x + 1 : x - 1
+    end |> only
+
+    idx = defs(sci)
+
+    # All instructions are in the index
+    count = 0
+    walk(sci) do inst, blk
+        result = def(idx, SSAValue(inst.ssa_idx))
+        @test result !== nothing
+        @test result.ssa_idx == inst.ssa_idx
+        count += 1
+        :advance
+    end
+    @test count == length(idx.map)
+
+    # Missing SSAValue
+    @test def(idx, SSAValue(999999)) === nothing
+end
+
+end  # def
