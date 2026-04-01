@@ -946,6 +946,105 @@ end
     @test !isempty(if_ops)
 end
 
+@testset "loop exit through fallthrough (not GotoIfNot dest)" begin
+    # Regression test: find_loop_exit_condition only checked if GotoIfNot.dest
+    # exited the loop, but missed the case where the *fallthrough* path (cond=true)
+    # exits. This produced a LoopOp with no break — an infinite loop.
+    #
+    # The pattern occurs when the iterator protocol merges done/not-done paths
+    # into a phi block, and the GotoIfNot there branches to the body (in-loop)
+    # on false, while fallthrough exits on true. E.g., SynchArray iteration on 1.11.
+    #
+    # Synthetic IR:
+    #   Block 1: entry → 2
+    #   Block 2: header, phi(acc,idx), idx===n?, GotoIfNot → 4
+    #   Block 3: done path → 5
+    #   Block 4: not-done, next_idx = idx+1 → 5
+    #   Block 5: merge phis(next_idx, done_flag, body_idx),
+    #            GotoIfNot(done_flag, 7)
+    #            dest=7 IN loop, fallthrough=6 OUT → fallthrough exit
+    #   Block 6: return acc
+    #   Block 7: body, acc += body_idx*body_idx → 2
+
+    CC = Core.Compiler
+    nstmts = 17
+    stmts = CC.InstructionStream(nstmts)
+
+    @static if VERSION >= v"1.12-"
+        _set!(idx, s, t) = (stmts[idx][:stmt]=s; stmts[idx][:type]=t;
+            stmts[idx][:info]=CC.NoCallInfo(); stmts[idx][:line]=(Int32(0),Int32(0),Int32(0));
+            stmts[idx][:flag]=CC.IR_FLAGS_EFFECTS)
+    else
+        _set!(idx, s, t) = (CC.setindex!(stmts[idx], s, :stmt); CC.setindex!(stmts[idx], t, :type);
+            CC.setindex!(stmts[idx], CC.NoCallInfo(), :info); CC.setindex!(stmts[idx], Int32(0), :line);
+            CC.setindex!(stmts[idx], CC.IR_FLAGS_EFFECTS, :flag))
+    end
+
+    # Block 1: entry
+    _set!(1, GotoNode(2), Nothing)
+    # Block 2: loop header
+    _set!(2, PhiNode(Int32[1, 7], Any[0, SSAValue(16)]), Int)         # acc
+    _set!(3, PhiNode(Int32[1, 7], Any[1, SSAValue(9)]),  Int)         # idx
+    _set!(4, Expr(:call, GlobalRef(Base, :(===)), SSAValue(3), Core.Argument(2)), Bool)
+    _set!(5, GotoIfNot(SSAValue(4), 4), Nothing)                      # NOT done → 4
+    # Block 3: done → merge
+    _set!(6, GotoNode(5), Nothing)
+    # Block 4: not-done
+    _set!(7, Expr(:call, GlobalRef(Base, :add_int), SSAValue(3), 1), Int)
+    _set!(8, GotoNode(5), Nothing)
+    # Block 5: merge — exit through fallthrough
+    _set!(9,  PhiNode(Int32[4, 3], Any[SSAValue(7), 0]),   Int)       # next_idx
+    _set!(10, PhiNode(Int32[4, 3], Any[false, true]),       Bool)      # done_flag
+    _set!(11, PhiNode(Int32[4, 3], Any[SSAValue(7), 0]),    Int)       # body_idx
+    _set!(12, GotoIfNot(SSAValue(10), 7), Nothing)                     # NOT done → 7; done → fall to 6
+    # Block 6: exit
+    _set!(13, ReturnNode(SSAValue(2)), Nothing)
+    # Block 7: body
+    _set!(14, Expr(:call, GlobalRef(Base, :mul_int), SSAValue(11), SSAValue(11)), Int)
+    _set!(15, Expr(:call, GlobalRef(Base, :add_int), SSAValue(2), SSAValue(14)), Int)
+    _set!(16, SSAValue(15), Int)
+    _set!(17, GotoNode(2), Nothing)
+
+    cfg = CC.CFG(
+        [
+            CC.BasicBlock(CC.StmtRange(1, 1),    Int[],    [2]),
+            CC.BasicBlock(CC.StmtRange(2, 5),    [1, 7],   [3, 4]),
+            CC.BasicBlock(CC.StmtRange(6, 6),    [2],      [5]),
+            CC.BasicBlock(CC.StmtRange(7, 8),    [2],      [5]),
+            CC.BasicBlock(CC.StmtRange(9, 12),   [3, 4],   [6, 7]),
+            CC.BasicBlock(CC.StmtRange(13, 13),  [5],      Int[]),
+            CC.BasicBlock(CC.StmtRange(14, 17),  [5],      [2]),
+        ],
+        Int[1]
+    )
+
+    argtypes = Any[Nothing, Int]
+    @static if VERSION >= v"1.12-"
+        debuginfo = CC.DebugInfoStream(Int32[0 for _ in 1:nstmts])
+        ir = CC.IRCode(stmts, cfg, debuginfo, argtypes, Expr[], CC.VarState[])
+    else
+        ir = CC.IRCode(stmts, cfg, Core.LineInfoNode[], argtypes, Expr[], CC.VarState[])
+    end
+
+    sci = StructuredIRCode(ir)
+    validate_scf(sci)
+
+    # Must be a LoopOp (not ForOp — the multi-block header prevents ForOp detection)
+    loop_ops = filter(x -> x isa LoopOp, collect(statements(sci.entry.body)))
+    @test length(loop_ops) == 1
+
+    # The loop must have a break (via an IfOp with BreakOp in one branch)
+    function has_break(block::Block)
+        for (_, entry) in block.body
+            s = entry.stmt
+            s isa IfOp && (has_break(s.then_region) || has_break(s.else_region)) && return true
+            s isa LoopOp && has_break(s.body) && return true
+        end
+        return block.terminator isa BreakOp
+    end
+    @test has_break(loop_ops[1].body)
+end
+
 end  # regression
 
 #=============================================================================
