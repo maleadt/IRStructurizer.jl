@@ -61,6 +61,19 @@ Get or set the block's terminator (`ReturnNode`, `YieldOp`, `ContinueOp`, `Break
 
 Get the carried-value operands of a terminator. Provides uniform access regardless of terminator type (`.values` for `YieldOp`/`ContinueOp`/`BreakOp`, `.args` for `ConditionOp`).
 
+#### `operands(op::ControlFlowOp)` → `Vector{IRValue}`
+
+Get the values flowing into a control flow operation from the parent scope:
+
+- `IfOp` → `[condition]`
+- `ForOp` → `[lower, upper, step, init_values...]`
+- `WhileOp` → `copy(init_values)`
+- `LoopOp` → `copy(init_values)`
+
+#### `operands(block, inst)` → `Vector{Any}`
+
+Extract all value operands from an instruction's statement (Expr args).
+
 #### `arguments(block::Block)` → `Vector{BlockArg}`
 
 Get the block arguments (loop-carried values, induction variables).
@@ -114,6 +127,25 @@ Get the raw function reference from a call expression without resolving `GlobalR
 #### `callargs(stmt_or_inst)` → `SubArray`
 
 Get the operand arguments of a call expression (excludes the function reference).
+
+### Definition Lookup
+
+#### `def(root, val::SSAValue)` → `Instruction` or `nothing`
+
+Find the instruction that defines an SSA value. The instruction's `block` field gives the containing block. Performs a linear scan — for repeated queries, use `defs(root)`.
+
+#### `defs(root)` / `def(idx, val::SSAValue)`
+
+Pre-built index for O(1) definition lookup. Analogous to `uses(block)` which returns a `UseIndex`.
+
+```julia
+idx = defs(sci)
+inst = def(idx, SSAValue(3))
+if inst !== nothing
+    stmt(inst)        # the statement
+    block(inst)       # the containing block
+end
+```
 
 ### Block Mutation
 

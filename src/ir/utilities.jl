@@ -16,7 +16,8 @@ public root, parent, walk_uses!, IndexedUseRef
 export insert_before!, insert_after!, eachblock, findblock,
        update_type!, new_block_arg!,
        resolve_call, iscall, callee, callargs,
-       reachable_terminators, walk, after_arg
+       reachable_terminators, walk, after_arg,
+       def, defs
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -60,7 +61,7 @@ function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ))
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 """
@@ -80,7 +81,7 @@ function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ))
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 """
@@ -159,7 +160,7 @@ function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @no
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ)
@@ -180,7 +181,7 @@ function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nos
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ)
@@ -206,7 +207,7 @@ function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospe
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 """
@@ -224,7 +225,7 @@ function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospec
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ)
+    return Instruction(idx, stmt, typ, block)
 end
 
 
@@ -1012,3 +1013,99 @@ end
 Convenience overload: extracts call arguments from the underlying statement.
 """
 callargs(inst::Instruction) = callargs(inst.stmt::Expr)
+
+
+#=============================================================================
+ Instruction operands
+=============================================================================#
+
+"""
+    operands(block::Block, inst::Instruction) -> Vector{Any}
+
+Extract data operands from an instruction's statement — the values the
+instruction consumes. Excludes the callee and type refs (use `callee()`
+or `callargs()` for call-specific access). Extensible via dispatch on
+the statement type for domain-specific IR nodes.
+"""
+operands(block::Block, inst::Instruction) = operands(block, inst.stmt)
+
+function operands(block::Block, @nospecialize(s))
+    s isa Expr || return Any[]
+    if s.head === :call
+        # args = [callee, arg1, arg2, ...] — skip callee
+        return collect(Any, @view s.args[2:end])
+    elseif s.head === :invoke
+        # args = [CodeInstance, callee, arg1, arg2, ...] — skip CI and callee
+        return collect(Any, @view s.args[3:end])
+    elseif s.head === :new
+        # args = [Type, field1, field2, ...] — skip type
+        return collect(Any, @view s.args[2:end])
+    elseif s.head === :splatnew
+        # args = [Type, tuple] — skip type
+        return collect(Any, @view s.args[2:end])
+    else
+        return collect(Any, s.args)
+    end
+end
+
+
+#=============================================================================
+ Definition lookup
+=============================================================================#
+
+"""
+    def(root, val::Core.SSAValue) -> Union{Instruction, Nothing}
+
+Find the instruction that defines `val`. Performs a linear scan over
+all blocks. The instruction's `block` field gives the containing block.
+For repeated queries, build an index via [`defs`](@ref) instead.
+"""
+function def(root::Union{Block, StructuredIRCode}, val::Core.SSAValue)
+    blk = root isa StructuredIRCode ? root.entry : root
+    target = val.id
+    for b in eachblock(blk)
+        for inst in instructions(b)
+            inst.ssa_idx == target && return inst
+        end
+    end
+    return nothing
+end
+
+"""
+    DefIndex
+
+Pre-built index mapping SSA indices to their defining `Instruction`.
+Build via `defs(root)`, query via `def(idx, val)`.
+Analogous to `UseIndex` / `uses(block)`.
+"""
+struct DefIndex
+    map::Dict{Int, Instruction}
+end
+
+"""
+    defs(root) -> DefIndex
+
+Build a definition index for all instructions in `root` (recursively).
+Returns a `DefIndex` that supports O(1) lookup via `def(idx, val)`.
+
+Analogous to `uses(block)` which returns a `UseIndex`.
+"""
+function defs(root::Union{Block, StructuredIRCode})
+    blk = root isa StructuredIRCode ? root.entry : root
+    map = Dict{Int, Instruction}()
+    for b in eachblock(blk)
+        for inst in instructions(b)
+            map[inst.ssa_idx] = inst
+        end
+    end
+    return DefIndex(map)
+end
+
+"""
+    def(idx::DefIndex, val::Core.SSAValue) -> Union{Instruction, Nothing}
+
+O(1) lookup of the instruction defining `val`.
+"""
+def(idx::DefIndex, val::Core.SSAValue) = get(idx.map, val.id, nothing)
+
+Base.haskey(idx::DefIndex, val::Core.SSAValue) = haskey(idx.map, val.id)

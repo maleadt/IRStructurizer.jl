@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt,
+export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, block,
        insert_before!, insert_after!, terminator, terminator!, operands
 
 #=============================================================================
@@ -56,18 +56,17 @@ const IRValue = Any
 """
     Instruction
 
-A convenience view over an SSAMap entry, bundling an SSA index with its statement
-and type. Yielded by `instructions(block)` and usable as a key in `UseIndex`.
+A view over an SSAMap entry, bundling an SSA index with its statement, type,
+and containing block. Yielded by `instructions(block)` and usable as a key
+in `UseIndex`.
 
-Unlike the structural IR elements (`SSAValue`, `BlockArgument`, `Argument`) which appear
-as operands in the IR, an `Instruction` is constructed on-the-fly during iteration
-and provides convenient access to all three aspects of a definition: its identity
-(`ssa_idx`), its statement (`stmt`), and its Julia type (`typ`).
+Analogous to MLIR's `Operation` which knows its parent `Block` via `getBlock()`.
 """
 struct Instruction
     ssa_idx::Int
     stmt::Any
     typ::Any
+    block::Any  # ::Block — untyped to avoid forward reference
 end
 
 """Get the Julia type of the instruction result."""
@@ -75,6 +74,9 @@ value_type(i::Instruction) = i.typ
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
 stmt(i::Instruction) = i.stmt
+
+"""Get the block containing this instruction."""
+block(i::Instruction) = i.block
 
 """Convert to SSAValue for use in operand positions."""
 Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)
@@ -239,6 +241,8 @@ operands(t::ConditionOp) = t.args
  Abstract Control Flow Type
 =============================================================================#
 
+# operands() for ControlFlowOps — defined after the types (below)
+
 """
     ControlFlowOp
 
@@ -310,19 +314,19 @@ need to interact with SSAMap directly.
 
 Analogous to LLVM.jl's `instructions(bb::BasicBlock)`.
 """
-instructions(block::Block) = InstructionIterator(block.body)
+instructions(b::Block) = InstructionIterator(b)
 
 struct InstructionIterator
-    body::SSAMap
+    block::Block
 end
 
-Base.length(it::InstructionIterator) = length(it.body)
+Base.length(it::InstructionIterator) = length(it.block.body)
 Base.eltype(::Type{InstructionIterator}) = Instruction
 
 function Base.iterate(it::InstructionIterator, state::Int=1)
-    m = it.body
+    m = it.block.body
     state > length(m.ssa_idxes) && return nothing
-    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state])
+    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state], it.block)
     return inst, state + 1
 end
 
@@ -470,6 +474,17 @@ blocks(op::ForOp) = (op.body,)
 blocks(op::WhileOp) = (op.before, op.after)
 blocks(op::LoopOp) = (op.body,)
 blocks(::ControlFlowOp) = ()
+
+"""
+    operands(op::ControlFlowOp) -> Vector{IRValue}
+
+Get the values flowing into a control flow operation from the parent scope.
+For loops, this includes bounds and init values. For IfOp, this is the condition.
+"""
+operands(op::IfOp)    = Any[op.condition]
+operands(op::ForOp)   = Any[op.lower, op.upper, op.step, op.init_values...]
+operands(op::WhileOp) = copy(op.init_values)
+operands(op::LoopOp)  = copy(op.init_values)
 
 #=============================================================================
  StructuredIRCode - the structured IR for a function
