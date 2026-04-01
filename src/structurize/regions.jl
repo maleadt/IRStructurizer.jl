@@ -581,15 +581,24 @@ function handle_proper_region!(block::Block, tree::ControlTree, ir::IRCode,
     phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
     emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx)
 
-    # If merge block is inside the region, process its non-phi statements here
+    # If merge block is inside the region, process its content here.
+    # When the merge block is the root of a control tree subtree (e.g., a
+    # TERMINATION region with further if/return chains), we must process
+    # the full subtree — not just the raw statements — to preserve the
+    # downstream control flow.
     if merge_is_internal
-        merge_bb = ir.cfg.blocks[merge_idx]
-        for si in first(merge_bb.stmts):last(merge_bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa ReturnNode
-                block.terminator = stmt
-            elseif !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot)
-                push!(block, si, stmt, ir.stmts.type[si])
+        merge_subtree = get(subtree_map, merge_idx, nothing)
+        if merge_subtree !== nothing
+            handle_nested_region!(block, merge_subtree, ir, ctx)
+        else
+            merge_bb = ir.cfg.blocks[merge_idx]
+            for si in first(merge_bb.stmts):last(merge_bb.stmts)
+                stmt = ir.stmts.stmt[si]
+                if stmt isa ReturnNode
+                    block.terminator = stmt
+                elseif !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot)
+                    push!(block, si, stmt, ir.stmts.type[si])
+                end
             end
         end
     end

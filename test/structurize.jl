@@ -1045,6 +1045,27 @@ end
     @test has_break(loop_ops[1].body)
 end
 
+@testset "proper region merge block with downstream control flow" begin
+    # When a proper region's merge block has further control flow (e.g., if/return),
+    # the structurizer must process the merge block's subtree — not just its raw
+    # statements. Regression: mod(::Float64, ::Float64) lost the final if/return
+    # because handle_proper_region! only emitted raw merge-block statements.
+    sci, _ = code_structured(mod, Tuple{Float64, Float64}) |> only
+
+    # Count ReturnNodes recursively — every branch must reach one
+    function count_returns(blk::Block)
+        n = blk.terminator isa Core.ReturnNode ? 1 : 0
+        for (_, entry) in blk.body
+            if entry.stmt isa IfOp
+                n += count_returns(entry.stmt.then_region)
+                n += count_returns(entry.stmt.else_region)
+            end
+        end
+        return n
+    end
+    @test count_returns(sci.entry) >= 3
+end
+
 end  # regression
 
 #=============================================================================
