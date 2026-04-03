@@ -8,9 +8,6 @@ using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
                      widenconst
 using Base: code_ircode
 
-# CFG analysis
-include("cfg.jl")
-
 # structured IR definitions
 include("ir/types.jl")
 include("ir/show.jl")
