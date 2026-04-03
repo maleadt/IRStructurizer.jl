@@ -566,12 +566,11 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     sci = StructuredIRCode(argtypes, sptypes, entry, n, 0)
 
     if structurize && n > 0
-        ctx = StructurizationContext(types, n + 1, 1)
-        ctree = ControlTree(ir)
-        sci.entry = control_tree_to_structured_ir(ctree, ir, ctx)
-        ctx.next_value_idx = rebuildssa!(sci.entry, ctx.next_value_idx)
-        sci.max_ssa_idx = ctx.next_value_idx - 1
-        sci.max_arg_idx = ctx.next_arg_idx - 1
+        entry, max_ssa, max_arg = IRStructurizer.structurize(ir)
+        max_ssa = rebuildssa!(entry, max_ssa + 1) - 1
+        sci.entry = entry
+        sci.max_ssa_idx = max_ssa
+        sci.max_arg_idx = max_arg
     end
 
     # Entry block's parent is the SCI (sub-blocks get parents via push!)

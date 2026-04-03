@@ -8,22 +8,18 @@ using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
                      widenconst
 using Base: code_ircode
 
-# auxiliary data structures and analyses
-include("graph.jl")
+# CFG analysis
 include("cfg.jl")
-
-# control tree construction
-include("control_tree.jl")
 
 # structured IR definitions
 include("ir/types.jl")
 include("ir/show.jl")
 
-# control tree to structured IR
+# substitution machinery (phi refs → block args)
 include("structurize/substitutions.jl")
-include("structurize/helpers.jl")
-include("structurize/regions.jl")
-include("structurize/loops.jl")
+
+# structurization: IRCode → StructuredIRCode
+include("structurize.jl")
 
 # IR utilities & validation
 include("ir/utilities.jl")
