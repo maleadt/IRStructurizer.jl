@@ -59,14 +59,14 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
     # Create BlockArguments and apply substitutions immediately
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        id = (ctx.next_ssa_idx += 1)
+        id = alloc_arg_id!(ctx)
         arg = BlockArgument(id, phi_type)
         push!(before.args, arg)
         push!(after.args, BlockArgument(id, phi_type))
         subs[phi_idx] = arg
     end
-    apply_substitutions!(before, subs)
-    apply_substitutions!(after, subs)
+    apply_substitutions!(before, subs, ctx)
+    apply_substitutions!(after, subs, ctx)
 
     while_op = WhileOp(before, after, init_values)
     return while_op, phi_indices, phi_types
@@ -197,7 +197,7 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     n_header_phis = length(phi_indices)
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
-        id = (ctx.next_ssa_idx += 1)
+        id = alloc_arg_id!(ctx)
         arg = BlockArgument(id, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
@@ -236,7 +236,7 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
         body.terminator = ContinueOp(copy(carried_values))
     end
 
-    apply_substitutions!(body, subs)
+    apply_substitutions!(body, subs, ctx)
 
     loop_op = LoopOp(body, init_values)
 
@@ -312,7 +312,7 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     iv_type = types[iv_phi_idx]
 
     # Create BlockArgument for IV (first in ForOp's block args)
-    iv_arg = BlockArgument((ctx.next_ssa_idx += 1), iv_type)
+    iv_arg = BlockArgument(alloc_arg_id!(ctx), iv_type)
 
     # Build the body block
     body = Block()
@@ -356,7 +356,7 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     subs = Substitutions()
     subs[iv_phi_idx] = iv_arg  # IV at index 1
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
-        id = (ctx.next_ssa_idx += 1)
+        id = alloc_arg_id!(ctx)
         arg = BlockArgument(id, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
@@ -375,15 +375,15 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
 
     # Normalize inclusive bounds (e.g., `while j <= n`) to exclusive (upper + 1)
     if for_info.is_inclusive
-        adj_ssa_idx = ctx.next_ssa_idx
-        ctx.next_ssa_idx += 1
+        adj_ssa_idx = ctx.next_value_idx
+        ctx.next_value_idx += 1
         upper_type = get_value_type(for_info.upper, ir)
         add_int_expr = Expr(:call, GlobalRef(Base, :add_int), upper, one(upper_type))
         push!(block, adj_ssa_idx, add_int_expr, upper_type)
         upper = SSAValue(adj_ssa_idx)
     end
 
-    apply_substitutions!(body, subs)
+    apply_substitutions!(body, subs, ctx)
 
     for_op = ForOp(lower, upper, step, iv_arg, body, init_values)
 

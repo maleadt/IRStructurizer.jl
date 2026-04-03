@@ -526,7 +526,11 @@ mutable struct StructuredIRCode
     const sptypes::Vector{Any}
     entry::Block
     max_ssa_idx::Int
+    max_arg_idx::Int
 end
+
+StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
+    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0)
 
 """
     StructuredIRCode(ir::IRCode; structurize=true, validate=true)
@@ -559,14 +563,15 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         end
     end
 
-    sci = StructuredIRCode(argtypes, sptypes, entry, n)
+    sci = StructuredIRCode(argtypes, sptypes, entry, n, 0)
 
     if structurize && n > 0
-        ctx = StructurizationContext(types, n + 1)
+        ctx = StructurizationContext(types, n + 1, 1)
         ctree = ControlTree(ir)
         sci.entry = control_tree_to_structured_ir(ctree, ir, ctx)
-        ctx.next_ssa_idx = rebuildssa!(sci.entry, ctx.next_ssa_idx)
-        sci.max_ssa_idx = ctx.next_ssa_idx - 1
+        ctx.next_value_idx = rebuildssa!(sci.entry, ctx.next_value_idx)
+        sci.max_ssa_idx = ctx.next_value_idx - 1
+        sci.max_arg_idx = ctx.next_arg_idx - 1
     end
 
     # Entry block's parent is the SCI (sub-blocks get parents via push!)

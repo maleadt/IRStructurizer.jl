@@ -124,8 +124,8 @@ repeating the IfOp allocation / getfield pattern.
 """
 function emit_ifop_result!(block::Block, if_op::IfOp, phi_ssa_indices::Vector{Int},
                             phi_types::Vector{Any}, ctx::StructurizationContext)
-    if_result_idx = ctx.next_ssa_idx
-    ctx.next_ssa_idx += 1
+    if_result_idx = ctx.next_value_idx
+    ctx.next_value_idx += 1
 
     if !isempty(phi_ssa_indices)
         result_type = Tuple{phi_types...}
@@ -327,7 +327,7 @@ function pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_in
     for (j, ex) in enumerate(extra_exits)
         push!(init_values, Undef(ex.type))
         push!(carried_values, ex.value)
-        id = (ctx.next_ssa_idx += 1)
+        id = alloc_arg_id!(ctx)
         push!(body.args, BlockArgument(id, ex.type))
     end
     for ex in extra_exits
@@ -467,8 +467,8 @@ function handle_loop!(block::Block, tree::ControlTree, ir::IRCode,
     end
 
     # Allocate new SSA index for loop's tuple result
-    loop_result_idx = ctx.next_ssa_idx
-    ctx.next_ssa_idx += 1
+    loop_result_idx = ctx.next_value_idx
+    ctx.next_value_idx += 1
 
     # Always use Tuple type for loop results (uniform handling in codegen)
     # Empty phi_indices produces Tuple{} which is fine
@@ -761,8 +761,8 @@ function build_proper_branch!(branch_blk::Block, target::Union{Int,Nothing},
             phi_types = Any[ctx.ssavaluetypes[phi.ssa_idx] for phi in merge_phis]
             gf_indices = Int[]
             for _ in merge_phis
-                push!(gf_indices, ctx.next_ssa_idx)
-                ctx.next_ssa_idx += 1
+                push!(gf_indices, ctx.next_value_idx)
+                ctx.next_value_idx += 1
             end
             emit_ifop_result!(branch_blk, inner_if, gf_indices, phi_types, ctx)
             branch_blk.terminator = if !isempty(gf_indices)
