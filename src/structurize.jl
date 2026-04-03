@@ -19,17 +19,34 @@ mutable struct StructurizeCtx
     next_ssa::Int
     next_arg::Int
     types::Vector{Any}
+    ssa_remap::Dict{Int, Int}   # original → fresh (for inner defs)
 end
 
 function StructurizeCtx(ir::IRCode)
     domtree = construct_domtree(ir)
     loops = compute_natural_loops(ir, domtree)
     n = length(ir.stmts.stmt)
-    StructurizeCtx(ir, domtree, loops, n + 1, 1, copy(ir.stmts.type))
+    StructurizeCtx(ir, domtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}())
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
 alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
+
+"""Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""
+function remap_stmt(@nospecialize(stmt), remap::Dict{Int, Int})
+    isempty(remap) && return stmt
+    if stmt isa Expr
+        new_args = Any[remap_ssa_ref(a, remap) for a in stmt.args]
+        return Expr(stmt.head, new_args...)
+    elseif stmt isa PiNode
+        return PiNode(remap_ssa_ref(stmt.val, remap), stmt.typ)
+    else
+        return stmt
+    end
+end
+
+remap_ssa_ref(@nospecialize(val), remap::Dict{Int, Int}) =
+    val isa SSAValue ? SSAValue(get(remap, val.id, val.id)) : val
 
 #=============================================================================
  Natural Loop Detection
@@ -198,7 +215,12 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
         term = find_terminator(ir, current)
 
         if term isa ReturnNode
-            block.terminator = term
+            if !isempty(ctx.ssa_remap) && isdefined(term, :val)
+                val = remap_ssa_ref(term.val, ctx.ssa_remap)
+                block.terminator = val === term.val ? term : ReturnNode(val)
+            else
+                block.terminator = term
+            end
             return block
         elseif term isa GotoNode
             current = resolve_dest(term.label, region_blocks, loop_ctx, block)
@@ -252,12 +274,15 @@ end
 """Emit non-phi, non-terminator statements from a basic block."""
 function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
     ir = ctx.ir
+    remap = ctx.ssa_remap
     bb = ir.cfg.blocks[bb_idx]
     for si in first(bb.stmts):last(bb.stmts)
         stmt = ir.stmts.stmt[si]
         (stmt isa PhiNode || stmt isa GotoNode ||
          stmt isa GotoIfNot || stmt isa ReturnNode) && continue
-        push!(block, si, stmt, ir.stmts.type[si])
+        idx = get(remap, si, si)
+        stmt = remap_stmt(stmt, remap)
+        push!(block, idx, stmt, ir.stmts.type[si])
     end
 end
 
@@ -291,7 +316,7 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # GotoIfNot: cond=false → dest, cond=true → fallthrough
     false_dest = gotoifnot.dest
     true_dest = current + 1
-    cond = gotoifnot.cond
+    cond = remap_ssa_ref(gotoifnot.cond, ctx.ssa_remap)
 
     # Determine branch regions and merge block using dominance
     then_blocks, else_blocks, merge = find_branch_regions(
@@ -376,11 +401,20 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         if_op = IfOp(cond, then_blk, else_blk)
 
         if outer_merge_phis !== nothing && !isempty(outer_merge_phis)
-            # Create IfOp result with getfields, then yield them upward
-            phi_indices = [p.ssa_idx for p in outer_merge_phis]
+            # Use fresh indices for getfields — these are intermediate values
+            # fed to YieldOp, not final definitions. The outermost emit_ifop_result!
+            # (in the merge case) keeps the original phi indices.
             phi_types = [ctx.types[p.ssa_idx] for p in outer_merge_phis]
-            emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx)
-            block.terminator = YieldOp(IRValue[SSAValue(idx) for idx in phi_indices])
+            if_ssa = alloc_ssa!(ctx)
+            result_type = Tuple{phi_types...}
+            push!(block, if_ssa, if_op, result_type)
+            yield_values = IRValue[]
+            for (i, phi_type) in enumerate(phi_types)
+                fresh = alloc_ssa!(ctx)
+                push!(block, fresh, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
+                push!(yield_values, SSAValue(fresh))
+            end
+            block.terminator = YieldOp(yield_values)
         else
             push!(block, alloc_ssa!(ctx), if_op, Nothing)
         end
@@ -480,11 +514,12 @@ end
 function make_yield_for_edge(ir::IRCode, merge_phis::Vector{MergePhiInfo},
                               pred::Int, blk::Block, ctx::StructurizeCtx)
     yield_values = IRValue[]
+    remap = ctx.ssa_remap
     for phi in merge_phis
         val = get(phi.edge_values, pred, nothing)
         if val !== nothing
-            # Check if the block already defines this SSA (from inner IfOp getfield)
-            resolved = resolve_yield_value(blk, phi.ssa_idx, val)
+            val = remap_ssa_ref(val, remap)
+            resolved = resolve_yield_value(blk, phi.ssa_idx, val, remap)
             push!(yield_values, resolved)
         else
             push!(yield_values, Undef(ctx.types[phi.ssa_idx]))
@@ -502,11 +537,13 @@ function make_exit_yield(ir::IRCode, merge_phis::Vector{MergePhiInfo},
 end
 
 """
-If the block already defines `phi_ssa_idx` (e.g., via an inner IfOp's getfield),
-yield SSAValue(phi_ssa_idx). Otherwise yield `default_val`.
+If the block already defines `phi_ssa_idx` (or its remapped index), yield that SSAValue.
+Otherwise yield `default_val`.
 """
-function resolve_yield_value(blk::Block, phi_ssa_idx::Int, default_val)
-    haskey(blk.body, phi_ssa_idx) ? SSAValue(phi_ssa_idx) : default_val
+function resolve_yield_value(blk::Block, phi_ssa_idx::Int, default_val,
+                              remap::Dict{Int, Int}=Dict{Int,Int}())
+    idx = get(remap, phi_ssa_idx, phi_ssa_idx)
+    haskey(blk.body, idx) ? SSAValue(idx) : default_val
 end
 
 #=============================================================================
@@ -680,11 +717,13 @@ end
 function emit_ifop_result!(block::Block, if_op::IfOp, phi_indices::Vector{Int},
                             phi_types::AbstractVector, ctx::StructurizeCtx)
     if_ssa = alloc_ssa!(ctx)
+    remap = ctx.ssa_remap
     if !isempty(phi_indices)
         result_type = Tuple{phi_types...}
         push!(block, if_ssa, if_op, result_type)
         for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-            push!(block, phi_idx, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
+            idx = get(remap, phi_idx, phi_idx)
+            push!(block, idx, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
         end
     else
         push!(block, if_ssa, if_op, Tuple{})
@@ -736,17 +775,36 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         subs[phi.ssa_idx] = arg
     end
 
+    # Save remap state and add extra-exit remappings for the loop body.
+    # Inner defs get fresh indices; outer getfields keep the originals.
+    saved_remap = copy(ctx.ssa_remap)
     for ex in extra_exits
+        fresh = alloc_ssa!(ctx)
+        ctx.ssa_remap[ex.ssa_idx] = fresh
         push!(init_values, Undef(ex.type))
-        push!(carried_values, ex.value)
-        push!(phi_indices, ex.ssa_idx)
+        push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
+        push!(phi_indices, ex.ssa_idx)           # getfield OUTSIDE uses original
         push!(phi_types, ex.type)
         arg = BlockArgument(alloc_arg!(ctx), ex.type)
         push!(body.args, arg)
     end
 
+    # Remap header phi carried values that reference extra exit SSAs
+    if !isempty(ctx.ssa_remap)
+        n_header = length(phi_info)
+        for i in 1:n_header
+            v = carried_values[i]
+            if v isa SSAValue
+                carried_values[i] = SSAValue(get(ctx.ssa_remap, v.id, v.id))
+            end
+        end
+    end
+
     # 5. Build loop body
     build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
+
+    # Restore remap (scoped to loop body)
+    ctx.ssa_remap = saved_remap
 
     # 6. Apply phi→arg substitutions
     apply_substitutions!(body, subs, ctx)
@@ -865,6 +923,7 @@ function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int
                         loop_val = stmt.values[edge_idx]
                         gf_idx = loop_val isa SSAValue ? loop_val.id : si
                         gf_idx ∈ seen && continue
+                        gf_idx ∈ already_exported && continue  # already a header phi
                         push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
                         push!(seen, gf_idx)
                     end

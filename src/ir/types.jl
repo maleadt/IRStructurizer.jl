@@ -579,7 +579,6 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
 
     if structurize && n > 0
         entry, max_ssa, max_arg = IRStructurizer.structurize(ir)
-        max_ssa = rebuildssa!(entry, max_ssa + 1) - 1
         sci.entry = entry
         sci.max_ssa_idx = max_ssa
         sci.max_arg_idx = max_arg
