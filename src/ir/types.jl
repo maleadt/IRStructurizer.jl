@@ -498,6 +498,18 @@ blocks(op::WhileOp) = (op.before, op.after)
 blocks(op::LoopOp) = (op.body,)
 blocks(::ControlFlowOp) = ()
 
+"""Recursively fix parent pointers for all sub-blocks."""
+function fix_parents!(block::Block)
+    for (_, entry) in block.body
+        if entry.stmt isa ControlFlowOp
+            for b in blocks(entry.stmt)
+                b.parent = block
+                fix_parents!(b)
+            end
+        end
+    end
+end
+
 """
     operands(op::ControlFlowOp) -> Vector{IRValue}
 
@@ -573,8 +585,11 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         sci.max_arg_idx = max_arg
     end
 
-    # Entry block's parent is the SCI (sub-blocks get parents via push!)
+    # Set parent chain: entry → SCI, sub-blocks → containing block.
+    # Must be done after structurize+promote since promote_loops! replaces
+    # block.body without going through push! (which normally sets parents).
     sci.entry.parent = sci
+    fix_parents!(sci.entry)
 
     if validate
         validate_scf(sci.entry)
