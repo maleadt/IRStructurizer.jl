@@ -20,6 +20,7 @@ include("structurize/substitutions.jl")
 
 # structurization: IRCode → StructuredIRCode
 include("structurize.jl")
+include("structurize/promote.jl")
 
 # IR utilities & validation
 include("ir/utilities.jl")
