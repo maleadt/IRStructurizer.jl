@@ -144,8 +144,8 @@ Add a new BlockArgument to a block, allocating a fresh ID from the root Structur
 """
 function new_block_arg!(block::Block, @nospecialize(typ))
     sci = root(block)
-    sci.max_ssa_idx += 1
-    arg = BlockArgument(sci.max_ssa_idx, typ)
+    sci.max_arg_idx += 1
+    arg = BlockArgument(sci.max_arg_idx, typ)
     push!(block.args, arg)
     return arg
 end
@@ -520,7 +520,7 @@ function _references(@nospecialize(stmt), @nospecialize(target))
 end
 
 """
-    rebuildssa!(root::Block, next_ssa_idx::Int) -> Int
+    rebuildssa!(root::Block, next_value_idx::Int) -> Int
 
 Post-hoc SSA fixup, modelled after LLVM's `StructurizeCFG::rebuildSSA()`.
 Finds SSA indices defined in multiple blocks and renames inner (duplicate) defs
@@ -531,7 +531,7 @@ don't interfere with outer ones.
 
 Returns the updated next available SSA index.
 """
-function rebuildssa!(root::Block, next_ssa_idx::Int)
+function rebuildssa!(root::Block, next_value_idx::Int)
     # Collect all defs as (ssa_idx → [(block, position)]) in top-down traversal order.
     defs = Dict{Int, Vector{Tuple{Block, Int}}}()
     for block in eachblock(root)
@@ -547,9 +547,9 @@ function rebuildssa!(root::Block, next_ssa_idx::Int)
         length(locs) <= 1 && continue
         for i in length(locs):-1:2
             blk, pos = locs[i]
-            blk.body.ssa_idxes[pos] = next_ssa_idx
-            push!(get!(Vector{Pair{Int, Int}}, block_replacements, blk), idx => next_ssa_idx)
-            next_ssa_idx += 1
+            blk.body.ssa_idxes[pos] = next_value_idx
+            push!(get!(Vector{Pair{Int, Int}}, block_replacements, blk), idx => next_value_idx)
+            next_value_idx += 1
         end
     end
     for (blk, repls) in block_replacements
@@ -563,7 +563,7 @@ function rebuildssa!(root::Block, next_ssa_idx::Int)
         end
     end
 
-    return next_ssa_idx
+    return next_value_idx
 end
 
 

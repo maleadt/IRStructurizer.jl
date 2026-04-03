@@ -9,12 +9,16 @@
 
 Context for IR construction. Holds metadata that shouldn't be part of the IR node types:
 - ssavaluetypes: Julia types for each SSA value (from CodeInfo)
-- next_ssa_idx: Next available SSA index for synthesized values (e.g., loop tuples)
+- next_value_idx: Next available SSA index for synthesized values (e.g., loop tuples)
+- next_arg_idx: Next available BlockArgument ID (separate namespace from SSA values)
 """
 mutable struct StructurizationContext
     ssavaluetypes::Any  # Vector of types (from CodeInfo.ssavaluetypes)
-    next_ssa_idx::Int   # Next available SSA index for synthesized values
+    next_value_idx::Int # Next available SSA index for synthesized values
+    next_arg_idx::Int   # Next available BlockArgument ID
 end
+
+alloc_arg_id!(ctx::StructurizationContext) = (id = ctx.next_arg_idx; ctx.next_arg_idx += 1; id)
 
 #=============================================================================
  SSA Substitution (phi refs → block args)
@@ -70,13 +74,13 @@ Apply SSA substitutions within a block. Does not recurse into control flow regio
 Each control flow op's entry values (condition, init_values) are substituted,
 but the nested regions are handled by process_block_args! dispatch.
 """
-function apply_substitutions!(block::Block, subs::Substitutions)
+function apply_substitutions!(block::Block, subs::Substitutions, ctx::StructurizationContext)
     isempty(subs) && return
 
     new_body = SSAMap()
     for (idx, entry) in block.body
         if entry.stmt isa ControlFlowOp
-            apply_substitutions!(entry.stmt, subs)
+            apply_substitutions!(entry.stmt, subs, ctx)
             push!(new_body, (idx, entry.stmt, entry.typ))
         else
             new_expr = substitute_ssa(entry.stmt, subs)
@@ -90,13 +94,13 @@ function apply_substitutions!(block::Block, subs::Substitutions)
     end
 end
 
-function apply_substitutions!(op::IfOp, subs::Substitutions)
+function apply_substitutions!(op::IfOp, subs::Substitutions, ctx::StructurizationContext)
     op.condition = substitute_ssa(op.condition, subs)
-    apply_substitutions!(op.then_region, subs)
-    apply_substitutions!(op.else_region, subs)
+    apply_substitutions!(op.then_region, subs, ctx)
+    apply_substitutions!(op.else_region, subs, ctx)
 end
 
-function apply_substitutions!(op::ForOp, subs::Substitutions)
+function apply_substitutions!(op::ForOp, subs::Substitutions, ctx::StructurizationContext)
     # Substitute bounds and init_values (evaluated in outer scope)
     op.lower = substitute_ssa(op.lower, subs)
     op.upper = substitute_ssa(op.upper, subs)
@@ -106,12 +110,10 @@ function apply_substitutions!(op::ForOp, subs::Substitutions)
     end
 
     # Thread outer BlockArguments through inner loop as invariant carries.
-    # Without this, an outer BlockArgument(1) collides with the inner loop's own BlockArgument(1) (its IV).
     isempty(subs) && return
     inner_subs = Substitutions()
     for (ssa_idx, outer_arg) in subs
-        next_id = isempty(op.body.args) ? 2 : maximum(a.id for a in op.body.args) + 1
-        inner_arg = BlockArgument(next_id, outer_arg.type)
+        inner_arg = BlockArgument(alloc_arg_id!(ctx), outer_arg.type)
         push!(op.body.args, inner_arg)
         push!(op.init_values, outer_arg)
         if op.body.terminator isa ContinueOp
@@ -119,10 +121,10 @@ function apply_substitutions!(op::ForOp, subs::Substitutions)
         end
         inner_subs[ssa_idx] = inner_arg
     end
-    apply_substitutions!(op.body, inner_subs)
+    apply_substitutions!(op.body, inner_subs, ctx)
 end
 
-function apply_substitutions!(op::LoopOp, subs::Substitutions)
+function apply_substitutions!(op::LoopOp, subs::Substitutions, ctx::StructurizationContext)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
@@ -130,14 +132,13 @@ function apply_substitutions!(op::LoopOp, subs::Substitutions)
     isempty(subs) && return
     inner_subs = Substitutions()
     for (ssa_idx, outer_arg) in subs
-        next_id = isempty(op.body.args) ? 1 : maximum(a.id for a in op.body.args) + 1
-        inner_arg = BlockArgument(next_id, outer_arg.type)
+        inner_arg = BlockArgument(alloc_arg_id!(ctx), outer_arg.type)
         push!(op.body.args, inner_arg)
         push!(op.init_values, outer_arg)
         _thread_loop_carry!(op.body, inner_arg)
         inner_subs[ssa_idx] = inner_arg
     end
-    apply_substitutions!(op.body, inner_subs)
+    apply_substitutions!(op.body, inner_subs, ctx)
 end
 
 """
@@ -160,7 +161,7 @@ function _thread_loop_carry!(block::Block, inner_arg::BlockArgument)
     end
 end
 
-function apply_substitutions!(op::WhileOp, subs::Substitutions)
+function apply_substitutions!(op::WhileOp, subs::Substitutions, ctx::StructurizationContext)
     for (j, v) in enumerate(op.init_values)
         op.init_values[j] = substitute_ssa(v, subs)
     end
@@ -170,8 +171,7 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
     after_subs = Substitutions()
     for (ssa_idx, outer_arg) in subs
         # before region
-        next_before_id = isempty(op.before.args) ? 1 : maximum(a.id for a in op.before.args) + 1
-        before_arg = BlockArgument(next_before_id, outer_arg.type)
+        before_arg = BlockArgument(alloc_arg_id!(ctx), outer_arg.type)
         push!(op.before.args, before_arg)
         push!(op.init_values, outer_arg)
         if op.before.terminator isa ConditionOp
@@ -179,8 +179,7 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
         end
 
         # after region
-        next_after_id = isempty(op.after.args) ? 1 : maximum(a.id for a in op.after.args) + 1
-        after_arg = BlockArgument(next_after_id, outer_arg.type)
+        after_arg = BlockArgument(alloc_arg_id!(ctx), outer_arg.type)
         push!(op.after.args, after_arg)
         if op.after.terminator isa YieldOp
             push!(op.after.terminator.values, after_arg)
@@ -189,8 +188,8 @@ function apply_substitutions!(op::WhileOp, subs::Substitutions)
         before_subs[ssa_idx] = before_arg
         after_subs[ssa_idx] = after_arg
     end
-    apply_substitutions!(op.before, before_subs)
-    apply_substitutions!(op.after, after_subs)
+    apply_substitutions!(op.before, before_subs, ctx)
+    apply_substitutions!(op.after, after_subs, ctx)
 end
 
 
