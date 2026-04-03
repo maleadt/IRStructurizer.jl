@@ -207,7 +207,7 @@ end
             i = 0
             acc = 0
             @check "add_int(_2, 1)::Int64"
-            @check "for %arg1 = 0:1:%{{.*}}"
+            @check "for %arg{{[0-9]+}} = 0:1:%{{.*}}"
             while i <= n
                 acc += i
                 i += 1
@@ -819,7 +819,7 @@ end
     # Header phi (acc) should be body.args[1]; extra exits follow.
     @test length(inner_for.body.args) == length(inner_for.init_values)
     @test length(inner_for.body.args) >= 1
-    @test inner_for.body.args[1].id == 2  # id 1 = IV, id 2 = first non-IV arg
+    @test inner_for.body.args[1].id != inner_for.iv_arg.id  # first non-IV arg has different ID from IV
 end
 
 @testset "extra exit values don't collide with loop body defs" begin
@@ -1310,3 +1310,29 @@ end
 end
 
 end  # Julia for-in-range integration
+
+@testset "BlockArgument uniqueness across sibling loops" begin
+    # Sequential for-in-range loops produce sibling LoopOps (wrapped in IfOps).
+    # Each loop's block args must have globally unique IDs so they don't collide
+    # when used as dictionary keys (e.g., in DCE dependency graphs).
+    sci, _ = code_structured(Tuple{Int32}) do n::Int32
+        acc = Int32(0)
+        for i in Int32(1):n
+            acc += i
+        end
+        result = Int32(0)
+        for j in Int32(1):n
+            result += acc
+        end
+        return result
+    end |> only
+
+    # Collect all BlockArguments from all blocks
+    all_args = BlockArgument[]
+    for blk in eachblock(sci)
+        append!(all_args, arguments(blk))
+    end
+
+    # All block args must be unique (no two equal values)
+    @test length(all_args) == length(unique(all_args))
+end
