@@ -259,7 +259,24 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # If merge exists and is in region, extract its phis.
     # Skip phis at loop headers — those are loop-carried values, not branch merge values.
     merge_phis = if merge !== nothing && merge ∈ region_blocks && !haskey(ctx.loop_map, merge)
-        extract_merge_phis(ir, merge, region_blocks)
+        phis = extract_merge_phis(ir, merge, region_blocks)
+        # If merge has no phis, check its successors for phis
+        # (handles pass-through merge blocks like in || patterns)
+        if isempty(phis)
+            for succ in ir.cfg.blocks[merge].succs
+                if succ ∈ region_blocks && !haskey(ctx.loop_map, succ)
+                    succ_phis = extract_merge_phis(ir, succ, region_blocks)
+                    if !isempty(succ_phis)
+                        # Absorb the pass-through block into the branch regions
+                        # and use the successor as the real merge
+                        merge = succ
+                        phis = succ_phis
+                        break
+                    end
+                end
+            end
+        end
+        isempty(phis) ? nothing : phis
     else
         nothing
     end
@@ -277,31 +294,14 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         structurize_region!(ctx, true_dest, then_blocks;
                              merge_phis=sub_merge_phis, loop_ctx=loop_ctx)
     else
-        b = Block()
-        # If dest is a loop boundary, set appropriate terminator
-        if loop_ctx !== nothing
-            if true_dest == loop_ctx.header
-                b.terminator = ContinueOp(copy(loop_ctx.carried_values))
-            elseif true_dest ∉ loop_ctx.loop_blocks
-                b.terminator = BreakOp(copy(loop_ctx.break_values))
-            end
-        end
-        b
+        make_empty_branch_block(true_dest, current, sub_merge_phis, loop_ctx, ir, ctx)
     end
 
     else_blk = if !isempty(else_blocks)
         structurize_region!(ctx, false_dest, else_blocks;
                              merge_phis=sub_merge_phis, loop_ctx=loop_ctx)
     else
-        b = Block()
-        if loop_ctx !== nothing
-            if false_dest == loop_ctx.header
-                b.terminator = ContinueOp(copy(loop_ctx.carried_values))
-            elseif false_dest ∉ loop_ctx.loop_blocks
-                b.terminator = BreakOp(copy(loop_ctx.break_values))
-            end
-        end
-        b
+        make_empty_branch_block(false_dest, current, sub_merge_phis, loop_ctx, ir, ctx)
     end
 
     if merge !== nothing && merge ∈ region_blocks && merge_phis !== nothing
@@ -320,6 +320,11 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         set_yield_if_needed!(else_blk)
         if_op = IfOp(cond, then_blk, else_blk)
         push!(block, alloc_ssa!(ctx), if_op, Tuple{})
+        # If merge is the loop header, both branches already handle the loop flow
+        # (break/continue inside). Don't continue walking at the header.
+        if loop_ctx !== nothing && merge == loop_ctx.header
+            return nothing
+        end
         return merge
     else
         # --- Both branches exit/diverge ---
@@ -357,6 +362,29 @@ end
 """Ensure a block has a terminator (YieldOp if nothing set)."""
 function set_yield_if_needed!(blk::Block)
     blk.terminator === nothing && (blk.terminator = YieldOp())
+end
+
+"""Create an empty branch block with appropriate terminator for its destination."""
+function make_empty_branch_block(dest::Int, from::Int,
+                                  merge_phis::Union{Nothing, Vector{MergePhiInfo}},
+                                  loop_ctx::Union{Nothing, LoopCtx},
+                                  ir::IRCode, ctx::StructurizeCtx)
+    b = Block()
+    # Loop boundary?
+    if loop_ctx !== nothing
+        if dest == loop_ctx.header
+            b.terminator = ContinueOp(copy(loop_ctx.carried_values))
+            return b
+        elseif dest ∉ loop_ctx.loop_blocks
+            b.terminator = BreakOp(copy(loop_ctx.break_values))
+            return b
+        end
+    end
+    # Merge phis? Set yield for this edge.
+    if merge_phis !== nothing && !isempty(merge_phis)
+        b.terminator = make_yield_for_edge(ir, merge_phis, from, b, ctx)
+    end
+    return b
 end
 
 """Find the block in `blocks` (or `fallback`) that is a predecessor of merge phis."""
@@ -469,10 +497,23 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
         push!(candidates, false_dest)
     end
 
-    for c in sort!(collect(candidates))
-        if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
+    # Prefer non-loop-header candidates: when a branch guards a loop entry,
+    # the real merge is past the loop exit, not the loop header itself.
+    sorted = sort!(collect(candidates))
+    for c in sorted
+        if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks &&
+           !haskey(ctx.loop_map, c)
             merge = c
             break
+        end
+    end
+    # Fallback to loop header if no better candidate
+    if merge === nothing
+        for c in sorted
+            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
+                merge = c
+                break
+            end
         end
     end
 
@@ -794,6 +835,9 @@ where the pattern matches.
 """
 function promote_loops!(block::Block, ctx::StructurizeCtx)
     new_body = SSAMap()
+    # Track ForOp promotions: loop_ssa_idx → (iv_pos, ForOp)
+    for_promotions = Dict{Int, Tuple{Int, ForOp}}()
+
     for (idx, entry) in block.body
         stmt = entry.stmt
         if stmt isa LoopOp
@@ -802,8 +846,35 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             # Try to promote this loop
             promoted = try_promote_while(stmt, ctx)
             if promoted !== nothing
-                promoted = try_promote_for(promoted, idx, block, new_body, ctx)
-                push!(new_body, (idx, promoted, entry.typ))
+                result, iv_pos = try_promote_for(promoted, idx, block, new_body, ctx)
+                if result isa ForOp && iv_pos > 0
+                    for_promotions[idx] = (iv_pos, result)
+                    # Update result type: remove IV from tuple
+                    carry_types = Any[]
+                    for (i, t) in enumerate(entry.typ.parameters)
+                        i == iv_pos && continue
+                        push!(carry_types, t)
+                    end
+                    push!(new_body, (idx, result, Tuple{carry_types...}))
+                else
+                    push!(new_body, (idx, result, entry.typ))
+                end
+            else
+                push!(new_body, (idx, stmt, entry.typ))
+            end
+        elseif stmt isa Expr && stmt.head === :call && stmt.args[1] === Core.getfield &&
+               stmt.args[2] isa SSAValue && haskey(for_promotions, stmt.args[2].id)
+            # Fix getfield for ForOp: IV position → upper bound, others → adjusted index
+            loop_ssa = stmt.args[2].id
+            field_idx = stmt.args[3]::Int
+            iv_pos, for_op = for_promotions[loop_ssa]
+            if field_idx == iv_pos
+                # IV exit value = upper bound
+                push!(new_body, (idx, for_op.upper, entry.typ))
+            elseif field_idx > iv_pos
+                # Adjust index (IV was removed from result tuple)
+                new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), field_idx - 1)
+                push!(new_body, (idx, new_gf, entry.typ))
             else
                 push!(new_body, (idx, stmt, entry.typ))
             end
@@ -867,6 +938,17 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     # Standard pattern: cond=true → continue, cond=false → break
     # Build WhileOp: before = header stmts + ConditionOp, after = stay body + YieldOp
 
+    continue_op = stay_region.terminator::ContinueOp
+
+    # Guard: ContinueOp values must only reference block args or values defined
+    # in the stay region. If they reference header SSAs (which go into `before`),
+    # the WhileOp's `after` region can't see them — keep as LoopOp.
+    for val in continue_op.values
+        if val isa SSAValue && !haskey(stay_region.body, val.id)
+            return nothing
+        end
+    end
+
     # Before region: header stmts (everything before the IfOp)
     before = Block()
     for (i, (sidx, sentry)) in enumerate(body.body)
@@ -880,7 +962,6 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     end
 
     # ConditionOp args = before block args (passed to after region when cond is true)
-    continue_op = stay_region.terminator::ContinueOp
     cond_args = IRValue[arg for arg in before.args]
     before.terminator = ConditionOp(cond, cond_args)
 
@@ -899,24 +980,27 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     return WhileOp(before, after, loop.init_values)
 end
 
-"""Try to promote a WhileOp to ForOp by detecting counting patterns."""
+"""
+Try to promote a WhileOp to ForOp by detecting counting patterns.
+Returns (promoted_op, iv_pos) where iv_pos > 0 if ForOp was created.
+"""
 function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
                           ctx::StructurizeCtx)
-    op isa WhileOp || return op
+    op isa WhileOp || return (op, 0)
 
     # Look for: condition is slt_int/sle_int/=== on a block arg vs loop-invariant bound
     before = op.before
-    before.terminator isa ConditionOp || return op
+    before.terminator isa ConditionOp || return (op, 0)
     cond_op = before.terminator
 
     # Find the condition expression
     cond_val = cond_op.condition
-    cond_val isa SSAValue || return op
+    cond_val isa SSAValue || return (op, 0)
     cond_entry = get(before.body, cond_val.id, nothing)
-    cond_entry === nothing && return op
+    cond_entry === nothing && return (op, 0)
     cond_expr = cond_entry.stmt
-    cond_expr isa Expr && cond_expr.head === :call || return op
-    length(cond_expr.args) >= 3 || return op
+    cond_expr isa Expr && cond_expr.head === :call || return (op, 0)
+    length(cond_expr.args) >= 3 || return (op, 0)
 
     func = cond_expr.args[1]
     iv_candidate = cond_expr.args[2]
@@ -926,19 +1010,20 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
     is_sle = func isa GlobalRef && func.name === :sle_int
     is_eq = (func isa GlobalRef && func.name === :(===)) || func === :(===)
-    (is_slt || is_sle || is_eq) || return op
+    (is_slt || is_sle || is_eq) || return (op, 0)
 
     # IV must be a block argument
-    iv_candidate isa BlockArgument || return op
+    iv_candidate isa BlockArgument || return (op, 0)
 
     # Find IV's position in args
     iv_pos = findfirst(a -> a.id == iv_candidate.id, before.args)
-    iv_pos === nothing && return op
+    iv_pos === nothing && return (op, 0)
 
-    # Find step: look in the after region for add_int(iv_after_arg, step)
+    # Find step: look in the after region for add_int(iv_arg, step)
     after = op.after
-    iv_pos <= length(after.args) || return op
+    iv_pos <= length(after.args) || return (op, 0)
     after_iv_arg = after.args[iv_pos]
+    before_iv_arg = before.args[iv_pos]
 
     # Find add_int in after body or in YieldOp values
     step = nothing
@@ -951,18 +1036,20 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
             if s isa Expr && s.head === :call && length(s.args) >= 3
                 sfunc = s.args[1]
                 if sfunc isa GlobalRef && sfunc.name === :add_int
-                    if s.args[2] isa BlockArgument && s.args[2].id == after_iv_arg.id
+                    # Match either after or before block arg (cross-scope reference)
+                    if s.args[2] isa BlockArgument &&
+                       (s.args[2].id == after_iv_arg.id || s.args[2].id == before_iv_arg.id)
                         step = s.args[3]
                     end
                 end
             end
         end
     end
-    step === nothing && return op
+    step === nothing && return (op, 0)
 
     # Bound must be loop-invariant (not a block arg of this loop)
     if bound isa BlockArgument && any(a -> a.id == bound.id, before.args)
-        return op
+        return (op, 0)
     end
 
     # Build ForOp
@@ -1013,7 +1100,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     end
     for_body.terminator = ContinueOp(cont_values)
 
-    return ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits)
+    return (ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits), iv_pos)
 end
 
 #=============================================================================
