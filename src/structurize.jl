@@ -706,6 +706,12 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, exit_info, carried_values::Vector{IRValue},
                            subs::Dict{Int, BlockArgument})
     break_values = IRValue[arg for arg in body.args]
+    # Extra exits (beyond header phis) must carry the current iteration's
+    # computed value, not the stale block arg from the previous iteration.
+    n_header_phis = length(subs)
+    for i in (n_header_phis + 1):length(break_values)
+        break_values[i] = carried_values[i]
+    end
     lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
 
     # Use structurize_region! with loop context for the entire loop body
