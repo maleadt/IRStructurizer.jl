@@ -125,7 +125,7 @@ end
     # Loop with condition check at header (empty body - self-loop pattern)
     @test @filecheck begin
         code_structured(Tuple{Int}) do flag::Int
-            @check "loop ->"
+            @check "while"
             while flag != 0
                 @check "not_int"
                 # spin
@@ -442,7 +442,7 @@ end  # ForOp detection
 @testset "condition-only spinloop" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do flag::Int
-            @check "loop ->"
+            @check "while"
             while flag != 0
                 @check "not_int"
             end
