@@ -29,6 +29,9 @@ include("structurize/loops.jl")
 include("ir/utilities.jl")
 include("ir/validation.jl")
 
+# unstructurize: StructuredIRCode → IRCode
+include("unstructurize.jl")
+
 # public API
 include("interface.jl")
 include("precompile.jl")

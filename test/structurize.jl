@@ -17,6 +17,7 @@
             x + 1
         end
     end
+    @test @roundtrip (x -> x + 1)(5)
 
     # Multiple operations: (x + y) * (x - y)
     @test @filecheck begin
@@ -29,6 +30,7 @@
             (x + y) * (x - y)
         end
     end
+    @test @roundtrip ((x, y) -> (x + y) * (x - y))(3, 2)
 end
 
 @testset "if-then-else: diamond pattern" begin
@@ -44,6 +46,8 @@ end
             x > 0 ? x + 1 : x - 1
         end
     end
+    @test @roundtrip (x -> x > 0 ? x + 1 : x - 1)(5)
+    @test @roundtrip (x -> x > 0 ? x + 1 : x - 1)(-3)
 end
 
 @testset "if-then-else: bool condition (no comparison)" begin
@@ -57,6 +61,8 @@ end
             x ? 1 : 2
         end
     end
+    @test @roundtrip (x -> x ? 1 : 2)(true)
+    @test @roundtrip (x -> x ? 1 : 2)(false)
 end
 
 @testset "if-then-else: with comparison" begin
@@ -89,6 +95,9 @@ end
             y - x
         end
     end
+    f_early = (x::Int, y::Int) -> (x > y ? (return y * x) : nothing; y - x)
+    @test @roundtrip f_early(5, 3)
+    @test @roundtrip f_early(3, 5)
 end
 
 end  # acyclic regions
@@ -107,6 +116,9 @@ end  # acyclic regions
             return i
         end
     end
+    f_count = (n::Int) -> (i = 0; while i < n; i += 1; end; i)
+    @test @roundtrip f_count(5)
+    @test @roundtrip f_count(0)
 end
 
 @testset "loop with condition" begin
@@ -121,6 +133,8 @@ end
             return flag
         end
     end
+    # Only test with 0 (non-zero would spin forever)
+    @test @roundtrip ((flag::Int) -> (while flag != 0; end; flag))(0)
 end
 
 @testset "loop with body statements" begin
@@ -135,6 +149,8 @@ end
             return n
         end
     end
+    @test @roundtrip ((n::Int) -> (while n > 0; n -= 1; end; n))(5)
+    @test @roundtrip ((n::Int) -> (while n > 0; n -= 1; end; n))(0)
 end
 
 @testset "nested loops" begin
@@ -155,6 +171,8 @@ end
             return acc
         end
     end
+    f_nest = (n::Int, m::Int) -> (acc=0; i=0; while i<n; j=0; while j<m; acc+=1; j+=1; end; i+=1; end; acc)
+    @test @roundtrip f_nest(3, 4)
 end
 
 end  # cyclic regions
@@ -215,6 +233,9 @@ end
             return acc
         end
     end
+    f_incl = (n::Int) -> (i=0; acc=0; while i<=n; acc+=i; i+=1; end; acc)
+    @test @roundtrip f_incl(5)
+    @test @roundtrip f_incl(0)
 end
 
 @testset "inclusive bound with Core.Const upper type" begin
@@ -271,6 +292,10 @@ end
     for_op = for_ops[1]
     @test length(for_op.body.args) == 1
     @test length(for_op.init_values) == 1
+
+    f_acc = (n::Int) -> (i=0; acc=0; while i<n; acc+=i; i+=1; end; acc)
+    @test @roundtrip f_acc(5)
+    @test @roundtrip f_acc(0)
 end
 
 @testset "Julia for-in-range (1:n) stays as LoopOp" begin
@@ -298,6 +323,10 @@ end
 
     # Verify IR is valid (LoopOp is nested inside IfOps from iterator protocol)
     @test sci isa StructuredIRCode
+
+    f_forin = (n::Int) -> (acc=0; for i in 1:n; acc+=i; end; acc)
+    @test @roundtrip f_forin(5)
+    @test @roundtrip f_forin(0)
 end
 
 @testset "nested for loops" begin
@@ -341,6 +370,10 @@ end
 
     for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
     @test length(for_ops) == 2
+
+    f_seq = (n::Int) -> (i=0; acc=0; while i<n; acc+=i; i+=1; end;
+                         j=0; result=0; while j<n; result+=acc; j+=1; end; result)
+    @test @roundtrip f_seq(5)
 end
 
 @testset "sequential for loops" begin
@@ -500,6 +533,8 @@ end  # loop classification
             return acc
         end
     end
+    f_ifinloop = (n::Int) -> (acc=0; i=0; while i<n; if i%2==0; acc+=i; end; i+=1; end; acc)
+    @test @roundtrip f_ifinloop(6)
 end
 
 @testset "loop inside if" begin
@@ -546,6 +581,8 @@ end  # nested control flow
             return result
         end
     end
+    f_dup = (x::Int) -> (i=0; while i<x; i+=1; end; i*2)
+    @test @roundtrip f_dup(5)
 end
 
 @testset "type preservation" begin
@@ -556,6 +593,7 @@ end
     # Float64 type should be preserved in entry block types
     @test !isempty(sci.entry.body)
     @test any(((_, entry),) -> entry.typ isa Type && entry.typ <: AbstractFloat, sci.entry.body)
+    @test @roundtrip (x -> x + 1.0)(3.14)
 end
 
 @testset "multiple arguments" begin
@@ -563,6 +601,7 @@ end
         x + y
     end |> only
     @test sci.entry.terminator isa Core.ReturnNode
+    @test @roundtrip ((x::Int, y::Float64) -> x + y)(3, 1.5)
 end
 
 @testset "swap_loop phi references" begin
@@ -585,6 +624,15 @@ end
         end
         return x
     end |> only
+
+    function f_swap(n::Int)
+        x, y = 1, 2
+        for i in 1:n; x, y = y, x; end
+        x
+    end
+    @test @roundtrip f_swap(0)
+    @test @roundtrip f_swap(1)
+    @test @roundtrip f_swap(4)
 end
 
 @testset "while loop with outer capture has Nothing type" begin
@@ -628,6 +676,10 @@ end
     # The result should be BlockArgument, not SSAValue
     @test !isempty(cond_op.args)
     @test cond_op.args[1] isa IRStructurizer.BlockArgument
+
+    f_pow = (x::Int, y::Int) -> (count=0; while x^count<y; count+=1; end; count)
+    @test @roundtrip f_pow(2, 16)
+    @test @roundtrip f_pow(2, 1)
 end
 
 @testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin
@@ -657,6 +709,11 @@ end
 
     # LoopOp will be nested inside IfOps, just verify the IR is valid
     @test sci_for isa StructuredIRCode
+
+    f_while_acc = (n::Int) -> (i=0; acc=0; while i<n; acc+=i; i+=1; end; acc)
+    @test @roundtrip f_while_acc(5)
+    f_forin_acc = (n::Int) -> (acc=0; for i in 1:n; acc+=i; end; acc)
+    @test @roundtrip f_forin_acc(5)
 end
 
 @testset "while-loop mimicking iterator protocol stays valid" begin
@@ -684,6 +741,10 @@ end
 
     # Should produce valid structured IR (no unstructured control flow)
 
+    f_iter = (n::Int) -> (state=1; upper=n; acc=0;
+        while true; done=state>upper; done&&break; i=state; acc+=i; state+=1; end; acc)
+    @test @roundtrip f_iter(5)
+    @test @roundtrip f_iter(0)
 end
 
 # If-then (no else) must yield phi values, not return Nothing
@@ -702,6 +763,9 @@ end
             return x
         end
     end
+    f_ifthen = (flag::Bool) -> (x=0; if flag; x=1; end; x)
+    @test @roundtrip f_ifthen(true)
+    @test @roundtrip f_ifthen(false)
 end
 
 @testset "if-then phi inside loop" begin
@@ -740,6 +804,13 @@ end
             return x + y
         end
     end
+    function f_mphi(flag::Bool)
+        x, y = 0, 0
+        if flag; x, y = 1, 2; end
+        x + y
+    end
+    @test @roundtrip f_mphi(true)
+    @test @roundtrip f_mphi(false)
 end
 
 @testset "outer IV used inside inner loop" begin
@@ -783,6 +854,10 @@ end
     # After fix: 1 (acc) + 2 (outer IV + outer acc) = 3 init_values
     @test length(inner_for.init_values) == 3
     @test length(inner_for.body.args) == 3
+
+    f_outer_iv = (n::Int, m::Int) -> (acc=0; i=0; while i<n; j=0; while j<m; acc+=i; j+=1; end; i+=1; end; acc)
+    @test @roundtrip f_outer_iv(3, 4)
+    @test @roundtrip f_outer_iv(0, 4)
 end
 
 @testset "ForOp body.args order matches init_values (extra exits)" begin
@@ -836,6 +911,8 @@ end
         return acc
     end |> only
     @test sci isa StructuredIRCode
+    f_extra = (n::Int, m::Int) -> (acc=0; i=0; while i<n; acc+=i*m; i+=1; end; acc)
+    @test @roundtrip f_extra(5, 3)
 end
 
 @testset "for-in-range loop exit condition in non-header block" begin
@@ -874,6 +951,8 @@ end
 
     sci, _ = only(code_structured(mysum, Tuple{Int}))
 
+    @test @roundtrip mysum(5)
+    @test @roundtrip mysum(0)
 end
 
 @testset "unreachable blocks are ignored" begin
@@ -922,11 +1001,14 @@ end
         r
     end |> only
 
-
-
     # Verify the output has nested IfOps (from || lowering)
     if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
     @test !isempty(if_ops)
+
+    f_or = (x::Int, y::Int) -> (r=0; if x>0||y>0; r=1; end; r)
+    @test @roundtrip f_or(1, -1)
+    @test @roundtrip f_or(-1, 1)
+    @test @roundtrip f_or(-1, -1)
 end
 
 @testset "REGION_PROPER: short-circuit && pattern" begin
@@ -938,10 +1020,13 @@ end
         r
     end |> only
 
-
-
     if_ops = filter(x -> x isa IfOp, collect(statements(sci.entry.body)))
     @test !isempty(if_ops)
+
+    f_and = (x::Int, y::Int) -> (r=0; if x>0&&y>0; r=1; end; r)
+    @test @roundtrip f_and(1, 1)
+    @test @roundtrip f_and(1, -1)
+    @test @roundtrip f_and(-1, -1)
 end
 
 @testset "loop exit through fallthrough (not GotoIfNot dest)" begin
@@ -1062,6 +1147,10 @@ end
         return n
     end
     @test count_returns(sci.entry) >= 3
+    # Fixed: vertices_between was over-including dead-end vertices (block 14) into
+    # inner REGION_PROPER, causing collect_proper_merge_phis to lose phi edges.
+    @test @roundtrip mod(7.5, 2.5)
+    @test @roundtrip mod(-3.0, 2.0)
 end
 
 end  # regression
@@ -1095,6 +1184,9 @@ end  # regression
         return acc
     end |> only
 
+    f_sum = (n) -> (acc=0; for i in 1:n; acc+=i; end; acc)
+    @test @roundtrip f_sum(5)
+    @test @roundtrip f_sum(0)
 end
 
 @testset "product: multiply pattern" begin
@@ -1118,6 +1210,9 @@ end
         return acc
     end |> only
 
+    f_prod = (n) -> (acc=1; for i in 1:n; acc*=i; end; acc)
+    @test @roundtrip f_prod(5)
+    @test @roundtrip f_prod(0)
 end
 
 @testset "count_evens: conditional accumulator" begin
@@ -1145,6 +1240,9 @@ end
         return count
     end |> only
 
+    f_evens = (n) -> (count=0; for i in 1:n; if i%2==0; count+=1; end; end; count)
+    @test @roundtrip f_evens(6)
+    @test @roundtrip f_evens(0)
 end
 
 @testset "multiple accumulators" begin
@@ -1173,6 +1271,8 @@ end
         return sum, count
     end |> only
 
+    f_multi_acc = (n) -> (sum=0; count=0; for i in 1:n; sum+=i; count+=1; end; (sum, count))
+    @test @roundtrip f_multi_acc(5)
 end
 
 @testset "nested for-in-range loops" begin
@@ -1202,6 +1302,8 @@ end
         return acc
     end |> only
 
+    f_nested_forin = (n, m) -> (acc=0; for i in 1:n; for j in 1:m; acc+=i*j; end; end; acc)
+    @test @roundtrip f_nested_forin(3, 4)
 end
 
 @testset "for-in-range with tuple destructuring" begin

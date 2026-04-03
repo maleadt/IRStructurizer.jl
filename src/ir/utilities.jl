@@ -540,31 +540,111 @@ function rebuildssa!(root::Block, next_value_idx::Int)
         end
     end
 
-    # For each multiply-defined index, rename inner defs (bottom-up) and
-    # batch all replacements per block into a single walk_uses! pass.
-    block_replacements = Dict{Block, Vector{Pair{Int, Int}}}()
+    # Phase 1: For each multiply-defined index, rename inner defs (bottom-up)
+    # and record per-block rename maps.
+    # First, unshare Expr objects in blocks with duplicate defs so that in-place
+    # renaming of uses in one block doesn't corrupt sibling blocks that share
+    # the same Expr reference (happens when build_proper_branch! duplicates blocks).
+    blocks_to_unshare = Set{Block}()
+    for (idx, locs) in defs
+        length(locs) <= 1 && continue
+        for (blk, _) in locs
+            push!(blocks_to_unshare, blk)
+        end
+    end
+    for blk in blocks_to_unshare
+        for i in 1:length(blk.body.stmts)
+            stmt = blk.body.stmts[i]
+            stmt isa Expr && (blk.body.stmts[i] = Expr(stmt.head, copy(stmt.args)...))
+        end
+    end
+
+    block_renames = Dict{Block, Dict{Int, Int}}()
     for (idx, locs) in defs
         length(locs) <= 1 && continue
         for i in length(locs):-1:2
             blk, pos = locs[i]
             blk.body.ssa_idxes[pos] = next_value_idx
-            push!(get!(Vector{Pair{Int, Int}}, block_replacements, blk), idx => next_value_idx)
+            get!(Dict{Int, Int}, block_renames, blk)[idx] = next_value_idx
             next_value_idx += 1
         end
     end
-    for (blk, repls) in block_replacements
-        walk_uses!(blk) do ref
-            val = ref[]
-            if val isa SSAValue
-                for (old, new) in repls
-                    val.id == old && (ref[] = SSAValue(new); break)
+
+    # Phase 2: Top-down walk with accumulated rename context.
+    # Each block gets effective_renames = parent_context ∪ own_renames (own wins).
+    # Renames are applied only to the block's direct body and terminator,
+    # NOT recursing into sub-blocks (those get their own accumulated context).
+    function apply_renames!(block::Block, context::Dict{Int, Int})
+        own = get(block_renames, block, Dict{Int, Int}())
+        effective = isempty(own) ? context : merge(context, own)
+
+        if !isempty(effective)
+            _walk_block_local_uses!(block) do ref
+                val = ref[]
+                if val isa SSAValue
+                    new_id = get(effective, val.id, nothing)
+                    new_id !== nothing && (ref[] = SSAValue(new_id))
                 end
             end
         end
+
+        # Recurse into sub-blocks with accumulated context
+        for (_, entry) in block.body
+            entry.stmt isa ControlFlowOp || continue
+            for b in blocks(entry.stmt)
+                apply_renames!(b, effective)
+            end
+        end
     end
+    apply_renames!(root, Dict{Int, Int}())
 
     return next_value_idx
 end
+
+"""
+Walk use sites in a block's direct body and terminator only — does NOT recurse
+into sub-blocks of nested ControlFlowOps. For ControlFlowOps, walks only their
+own operands (condition, bounds, init_values), not their sub-block contents.
+"""
+function _walk_block_local_uses!(f, block::Block)
+    for i in 1:length(block.body.ssa_idxes)
+        stmt = block.body.stmts[i]
+        if stmt isa ControlFlowOp
+            _walk_cfop_own_operands!(f, stmt)
+        elseif stmt isa ReturnNode
+            isdefined(stmt, :val) && f(ReturnNodeUseRef(block.body.stmts, i))
+        else
+            walk_uses!(f, stmt)
+        end
+    end
+    term = block.terminator
+    if term isa ReturnNode
+        isdefined(term, :val) && f(TerminatorReturnNodeUseRef(block))
+    elseif term !== nothing
+        walk_uses!(f, term)
+    end
+end
+
+"""
+Walk only the own operands of a ControlFlowOp (condition, bounds, init_values)
+without recursing into its sub-blocks.
+"""
+function _walk_cfop_own_operands!(f, op::IfOp)
+    f(MutableFieldUseRef(op, :condition))
+end
+
+function _walk_cfop_own_operands!(f, op::ForOp)
+    f(MutableFieldUseRef(op, :lower))
+    f(MutableFieldUseRef(op, :upper))
+    f(MutableFieldUseRef(op, :step))
+    for i in 1:length(op.init_values); f(IndexedUseRef(op.init_values, i)); end
+end
+
+function _walk_cfop_own_operands!(f, op::Union{WhileOp, LoopOp})
+    for i in 1:length(op.init_values); f(IndexedUseRef(op.init_values, i)); end
+end
+
+_walk_cfop_own_operands!(f, ::ControlFlowOp) = nothing
 
 
 #=============================================================================
