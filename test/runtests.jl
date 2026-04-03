@@ -27,7 +27,9 @@ function execute(sci::StructuredIRCode, args...)
     CC = Core.Compiler
     ir = CC.copy(CC.IRCode(sci))
     ir.argtypes[1] = Tuple{}
-    ir.debuginfo.def = Symbol("unstructurized")
+    @static if VERSION >= v"1.12-"
+        ir.debuginfo.def = Symbol("unstructurized")
+    end
     oc = Core.OpaqueClosure(ir)
     return oc(args...)
 end

@@ -576,7 +576,11 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
     # Build InstructionStream
     info = Vector{CC.CallInfo}(undef, n)
     fill!(info, CC.NoCallInfo())
-    line = fill(Int32(0), n * 3)
+    @static if VERSION >= v"1.12-"
+        line = fill(Int32(0), n * 3)
+    else
+        line = fill(Int32(0), n)
+    end
     flag = fill(UInt32(0), n)
     stmts = InstructionStream(all_stmts, all_types, info, line, flag)
 
@@ -612,13 +616,18 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
     end
 
     cfg = CFG(bb_blocks, cfg_index)
-    debuginfo = CC.DebugInfoStream(stmts.line)
 
     argtypes = copy(sci.argtypes)
     sptypes = CC.VarState[s for s in sci.sptypes]
     meta = Expr[]
 
-    return IRCode(stmts, cfg, debuginfo, argtypes, meta, sptypes)
+    @static if VERSION >= v"1.12-"
+        debuginfo = CC.DebugInfoStream(stmts.line)
+        return IRCode(stmts, cfg, debuginfo, argtypes, meta, sptypes)
+    else
+        linetable = Core.LineInfoNode[]
+        return IRCode(stmts, cfg, linetable, argtypes, meta, sptypes)
+    end
 end
 
 function _cfg_edge!(blocks::Vector{BasicBlock}, from::Int, to::Int)
