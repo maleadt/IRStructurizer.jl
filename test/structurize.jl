@@ -1147,7 +1147,12 @@ end
         return n
     end
     @test count_returns(sci.entry) >= 3
-    @test_broken @roundtrip mod(7.5, 2.5)   # structurizer drops %18 (rem result) from guard-chain yields
+    # Guard-chain IF_THEN and special-case REGION_PROPER are sibling children in a
+    # REGION_BLOCK, but the phi at block 14 spans both — `%18` (the rem result from
+    # the guard-pass path) is lost because collect_proper_merge_phis filters external
+    # edges. Fixing requires combining siblings into a single IfOp when they share a
+    # downstream merge phi.
+    @test_broken @roundtrip mod(7.5, 2.5)
     @test_broken @roundtrip mod(-3.0, 2.0)
 end
 
