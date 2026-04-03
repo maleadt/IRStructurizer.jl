@@ -7,8 +7,6 @@
 # Both phases are applied recursively until no unstructured CF remains.
 # A post-pass promotes LoopOps to WhileOp/ForOp where possible.
 
-using Graphs: SimpleDiGraph, add_edge!, strongly_connected_components
-
 #=============================================================================
  Context
 =============================================================================#
@@ -76,6 +74,42 @@ function get_loop_at(ctx::StructurizeCtx, header::Int, region_blocks::Set{Int})
 end
 
 #=============================================================================
+ Irreducible CFG Detection
+=============================================================================#
+
+"""
+    check_reducibility(ir, domtree)
+
+Verify the CFG is reducible by checking that removing all dominance-based
+backedges leaves an acyclic graph (via Kahn's topological sort).
+Throws `UnstructuredControlFlowError` if an irreducible cycle is found.
+"""
+function check_reducibility(ir::IRCode, domtree::DomTree)
+    n = length(ir.cfg.blocks)
+    indegree = zeros(Int, n)
+    adj = [Int[] for _ in 1:n]
+    for (i, bb) in enumerate(ir.cfg.blocks)
+        for succ in bb.succs
+            dominates(domtree, succ, i) && continue  # skip backedges
+            push!(adj[i], succ)
+            indegree[succ] += 1
+        end
+    end
+    queue = Int[i for i in 1:n if indegree[i] == 0]
+    count = 0
+    while !isempty(queue)
+        v = popfirst!(queue)
+        count += 1
+        for w in adj[v]
+            indegree[w] -= 1
+            indegree[w] == 0 && push!(queue, w)
+        end
+    end
+    count < n && throw(UnstructuredControlFlowError(
+        "irreducible control flow detected (multi-entry cycle)"))
+end
+
+#=============================================================================
  Entry Point
 =============================================================================#
 
@@ -86,6 +120,7 @@ Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForO
 """
 function structurize(ir::IRCode)
     ctx = StructurizeCtx(ir)
+    check_reducibility(ir, ctx.domtree)
     all_blocks = Set(1:length(ir.cfg.blocks))
     entry = structurize_region!(ctx, 1, all_blocks)
     promote_loops!(entry, ctx)
@@ -710,19 +745,13 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         push!(body.args, arg)
     end
 
-    # 5. Find exit condition
-    exit_info = find_loop_exit_condition(ir, loop_blocks)
+    # 5. Build loop body
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
 
-    # 6. Build loop body
-    build_loop_body!(body, ctx, header, loop_blocks, exit_info, carried_values, subs)
+    # 6. Apply phi→arg substitutions
+    apply_substitutions!(body, subs, ctx)
 
-    # 7. Apply phi→arg substitutions
-    sub_ctx = StructurizationContext(ctx.types, ctx.next_ssa, ctx.next_arg)
-    apply_substitutions!(body, subs, sub_ctx)
-    ctx.next_ssa = sub_ctx.next_value_idx
-    ctx.next_arg = sub_ctx.next_arg_idx
-
-    # 8. Emit LoopOp + getfields
+    # 7. Emit LoopOp + getfields
     loop_op = LoopOp(body, init_values)
     loop_ssa = alloc_ssa!(ctx)
     result_type = Tuple{phi_types...}
@@ -744,7 +773,7 @@ Build the body of a LoopOp using `structurize_region!` with a LoopCtx.
 The LoopCtx makes the region walk loop-aware: back-edges → ContinueOp, exits → BreakOp.
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
-                           loop_blocks::Set{Int}, exit_info, carried_values::Vector{IRValue},
+                           loop_blocks::Set{Int}, carried_values::Vector{IRValue},
                            subs::Dict{Int, BlockArgument})
     break_values = IRValue[arg for arg in body.args]
     # Extra exits (beyond header phis) must carry the current iteration's
@@ -817,43 +846,6 @@ function find_loop_exit(ir::IRCode, loop_blocks::Set{Int})
     return nothing
 end
 
-"""Find the entry to the loop body (successor of header that stays in the loop)."""
-function find_loop_body_entry(ir::IRCode, header::Int, loop_blocks::Set{Int})
-    for succ in ir.cfg.blocks[header].succs
-        succ ∈ loop_blocks && succ != header && return succ
-    end
-    return nothing
-end
-
-"""
-Find the GotoIfNot that controls loop exit.
-Returns `(; cond, block, true_dest, false_dest, inverted)` or `nothing`.
-
-`inverted=false`: cond=true → stay in loop, cond=false → exit
-`inverted=true`: cond=true → exit, cond=false → stay in loop
-"""
-function find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
-    nblocks = length(ir.cfg.blocks)
-    for block_idx in loop_blocks
-        bb = ir.cfg.blocks[block_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            stmt isa GotoIfNot || continue
-            dest = stmt.dest
-            fallthrough = block_idx + 1
-
-            if dest ∉ loop_blocks
-                return (; cond=stmt.cond, block=block_idx,
-                         true_dest=fallthrough, false_dest=dest, inverted=false)
-            elseif fallthrough <= nblocks && fallthrough ∉ loop_blocks
-                return (; cond=stmt.cond, block=block_idx,
-                         true_dest=fallthrough, false_dest=dest, inverted=true)
-            end
-        end
-    end
-    return nothing
-end
-
 """Find loop-internal SSA values referenced outside the loop."""
 function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int},
                                  already_exported::Set{Int})
@@ -911,6 +903,3 @@ function is_defined_in(val::SSAValue, blocks::Set{Int}, ir::IRCode)
     false
 end
 is_defined_in(val, blocks, ir) = false
-
-StructurizationContext(ctx::StructurizeCtx) =
-    StructurizationContext(ctx.types, ctx.next_ssa, ctx.next_arg)

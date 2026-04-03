@@ -6,12 +6,15 @@ export UnstructuredControlFlowError
 Exception thrown when unstructured control flow is detected in structured IR.
 """
 struct UnstructuredControlFlowError <: Exception
-    stmt_indices::Vector{Int}
+    msg::String
 end
 
+UnstructuredControlFlowError(stmt_indices::Vector{Int}) =
+    UnstructuredControlFlowError("unstructured control flow at statement(s): " *
+                                  join(stmt_indices, ", "))
+
 function Base.showerror(io::IO, e::UnstructuredControlFlowError)
-    print(io, "UnstructuredControlFlowError: unstructured control flow at statement(s): ",
-          join(e.stmt_indices, ", "))
+    print(io, "UnstructuredControlFlowError: ", e.msg)
 end
 
 
