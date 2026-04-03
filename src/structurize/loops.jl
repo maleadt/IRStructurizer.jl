@@ -59,9 +59,10 @@ function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationConte
     # Create BlockArguments and apply substitutions immediately
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        arg = BlockArgument(i, phi_type)
+        id = (ctx.next_ssa_idx += 1)
+        arg = BlockArgument(id, phi_type)
         push!(before.args, arg)
-        push!(after.args, BlockArgument(i, phi_type))
+        push!(after.args, BlockArgument(id, phi_type))
         subs[phi_idx] = arg
     end
     apply_substitutions!(before, subs)
@@ -196,7 +197,8 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     n_header_phis = length(phi_indices)
     subs = Substitutions()
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
-        arg = BlockArgument(i, phi_type)
+        id = (ctx.next_ssa_idx += 1)
+        arg = BlockArgument(id, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
     end
@@ -207,7 +209,7 @@ function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContex
     else
         @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
     end
-    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_header_phis)
+    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, ctx)
 
     # 7. Build exit control flow
     if exit !== nothing
@@ -309,8 +311,8 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     # Get IV type
     iv_type = types[iv_phi_idx]
 
-    # Create BlockArgument for IV (id=1, first in ForOp's block args)
-    iv_arg = BlockArgument(1, iv_type)
+    # Create BlockArgument for IV (first in ForOp's block args)
+    iv_arg = BlockArgument((ctx.next_ssa_idx += 1), iv_type)
 
     # Build the body block
     body = Block()
@@ -354,12 +356,13 @@ function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::Structur
     subs = Substitutions()
     subs[iv_phi_idx] = iv_arg  # IV at index 1
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
-        arg = BlockArgument(i + 1, phi_type)
+        id = (ctx.next_ssa_idx += 1)
+        arg = BlockArgument(id, phi_type)
         push!(body.args, arg)
         subs[phi_idx] = arg
     end
 
-    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, n_phi + 1)
+    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, ctx)
 
     # ContinueOp with non-IV carried values (including extra exits)
     body.terminator = ContinueOp(copy(carried_values))
