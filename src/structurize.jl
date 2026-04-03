@@ -145,6 +145,12 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             loop_body = get_loop_at(ctx, current, region_blocks)
             if loop_body !== nothing
                 exit_dest = emit_loop!(block, ctx, current, loop_body, region_blocks)
+                # Update last_block to the loop's exit predecessor (for merge phi lookup)
+                if exit_dest !== nothing
+                    for b in loop_body
+                        exit_dest ∈ ir.cfg.blocks[b].succs && (last_block = b)
+                    end
+                end
                 current = resolve_dest(exit_dest, region_blocks, loop_ctx, block)
                 continue
             end
@@ -387,7 +393,7 @@ function make_empty_branch_block(dest::Int, from::Int,
     return b
 end
 
-"""Find the block in `blocks` (or `fallback`) that is a predecessor of merge phis."""
+"""Find the block that is a predecessor of merge phis, starting from `blocks` or `fallback`."""
 function find_exit_predecessor(merge_phis::Vector{MergePhiInfo}, blocks::Set{Int},
                                 fallback::Int, ir::IRCode)
     # Check merge phi edge values for a block in our set
@@ -396,7 +402,28 @@ function find_exit_predecessor(merge_phis::Vector{MergePhiInfo}, blocks::Set{Int
             pred ∈ blocks && return pred
         end
     end
-    # If branch is empty, the predecessor is the branch entry (fallback)
+    # Follow the exit chain: blocks → successor → ... → merge phi predecessor
+    # (handles pass-through blocks between the region and merge)
+    for b in blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∈ blocks && continue
+            for phi in merge_phis
+                haskey(phi.edge_values, succ) && return succ
+            end
+        end
+    end
+    # Try from fallback too
+    for phi in merge_phis
+        haskey(phi.edge_values, fallback) && return fallback
+    end
+    # Last resort: follow fallback's successor chain
+    if 1 <= fallback <= length(ir.cfg.blocks)
+        for succ in ir.cfg.blocks[fallback].succs
+            for phi in merge_phis
+                haskey(phi.edge_values, succ) && return succ
+            end
+        end
+    end
     return fallback
 end
 
@@ -421,8 +448,16 @@ end
 function make_exit_yield(ir::IRCode, merge_phis::Vector{MergePhiInfo},
                           last_block::Int, blk::Block)
     yield_values = IRValue[]
+    nblocks = length(ir.cfg.blocks)
     for phi in merge_phis
         val = get(phi.edge_values, last_block, nothing)
+        # Follow the exit chain through pass-through blocks
+        if val === nothing && 1 <= last_block <= nblocks
+            for succ in ir.cfg.blocks[last_block].succs
+                val = get(phi.edge_values, succ, nothing)
+                val !== nothing && break
+            end
+        end
         resolved = val !== nothing ? resolve_yield_value(blk, phi.ssa_idx, val) :
                                      Undef(ir.stmts.type[phi.ssa_idx])
         push!(yield_values, resolved)
@@ -459,14 +494,17 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
     then_blocks = Set{Int}()
     else_blocks = Set{Int}()
 
-    # Collect blocks dominated by each successor (if single-predecessor)
+    # Collect blocks dominated by each successor (if single-entry from outside).
+    # A successor is "single-entry" if only one predecessor from the region is
+    # NOT a loop backedge to it. Loop backedges don't count because the loop body
+    # is structurally inside the branch, not a separate entry path.
     if true_dest ∈ region_blocks && true_dest <= nblocks &&
-       count(p -> p ∈ region_blocks, ir.cfg.blocks[true_dest].preds) == 1
+       count_non_backedge_preds(ir, ctx, true_dest, region_blocks) == 1
         collect_dominated!(then_blocks, ctx.domtree, true_dest, region_blocks)
     end
 
     if false_dest ∈ region_blocks && false_dest <= nblocks &&
-       count(p -> p ∈ region_blocks, ir.cfg.blocks[false_dest].preds) == 1
+       count_non_backedge_preds(ir, ctx, false_dest, region_blocks) == 1
         collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
     end
 
@@ -497,27 +535,28 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
         push!(candidates, false_dest)
     end
 
-    # Prefer non-loop-header candidates: when a branch guards a loop entry,
-    # the real merge is past the loop exit, not the loop header itself.
-    sorted = sort!(collect(candidates))
-    for c in sorted
-        if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks &&
-           !haskey(ctx.loop_map, c)
+    for c in sort!(collect(candidates))
+        if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
             merge = c
             break
         end
     end
-    # Fallback to loop header if no better candidate
-    if merge === nothing
-        for c in sorted
-            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
-                merge = c
-                break
-            end
-        end
-    end
 
     return then_blocks, else_blocks, merge
+end
+
+"""Count predecessors of `block` in `region` that are not loop backedges to `block`."""
+function count_non_backedge_preds(ir::IRCode, ctx::StructurizeCtx, block::Int, region::Set{Int})
+    count = 0
+    for pred in ir.cfg.blocks[block].preds
+        pred ∈ region || continue
+        # A backedge is an edge where the target dominates the source
+        if dominates(ctx.domtree, block, pred)
+            continue  # skip loop backedge
+        end
+        count += 1
+    end
+    count
 end
 
 """Collect all blocks in `region` dominated by `root` (including root itself)."""
@@ -967,15 +1006,21 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
 
     # After region: stay_region body + YieldOp with carried values (back to before)
     after = Block()
+    arg_remap = Dict{Int, BlockArgument}()
     for arg in body.args
         after_arg = BlockArgument(alloc_arg!(ctx), arg.type)
         push!(after.args, after_arg)
+        arg_remap[arg.id] = after_arg
     end
     for (sidx, sentry) in stay_region.body
         push!(after.body, (sidx, sentry.stmt, sentry.typ))
     end
     # YieldOp sends values back to before for the next iteration
     after.terminator = YieldOp(copy(continue_op.values))
+
+    # Remap before-region block arg references to after-region block args.
+    # Each region must reference its own args (MLIR's ownership principle).
+    remap_block_args!(after, arg_remap)
 
     return WhileOp(before, after, loop.init_values)
 end
@@ -1075,11 +1120,26 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
 
     iv_arg = BlockArgument(alloc_arg!(ctx), iv_candidate.type)
 
-    # Build ForOp body: copy after region, remove IV increment, adjust args
+    # Build ForOp body: copy after region, remove IV increment, remap args
     for_body = Block()
+    arg_remap = Dict{Int, BlockArgument}()
+
+    # Map after IV arg → ForOp's iv_arg
+    arg_remap[after_iv_arg.id] = iv_arg
+    # Also map before IV arg → ForOp's iv_arg (in case of stale cross-scope refs)
+    arg_remap[before_iv_arg.id] = iv_arg
+
     for (i, arg) in enumerate(after.args)
-        i == iv_pos && continue
-        push!(for_body.args, BlockArgument(alloc_arg!(ctx), arg.type))
+        if i == iv_pos
+            continue
+        end
+        for_arg = BlockArgument(alloc_arg!(ctx), arg.type)
+        push!(for_body.args, for_arg)
+        arg_remap[arg.id] = for_arg
+        # Also map corresponding before arg
+        if i <= length(before.args)
+            arg_remap[before.args[i].id] = for_arg
+        end
     end
 
     for (sidx, sentry) in after.body
@@ -1100,7 +1160,88 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     end
     for_body.terminator = ContinueOp(cont_values)
 
+    # Remap all block arg references to ForOp's namespace
+    remap_block_args!(for_body, arg_remap)
+    # Also remap step if it references a block arg
+    step = remap_value(step, arg_remap)
+
     return (ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits), iv_pos)
+end
+
+#=============================================================================
+ Block Argument Remapping
+=============================================================================#
+
+"""
+    remap_block_args!(block, remap::Dict{Int,BlockArgument})
+
+Replace all BlockArgument references in a block's body and terminator.
+Recurses into nested control flow ops. This ensures each region uses its
+own block arg namespace (MLIR's "region owns its block arguments" principle).
+"""
+function remap_block_args!(block::Block, remap::Dict{Int, BlockArgument})
+    isempty(remap) && return
+    new_body = SSAMap()
+    for (idx, entry) in block.body
+        new_stmt = remap_value(entry.stmt, remap)
+        push!(new_body, (idx, new_stmt, entry.typ))
+    end
+    block.body = new_body
+    if block.terminator !== nothing
+        block.terminator = remap_value(block.terminator, remap)
+    end
+end
+
+function remap_value(@nospecialize(val), remap::Dict{Int, BlockArgument})
+    if val isa BlockArgument
+        return get(remap, val.id, val)
+    elseif val isa Expr
+        return Expr(val.head, Any[remap_value(a, remap) for a in val.args]...)
+    elseif val isa PiNode
+        return PiNode(remap_value(val.val, remap), val.typ)
+    elseif val isa YieldOp
+        return YieldOp(IRValue[remap_value(v, remap) for v in val.values])
+    elseif val isa ContinueOp
+        return ContinueOp(IRValue[remap_value(v, remap) for v in val.values])
+    elseif val isa BreakOp
+        return BreakOp(IRValue[remap_value(v, remap) for v in val.values])
+    elseif val isa ConditionOp
+        return ConditionOp(remap_value(val.condition, remap),
+                           IRValue[remap_value(v, remap) for v in val.args])
+    elseif val isa IfOp
+        remap_block_args!(val.then_region, remap)
+        remap_block_args!(val.else_region, remap)
+        val.condition = remap_value(val.condition, remap)
+        return val
+    elseif val isa ForOp
+        val.lower = remap_value(val.lower, remap)
+        val.upper = remap_value(val.upper, remap)
+        val.step = remap_value(val.step, remap)
+        for (i, v) in enumerate(val.init_values)
+            val.init_values[i] = remap_value(v, remap)
+        end
+        remap_block_args!(val.body, remap)
+        return val
+    elseif val isa WhileOp
+        for (i, v) in enumerate(val.init_values)
+            val.init_values[i] = remap_value(v, remap)
+        end
+        remap_block_args!(val.before, remap)
+        remap_block_args!(val.after, remap)
+        return val
+    elseif val isa LoopOp
+        for (i, v) in enumerate(val.init_values)
+            val.init_values[i] = remap_value(v, remap)
+        end
+        remap_block_args!(val.body, remap)
+        return val
+    elseif val isa ReturnNode
+        isdefined(val, :val) || return val
+        new_v = remap_value(val.val, remap)
+        return new_v === val.val ? val : ReturnNode(new_v)
+    else
+        return val
+    end
 end
 
 #=============================================================================
