@@ -504,9 +504,24 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
         collect_dominated!(then_blocks, ctx.domtree, true_dest, region_blocks)
     end
 
-    if false_dest ∈ region_blocks && false_dest <= nblocks &&
-       count_non_backedge_preds(ir, ctx, false_dest, region_blocks) == 1
-        collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
+    if false_dest ∈ region_blocks && false_dest <= nblocks
+        npreds = count_non_backedge_preds(ir, ctx, false_dest, region_blocks)
+        if npreds == 1
+            collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
+        elseif !isempty(then_blocks)
+            # Short-circuit AND pattern: multiple blocks in then-chain have
+            # false-edges to false_dest. These are short-circuit exits, not
+            # independent entries. Only apply when:
+            # 1. Multiple then-blocks are predecessors (short-circuit signature)
+            # 2. false_dest has no phis from then-blocks (not a merge block)
+            then_pred_count = count(p -> p ∈ then_blocks, ir.cfg.blocks[false_dest].preds)
+            if then_pred_count > 1 && !has_phi_from(ir, false_dest, then_blocks)
+                npreds_excl = count_non_backedge_preds_excluding(ir, ctx, false_dest, region_blocks, then_blocks)
+                if npreds_excl == 1
+                    collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
+                end
+            end
+        end
     end
 
     # Remove any overlap with loop bodies that will be handled separately
@@ -555,6 +570,32 @@ function count_non_backedge_preds(ir::IRCode, ctx::StructurizeCtx, block::Int, r
         if dominates(ctx.domtree, block, pred)
             continue  # skip loop backedge
         end
+        count += 1
+    end
+    count
+end
+
+"""Check if `block` has any PhiNode edges from blocks in `source_blocks`."""
+function has_phi_from(ir::IRCode, block::Int, source_blocks::Set{Int})
+    bb = ir.cfg.blocks[block]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            Int(edge) ∈ source_blocks && return true
+        end
+    end
+    return false
+end
+
+"""Count predecessors of `block` in `region`, excluding blocks in `exclude` and loop backedges."""
+function count_non_backedge_preds_excluding(ir::IRCode, ctx::StructurizeCtx, block::Int,
+                                             region::Set{Int}, exclude::Set{Int})
+    count = 0
+    for pred in ir.cfg.blocks[block].preds
+        pred ∈ region || continue
+        pred ∈ exclude && continue
+        dominates(ctx.domtree, block, pred) && continue
         count += 1
     end
     count
