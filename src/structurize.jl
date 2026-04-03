@@ -183,7 +183,7 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
 
     # Region ended — set terminator if not already set
     if block.terminator === nothing && merge_phis !== nothing
-        block.terminator = make_exit_yield(ir, merge_phis, last_block, block)
+        block.terminator = make_exit_yield(ir, merge_phis, last_block, block, ctx)
     end
 
     return block
@@ -386,44 +386,58 @@ function make_empty_branch_block(dest::Int, from::Int,
             return b
         end
     end
-    # Merge phis? Set yield for this edge.
+    # Merge phis? Use reachability from dest to find the right phi edge value.
     if merge_phis !== nothing && !isempty(merge_phis)
-        b.terminator = make_yield_for_edge(ir, merge_phis, from, b, ctx)
+        pred = find_exit_predecessor(merge_phis, Set{Int}([dest]), from, ir)
+        b.terminator = make_yield_for_edge(ir, merge_phis, pred, b, ctx)
     end
     return b
 end
 
-"""Find the block that is a predecessor of merge phis, starting from `blocks` or `fallback`."""
+"""
+    find_exit_predecessor(merge_phis, blocks, fallback, ir)
+
+Find the block whose edge to the merge carries the phi value for this branch.
+Uses BFS from the branch region through successors (DREAM's reachability
+principle: the value a branch contributes to a merge phi is determined by
+which phi edge predecessor is reachable from that branch).
+"""
 function find_exit_predecessor(merge_phis::Vector{MergePhiInfo}, blocks::Set{Int},
                                 fallback::Int, ir::IRCode)
-    # Check merge phi edge values for a block in our set
-    for phi in merge_phis
-        for (pred, _) in phi.edge_values
-            pred ∈ blocks && return pred
-        end
+    nblocks = length(ir.cfg.blocks)
+    seeds = isempty(blocks) ? Set{Int}([fallback]) : blocks
+
+    # Check seeds directly
+    for b in seeds, phi in merge_phis
+        haskey(phi.edge_values, b) && return b
     end
-    # Follow the exit chain: blocks → successor → ... → merge phi predecessor
-    # (handles pass-through blocks between the region and merge)
-    for b in blocks
+
+    # BFS through successors of seeds (handles pass-through blocks)
+    visited = copy(seeds)
+    push!(visited, fallback)  # don't re-enter the branch source
+    queue = Int[]
+    for b in seeds
+        1 <= b <= nblocks || continue
         for succ in ir.cfg.blocks[b].succs
-            succ ∈ blocks && continue
-            for phi in merge_phis
-                haskey(phi.edge_values, succ) && return succ
-            end
+            succ ∈ visited || push!(queue, succ)
         end
     end
-    # Try from fallback too
-    for phi in merge_phis
-        haskey(phi.edge_values, fallback) && return fallback
-    end
-    # Last resort: follow fallback's successor chain
-    if 1 <= fallback <= length(ir.cfg.blocks)
-        for succ in ir.cfg.blocks[fallback].succs
-            for phi in merge_phis
-                haskey(phi.edge_values, succ) && return succ
-            end
+
+    while !isempty(queue)
+        b = popfirst!(queue)
+        b ∈ visited && continue
+        push!(visited, b)
+
+        for phi in merge_phis
+            haskey(phi.edge_values, b) && return b
+        end
+
+        1 <= b <= nblocks || continue
+        for succ in ir.cfg.blocks[b].succs
+            succ ∈ visited || push!(queue, succ)
         end
     end
+
     return fallback
 end
 
@@ -446,23 +460,10 @@ end
 
 """Create a YieldOp for exiting a region at `last_block`."""
 function make_exit_yield(ir::IRCode, merge_phis::Vector{MergePhiInfo},
-                          last_block::Int, blk::Block)
-    yield_values = IRValue[]
-    nblocks = length(ir.cfg.blocks)
-    for phi in merge_phis
-        val = get(phi.edge_values, last_block, nothing)
-        # Follow the exit chain through pass-through blocks
-        if val === nothing && 1 <= last_block <= nblocks
-            for succ in ir.cfg.blocks[last_block].succs
-                val = get(phi.edge_values, succ, nothing)
-                val !== nothing && break
-            end
-        end
-        resolved = val !== nothing ? resolve_yield_value(blk, phi.ssa_idx, val) :
-                                     Undef(ir.stmts.type[phi.ssa_idx])
-        push!(yield_values, resolved)
-    end
-    return YieldOp(yield_values)
+                          last_block::Int, blk::Block, ctx::StructurizeCtx)
+    # Reuse find_exit_predecessor's BFS to find the right phi edge
+    pred = find_exit_predecessor(merge_phis, Set{Int}([last_block]), last_block, ir)
+    return make_yield_for_edge(ir, merge_phis, pred, blk, ctx)
 end
 
 """
