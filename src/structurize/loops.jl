@@ -272,7 +272,6 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
     merge_block_into!(body, content)
 end
 
-"""Merge the content of `src` into `dst` (body + terminator)."""
 function merge_block_into!(dst::Block, src::Block)
     for (idx, entry) in src.body
         push!(dst.body, (idx, entry.stmt, entry.typ))
@@ -336,7 +335,6 @@ then any exit at all.
 function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     ir = ctx.ir
     nblocks = length(ir.cfg.blocks)
-    # Collect all exits
     exits = Int[]
     for b in loop_blocks
         for succ in ir.cfg.blocks[b].succs
@@ -347,19 +345,14 @@ function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     length(exits) == 1 && return exits[1]
     # Prefer post-dominator of header (the natural continuation)
     ipdom = ctx.postdomtree.idoms_bb[header]
-    if ipdom != 0 && ipdom ∉ loop_blocks && ipdom ∈ exits
-        return ipdom
-    end
-    # Fall back: prefer exits that have successors, then non-throw dead-ends
-    # (return blocks), then throw blocks as last resort.
+    ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
+    # Fall back: prefer exits with successors, then non-throw dead-ends
     for e in exits
         e <= nblocks && !isempty(ir.cfg.blocks[e].succs) && return e
     end
     for e in exits
         if e <= nblocks && isempty(ir.cfg.blocks[e].succs)
-            # Prefer return blocks over throw/unreachable blocks
-            last_type = ir.stmts.type[last(ir.cfg.blocks[e].stmts)]
-            last_type !== Union{} && return e
+            ir.stmts.type[last(ir.cfg.blocks[e].stmts)] !== Union{} && return e
         end
     end
     return first(exits)

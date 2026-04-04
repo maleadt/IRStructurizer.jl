@@ -132,7 +132,6 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
     new_stmt_start = n_stmts + 1
     si = n_stmts
 
-    # Discriminator phi: edges from all redirected sources
     si += 1
     disc_si = si
     disc_edges = Int32[]
@@ -141,11 +140,7 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
         push!(disc_edges, Int32(from))
         push!(disc_values, ei - 1)  # 0-indexed discriminator
     end
-    push!(ir.stmts.stmt, PhiNode(disc_edges, disc_values))
-    push!(ir.stmts.type, Int)
-    push!(ir.stmts.info, NoCallInfo())
-    push!(ir.stmts.line, Int32(0))
-    push!(ir.stmts.flag, UInt32(0))
+    append_stmt!(ir, PhiNode(disc_edges, disc_values), Int)
 
     # Union phis: for each entry's phi, create a multiplexer phi
     # that carries the value from the appropriate predecessor
@@ -166,11 +161,7 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
                     push!(phi_values, Undef(orig_type))
                 end
             end
-            push!(ir.stmts.stmt, PhiNode(phi_edges, phi_values))
-            push!(ir.stmts.type, orig_type)
-            push!(ir.stmts.info, NoCallInfo())
-            push!(ir.stmts.line, Int32(0))
-            push!(ir.stmts.flag, UInt32(0))
+            append_stmt!(ir, PhiNode(phi_edges, phi_values), orig_type)
             phi_ssa_map[orig_si] = si
         end
     end
@@ -181,13 +172,13 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
     if length(entries) == 2
         si += 1
         cmp_si = si
-        append_stmt!(ir, si, Expr(:call, GlobalRef(Base, :(===)), SSAValue(disc_si), 0), Bool)
+        append_stmt!(ir,Expr(:call, GlobalRef(Base, :(===)), SSAValue(disc_si), 0), Bool)
 
         si += 1
-        append_stmt!(ir, si, GotoIfNot(SSAValue(cmp_si), entries[2]), Any)
+        append_stmt!(ir,GotoIfNot(SSAValue(cmp_si), entries[2]), Any)
 
         si += 1
-        append_stmt!(ir, si, GotoNode(entries[1]), Any)
+        append_stmt!(ir,GotoNode(entries[1]), Any)
     else
         throw(UnstructuredControlFlowError(
             "irreducible control flow with $(length(entries)) entries " *
@@ -327,13 +318,13 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
             exit_val_type = ir.stmts.type[val.id]
         else
             dest = exit_block_dest[eb]
-            if dest == 0  # return — try to get type from the value
-                exit_val_type = val isa SSAValue ? ir.stmts.type[val.id] : typeof(val)
-            else  # goto — type from destination phi
+            if dest != 0  # goto — type from destination phi
                 dest_bb = ir.cfg.blocks[dest]
                 for dsi in first(dest_bb.stmts):last(dest_bb.stmts)
                     ir.stmts.stmt[dsi] isa PhiNode && (exit_val_type = ir.stmts.type[dsi]; break)
                 end
+            else
+                exit_val_type = typeof(val)
             end
         end
         break
@@ -352,7 +343,7 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
     for eb in exit_block_set
         push!(sr_edges, Int32(eb)); push!(sr_values, false)
     end
-    append_stmt!(ir, si, PhiNode(sr_edges, sr_values), Bool)
+    append_stmt!(ir,PhiNode(sr_edges, sr_values), Bool)
 
     # Phi 2: disc value (for back-edge → header, dummy for exit)
     si += 1; latch_disc_si = si
@@ -363,7 +354,7 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
     for eb in exit_block_set
         push!(ld_edges, Int32(eb)); push!(ld_values, 0)
     end
-    append_stmt!(ir, si, PhiNode(ld_edges, ld_values), Int)
+    append_stmt!(ir,PhiNode(ld_edges, ld_values), Int)
 
     # Phis for each multiplexer union phi value (carried back to header)
     latch_carry_sis = Int[]
@@ -386,7 +377,7 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
             push!(phi_edges, Int32(eb))
             push!(phi_values, Undef(ir.stmts.type[mux_si]))
         end
-        append_stmt!(ir, si, PhiNode(phi_edges, phi_values), ir.stmts.type[mux_si])
+        append_stmt!(ir,PhiNode(phi_edges, phi_values), ir.stmts.type[mux_si])
     end
 
     # Exit value phi: consolidates the value each exit block carries to its destination
@@ -400,15 +391,15 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         push!(ev_edges, Int32(eb))
         push!(ev_values, something(get(exit_block_val, eb, nothing), Undef(exit_val_type)))
     end
-    append_stmt!(ir, si, PhiNode(ev_edges, ev_values), exit_val_type)
+    append_stmt!(ir,PhiNode(ev_edges, ev_values), exit_val_type)
 
     # Dispatch: GotoIfNot(shouldRepeat, exit_block) + GotoNode(header)
     bbx_idx = bbl_idx + 1
 
     si += 1
-    append_stmt!(ir, si, GotoIfNot(SSAValue(sr_si), bbx_idx), Any)
+    append_stmt!(ir,GotoIfNot(SSAValue(sr_si), bbx_idx), Any)
     si += 1
-    append_stmt!(ir, si, GotoNode(bbm_idx), Any)
+    append_stmt!(ir,GotoNode(bbm_idx), Any)
 
     latch_end = si
 
@@ -417,11 +408,11 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
     if all_return
         # All exits return — BBX returns the consolidated value
         si += 1
-        append_stmt!(ir, si, ReturnNode(SSAValue(exit_val_si)), Any)
+        append_stmt!(ir,ReturnNode(SSAValue(exit_val_si)), Any)
     elseif all_goto_same && goto_dest != 0
         # All exits go to the same destination — BBX branches there
         si += 1
-        append_stmt!(ir, si, GotoNode(goto_dest), Any)
+        append_stmt!(ir,GotoNode(goto_dest), Any)
     else
         dests = unique(d for (_, d) in exit_block_dest if d != 0)
         throw(UnstructuredControlFlowError(
@@ -490,11 +481,12 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
     end
 
     # === Phase 8: Update multiplexer phis (remove back-edge entries, add latch) ===
+    back_sources = Set{Int}(from for (from, _) in back_edges)
+    mux_phis_sorted = sort(collect(phi_ssa_map), by=first)
     for phi_si in [disc_si; collect(values(phi_ssa_map))]
         stmt = ir.stmts.stmt[phi_si]
         stmt isa PhiNode || continue
         new_edges = Int32[]; new_values = Any[]
-        back_sources = Set{Int}(from for (from, _) in back_edges)
         for (idx, edge) in enumerate(stmt.edges)
             if Int(edge) ∉ back_sources
                 push!(new_edges, edge)
@@ -505,7 +497,6 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         if phi_si == disc_si
             push!(new_values, SSAValue(latch_disc_si))
         else
-            mux_phis_sorted = sort(collect(phi_ssa_map), by=first)
             carry_idx = findfirst(p -> p[2] == phi_si, mux_phis_sorted)
             push!(new_values, SSAValue(latch_carry_sis[carry_idx]))
         end
@@ -564,8 +555,7 @@ function update_phi_predecessor!(ir::IRCode, block::Int, old_pred::Int, new_pred
     end
 end
 
-"""Append a statement to the IR's instruction stream."""
-function append_stmt!(ir::IRCode, si::Int, @nospecialize(stmt), @nospecialize(typ))
+function append_stmt!(ir::IRCode, @nospecialize(stmt), @nospecialize(typ))
     push!(ir.stmts.stmt, stmt)
     push!(ir.stmts.type, typ)
     push!(ir.stmts.info, NoCallInfo())
@@ -573,7 +563,6 @@ function append_stmt!(ir::IRCode, si::Int, @nospecialize(stmt), @nospecialize(ty
     push!(ir.stmts.flag, UInt32(0))
 end
 
-"""Collect phis at a block: returns [(ssa_idx, type), ...]"""
 function collect_entry_phis(ir::IRCode, block::Int)
     result = Tuple{Int, Any}[]
     bb = ir.cfg.blocks[block]
@@ -583,7 +572,6 @@ function collect_entry_phis(ir::IRCode, block::Int)
     result
 end
 
-"""Get the value a PhiNode carries from a specific predecessor edge."""
 function get_phi_value_for_edge(ir::IRCode, phi_si::Int, from::Int)
     stmt = ir.stmts.stmt[phi_si]
     stmt isa PhiNode || return nothing
@@ -595,7 +583,6 @@ function get_phi_value_for_edge(ir::IRCode, phi_si::Int, from::Int)
     return nothing  # edge not found
 end
 
-"""Redirect a block's terminator from targeting `old_dest` to `new_dest`."""
 function redirect_terminator!(ir::IRCode, from::Int, old_dest::Int, new_dest::Int)
     bb = ir.cfg.blocks[from]
     for si in first(bb.stmts):last(bb.stmts)

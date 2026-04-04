@@ -125,7 +125,6 @@ end
  Statement Emission
 =============================================================================#
 
-"""Emit non-phi, non-terminator statements from a basic block."""
 function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
     ir = ctx.ir
     remap = ctx.ssa_remap
@@ -140,7 +139,6 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
     end
 end
 
-"""Find the terminator statement in a basic block."""
 function find_terminator(ir::IRCode, bb_idx::Int)
     bb = ir.cfg.blocks[bb_idx]
     for si in first(bb.stmts):last(bb.stmts)
@@ -302,7 +300,6 @@ function set_branch_yields!(blk::Block, merge_phis::Vector{MergePhiInfo},
     blk.terminator = make_yield_for_edge(ir, merge_phis, exit_block, blk, ctx)
 end
 
-"""Ensure a block has a terminator (YieldOp if nothing set)."""
 function set_yield_if_needed!(blk::Block)
     blk.terminator === nothing && (blk.terminator = YieldOp())
 end
