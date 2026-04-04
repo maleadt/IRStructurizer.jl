@@ -71,7 +71,7 @@ include("structurize/loops.jl")
 Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForOp.
 """
 function structurize(ir::IRCode)
-    ir = normalize_irreducible(ir)
+    check_irreducible(ir)
     ctx = StructurizeCtx(ir)
     all_blocks = Set(1:length(ir.cfg.blocks))
     entry = structurize_region!(ctx, 1, all_blocks)
