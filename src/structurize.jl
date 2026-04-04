@@ -305,7 +305,240 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
         end
     end
 
+    # --- Create exit latch ---
+    # Consolidates all back-edges and exit edges into a single latch block.
+    # Back-edges (shouldRepeat=1) → loop header. Exit edges (shouldRepeat=0) → exit block.
+    insert_exit_latch!(ir, scc_blocks, entries, bbm_idx, disc_si, phi_ssa_map)
+
     return ir
+end
+
+"""
+Insert an exit latch block that consolidates back-edges and exit edges.
+
+All edges leaving SCC blocks (back-edges to multiplexer + exits to return blocks)
+are redirected to the latch. The latch has a shouldRepeat flag that dispatches:
+  shouldRepeat=1 → loop header (multiplexer) with carried values
+  shouldRepeat=0 → exit block with return value
+
+This gives the loop exactly one back-edge and one exit edge.
+"""
+function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{Int},
+                              bbm_idx::Int, disc_si::Int, phi_ssa_map::Dict{Int, Int})
+    nblocks = length(ir.cfg.blocks)
+    si = length(ir.stmts.stmt)
+
+    # Classify edges from SCC blocks
+    # back_edges: SCC block → entry block (now BBM after mux redirect)
+    # exit_edges: SCC block → return block (outside SCC)
+    back_edges = Tuple{Int, Int}[]   # (from, original_entry_idx)
+    exit_edges = Tuple{Int, Int, Any}[]  # (from, exit_block, return_value)
+
+    for b in scc_blocks
+        for succ in ir.cfg.blocks[b].succs
+            if succ == bbm_idx
+                # Back-edge: determine which entry it targets from disc phi
+                # Find the disc value this block carries
+                disc_stmt = ir.stmts.stmt[disc_si]
+                disc_val = 0
+                for (idx, edge) in enumerate(disc_stmt.edges)
+                    Int(edge) == b && (disc_val = disc_stmt.values[idx])
+                end
+                push!(back_edges, (b, disc_val))
+            elseif succ ∉ scc_blocks && succ != bbm_idx
+                # Exit edge: extract the return value from the exit block
+                exit_bb = ir.cfg.blocks[succ]
+                ret_val = nothing
+                for esi in first(exit_bb.stmts):last(exit_bb.stmts)
+                    s = ir.stmts.stmt[esi]
+                    if s isa ReturnNode && isdefined(s, :val)
+                        ret_val = s.val
+                    end
+                end
+                push!(exit_edges, (b, succ, ret_val))
+            end
+        end
+    end
+
+    (isempty(back_edges) && isempty(exit_edges)) && return
+
+    # --- Create latch block (BBL) ---
+    bbl_idx = nblocks + 1
+    latch_start = si + 1
+
+    # Exit-edge predecessors to the latch are the EXIT BLOCKS (BB4, BB7),
+    # not the SCC blocks that branch to them (BB3, BB6).
+    exit_block_set = Set{Int}(eb for (_, eb, _) in exit_edges)
+
+    # Phi 1: shouldRepeat (1 for back-edges, 0 for exit edges)
+    si += 1; sr_si = si
+    sr_edges = Int32[]; sr_values = Any[]
+    for (from, _) in back_edges
+        push!(sr_edges, Int32(from)); push!(sr_values, true)
+    end
+    for eb in exit_block_set
+        push!(sr_edges, Int32(eb)); push!(sr_values, false)
+    end
+    append_stmt!(ir, si, PhiNode(sr_edges, sr_values), Bool)
+
+    # Phi 2: disc value (for back-edge → header, dummy for exit)
+    si += 1; latch_disc_si = si
+    ld_edges = Int32[]; ld_values = Any[]
+    for (from, disc_val) in back_edges
+        push!(ld_edges, Int32(from)); push!(ld_values, disc_val)
+    end
+    for eb in exit_block_set
+        push!(ld_edges, Int32(eb)); push!(ld_values, 0)
+    end
+    append_stmt!(ir, si, PhiNode(ld_edges, ld_values), Int)
+
+    # Phis for each multiplexer union phi value (carried back to header)
+    latch_carry_sis = Int[]
+    for (orig_si, mux_si) in sort(collect(phi_ssa_map), by=first)
+        si += 1
+        push!(latch_carry_sis, si)
+        phi_edges = Int32[]; phi_values = Any[]
+        # Back-edges: carry the value from the multiplexer phi for this entry
+        mux_phi = ir.stmts.stmt[mux_si]
+        for (from, _) in back_edges
+            # Find the value this block would carry for this phi
+            val = nothing
+            if mux_phi isa PhiNode
+                for (idx, edge) in enumerate(mux_phi.edges)
+                    Int(edge) == from && (val = mux_phi.values[idx])
+                end
+            end
+            push!(phi_edges, Int32(from))
+            push!(phi_values, something(val, Undef(ir.stmts.type[mux_si])))
+        end
+        # Exit blocks: Undef (not going back to header)
+        for eb in exit_block_set
+            push!(phi_edges, Int32(eb))
+            push!(phi_values, Undef(ir.stmts.type[mux_si]))
+        end
+        append_stmt!(ir, si, PhiNode(phi_edges, phi_values), ir.stmts.type[mux_si])
+    end
+
+    # Phi for return value (from exit blocks, Undef from back-edges)
+    si += 1; ret_val_si = si
+    rv_edges = Int32[]; rv_values = Any[]
+    # Determine return type from exit blocks
+    ret_type = Any
+    for (_, eb, rv) in exit_edges
+        if rv !== nothing
+            ret_type = ir.stmts.type[rv isa SSAValue ? rv.id : first(ir.cfg.blocks[eb].stmts)]
+            break
+        end
+    end
+    for (from, _) in back_edges
+        push!(rv_edges, Int32(from)); push!(rv_values, Undef(ret_type))
+    end
+    # Group exit values by exit block
+    for (_, eb, ret_val) in exit_edges
+        if Int32(eb) ∉ rv_edges
+            push!(rv_edges, Int32(eb))
+            push!(rv_values, something(ret_val, Undef(ret_type)))
+        end
+    end
+    append_stmt!(ir, si, PhiNode(rv_edges, rv_values), ret_type)
+
+    # Dispatch: GotoIfNot(shouldRepeat, exit_block) + GotoNode(header)
+    bbx_idx = bbl_idx + 1  # exit block index
+
+    si += 1
+    append_stmt!(ir, si, GotoIfNot(SSAValue(sr_si), bbx_idx), Any)
+    si += 1
+    append_stmt!(ir, si, GotoNode(bbm_idx), Any)
+
+    latch_end = si
+
+    # --- Create exit block (BBX) ---
+    bbx_start = si + 1
+    si += 1
+    append_stmt!(ir, si, ReturnNode(SSAValue(ret_val_si)), Any)
+    bbx_end = si
+
+    # --- Add blocks to CFG ---
+    bbl = BasicBlock(StmtRange(latch_start, latch_end), Int[], Int[])
+    push!(ir.cfg.blocks, bbl)
+    for s in latch_start:latch_end; push!(ir.cfg.index, bbl_idx); end
+
+    bbx = BasicBlock(StmtRange(bbx_start, bbx_end), Int[bbl_idx], Int[])
+    push!(ir.cfg.blocks, bbx)
+    for s in bbx_start:bbx_end; push!(ir.cfg.index, bbx_idx); end
+
+    # Latch succs: exit block + header
+    push!(bbl.succs, bbx_idx)
+    push!(bbl.succs, bbm_idx)
+    # Header now has latch as predecessor (will update phis below)
+    push!(ir.cfg.blocks[bbm_idx].preds, bbl_idx)
+    push!(ir.cfg.blocks[bbm_idx].succs, bbl_idx)  # not really a succ, but for edge tracking
+
+    # --- Redirect back-edges: SCC→BBM to SCC→BBL ---
+    for (from, _) in back_edges
+        filter!(!=(bbm_idx), ir.cfg.blocks[from].succs)
+        push!(ir.cfg.blocks[from].succs, bbl_idx)
+        filter!(!=(from), ir.cfg.blocks[bbm_idx].preds)
+        push!(bbl.preds, from)
+        redirect_terminator!(ir, from, bbm_idx, bbl_idx)
+    end
+
+    # --- Redirect exit edges: convert exit blocks (return) to pass-through (goto latch) ---
+    # Don't redirect the predecessor's terminator (would destroy GotoIfNot).
+    # Instead, replace the exit block's ReturnNode with GotoNode(latch).
+    redirected_exit_blocks = Set{Int}()
+    for (from, exit_blk, _) in exit_edges
+        if exit_blk ∉ redirected_exit_blocks
+            push!(redirected_exit_blocks, exit_blk)
+            # Replace return with goto latch
+            exit_bb = ir.cfg.blocks[exit_blk]
+            for esi in first(exit_bb.stmts):last(exit_bb.stmts)
+                if ir.stmts.stmt[esi] isa ReturnNode
+                    ir.stmts.stmt[esi] = GotoNode(bbl_idx)
+                end
+            end
+            # Update CFG: exit_block now goes to latch
+            push!(exit_bb.succs, bbl_idx)
+            push!(bbl.preds, exit_blk)
+        end
+    end
+
+    # --- Update multiplexer phis: remove old back-edge entries, add latch entry ---
+    for phi_si in [disc_si; collect(values(phi_ssa_map))]
+        stmt = ir.stmts.stmt[phi_si]
+        stmt isa PhiNode || continue
+        # Build new phi: keep external entries (not from back-edge sources), add latch
+        new_edges = Int32[]; new_values = Any[]
+        back_sources = Set{Int}(from for (from, _) in back_edges)
+        for (idx, edge) in enumerate(stmt.edges)
+            if Int(edge) ∉ back_sources
+                push!(new_edges, edge)
+                push!(new_values, isassigned(stmt.values, idx) ? stmt.values[idx] : Undef(ir.stmts.type[phi_si]))
+            end
+        end
+        # Add latch edge with the latch's corresponding phi
+        push!(new_edges, Int32(bbl_idx))
+        if phi_si == disc_si
+            push!(new_values, SSAValue(latch_disc_si))
+        else
+            # Find the latch carry phi for this mux phi
+            mux_phis_sorted = sort(collect(phi_ssa_map), by=first)
+            carry_idx = findfirst(p -> p[2] == phi_si, mux_phis_sorted)
+            push!(new_values, SSAValue(latch_carry_sis[carry_idx]))
+        end
+        ir.stmts.stmt[phi_si] = PhiNode(new_edges, new_values)
+    end
+
+    return ir
+end
+
+"""Append a statement to the IR's instruction stream."""
+function append_stmt!(ir::IRCode, si::Int, @nospecialize(stmt), @nospecialize(typ))
+    push!(ir.stmts.stmt, stmt)
+    push!(ir.stmts.type, typ)
+    push!(ir.stmts.info, NoCallInfo())
+    push!(ir.stmts.line, Int32(0))
+    push!(ir.stmts.flag, UInt32(0))
 end
 
 """Collect phis at a block: returns [(ssa_idx, type), ...]"""
@@ -545,7 +778,10 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # If merge exists and is in region, extract its phis.
     # Skip phis at loop headers — UNLESS the header has multiple non-loop predecessors
     # (entry multiplexer case: branch must yield the correct entry values).
-    is_multi_entry_header = if merge !== nothing && haskey(ctx.loop_map, merge)
+    # Only extract multi-entry header phis OUTSIDE the loop (for the entry IfOp).
+    # Inside the loop, the header is reached via the latch (single back-edge) → ContinueOp.
+    is_multi_entry_header = if merge !== nothing && haskey(ctx.loop_map, merge) &&
+                               loop_ctx === nothing  # not inside a loop
         loop_body = ctx.loop_map[merge]
         count(p -> p ∉ loop_body, ir.cfg.blocks[merge].preds) > 1
     else
@@ -1012,7 +1248,12 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     push!(block, loop_ssa, loop_op, result_type)
 
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        push!(block, phi_idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
+        # If a preceding IfOp already defined this phi SSA (multi-entry header),
+        # use a fresh index for the loop's getfield to avoid SSA uniqueness violation.
+        # Downstream code references phi_idx which is the IfOp's definition;
+        # the loop result is accessed via the fresh index (only used if phi changes in loop).
+        idx = haskey(block.body, phi_idx) ? alloc_ssa!(ctx) : phi_idx
+        push!(block, idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
     end
 
     return exit_dest
