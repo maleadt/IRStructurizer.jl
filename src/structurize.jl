@@ -753,9 +753,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
 
     # 3. Find extra exit values (loop-internal SSAs used outside)
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
-    extra_exits = exit_dest !== nothing ?
-        find_extra_exit_values(ir, exit_dest, loop_blocks, already_exported) :
-        @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
+    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported)
 
     # 4. Build init/carried values and block arguments
     init_values = IRValue[]
@@ -904,15 +902,49 @@ function find_loop_exit(ir::IRCode, loop_blocks::Set{Int})
     return nothing
 end
 
-"""Find loop-internal SSA values referenced outside the loop."""
-function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int},
+"""Find all blocks outside `loop_blocks` that are successors of loop blocks."""
+function find_loop_exits(ir::IRCode, loop_blocks::Set{Int})
+    exits = Set{Int}()
+    for b in loop_blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ loop_blocks && push!(exits, succ)
+        end
+    end
+    exits
+end
+
+"""
+Find loop-internal SSA values referenced outside the loop.
+
+Scans blocks reachable from loop exit edges (not the entire IR). This is more
+precise than scanning all non-loop blocks: it excludes blocks before the loop
+or on branches that bypass it. Values escape through exit-block phis, direct
+references at downstream blocks, or as operands of sequential loops.
+"""
+function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
                                  already_exported::Set{Int})
     result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
-    nblocks = length(ir.cfg.blocks)
     seen = Set{Int}()
 
-    for blk_idx in 1:nblocks
-        blk_idx ∈ loop_blocks && continue
+    # Collect all non-loop blocks reachable from loop exit edges
+    reachable = Set{Int}()
+    worklist = Int[]
+    for b in loop_blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ loop_blocks && push!(worklist, succ)
+        end
+    end
+    while !isempty(worklist)
+        b = pop!(worklist)
+        b ∈ reachable && continue
+        b ∈ loop_blocks && continue
+        push!(reachable, b)
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ reachable && succ ∉ loop_blocks && push!(worklist, succ)
+        end
+    end
+
+    for blk_idx in reachable
         bb = ir.cfg.blocks[blk_idx]
         for si in first(bb.stmts):last(bb.stmts)
             stmt = ir.stmts.stmt[si]
@@ -923,12 +955,13 @@ function find_extra_exit_values(ir::IRCode, exit_dest::Int, loop_blocks::Set{Int
                         loop_val = stmt.values[edge_idx]
                         gf_idx = loop_val isa SSAValue ? loop_val.id : si
                         gf_idx ∈ seen && continue
-                        gf_idx ∈ already_exported && continue  # already a header phi
+                        gf_idx ∈ already_exported && continue
                         push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
                         push!(seen, gf_idx)
                     end
                 end
             else
+                # Single-predecessor exit blocks may reference loop values directly
                 for arg in stmt_ssa_uses(stmt)
                     is_defined_in(arg, loop_blocks, ir) || continue
                     arg.id ∈ already_exported && continue
