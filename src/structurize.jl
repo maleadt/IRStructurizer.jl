@@ -93,39 +93,254 @@ function get_loop_at(ctx::StructurizeCtx, header::Int, region_blocks::Set{Int})
 end
 
 #=============================================================================
- Irreducible CFG Detection
+ Irreducible CFG Normalization (entry multiplexer pre-pass)
 =============================================================================#
 
 """
-    check_reducibility(ir, domtree)
+    normalize_irreducible(ir::IRCode) -> IRCode
 
-Verify the CFG is reducible by checking that removing all dominance-based
-backedges leaves an acyclic graph (via Kahn's topological sort).
-Throws `UnstructuredControlFlowError` if an irreducible cycle is found.
+If the CFG has irreducible cycles (multi-entry SCCs), insert entry multiplexer
+blocks to make them reducible. Returns the original IRCode unchanged if already
+reducible.
+
+The multiplexer is a new block with a discriminator phi that dispatches to the
+original entry blocks via GotoIfNot. All edges into the SCC are redirected to
+the multiplexer, making the SCC a natural loop with a single entry.
 """
-function check_reducibility(ir::IRCode, domtree::DomTree)
-    n = length(ir.cfg.blocks)
-    indegree = zeros(Int, n)
-    adj = [Int[] for _ in 1:n]
-    for (i, bb) in enumerate(ir.cfg.blocks)
-        for succ in bb.succs
-            dominates(domtree, succ, i) && continue  # skip backedges
-            push!(adj[i], succ)
-            indegree[succ] += 1
+function normalize_irreducible(ir::IRCode)
+    domtree = construct_domtree(ir)
+    reach = CFGReachability(ir.cfg, domtree)
+
+    # Find multi-entry SCCs
+    scc_groups = Dict{Int, Set{Int}}()
+    for (bb, scc_id) in enumerate(reach.scc)
+        scc_id == 0 && continue
+        bb_in_irreducible_loop(reach, bb) || continue
+        push!(get!(Set{Int}, scc_groups, scc_id), bb)
+    end
+
+    irreducible_sccs = Tuple{Set{Int}, Vector{Int}}[]  # (blocks, entries)
+    for (_, blocks) in scc_groups
+        length(blocks) <= 1 && continue
+        entries = sort!([bb for bb in blocks
+                         if any(p -> p ∉ blocks, ir.cfg.blocks[bb].preds)])
+        length(entries) >= 2 && push!(irreducible_sccs, (blocks, entries))
+    end
+
+    isempty(irreducible_sccs) && return ir
+
+    # Copy IR for mutation
+    ir = copy_ir(ir)
+
+    for (scc_blocks, entries) in irreducible_sccs
+        insert_entry_multiplexer!(ir, scc_blocks, entries)
+    end
+
+    return ir
+end
+
+"""Deep-copy an IRCode so we can mutate stmts, cfg blocks, and phis."""
+function copy_ir(ir::IRCode)
+    new_stmts = InstructionStream(
+        copy(ir.stmts.stmt), copy(ir.stmts.type),
+        copy(ir.stmts.info), copy(ir.stmts.line), copy(ir.stmts.flag))
+    new_blocks = [BasicBlock(StmtRange(first(bb.stmts), last(bb.stmts)),
+                             copy(bb.preds), copy(bb.succs))
+                  for bb in ir.cfg.blocks]
+    new_cfg = CFG(new_blocks, copy(ir.cfg.index))
+    IRCode(new_stmts, new_cfg, ir.debuginfo, copy(ir.argtypes),
+           copy(ir.meta), copy(ir.sptypes))
+end
+
+"""
+Insert an entry multiplexer block for a multi-entry SCC.
+
+For entries [E0, E1], creates block BBM that:
+1. Has a discriminator phi (0 = E0, 1 = E1)
+2. Has phis mirroring each entry's phis (union with Undef padding)
+3. Dispatches to E0 (fallthrough) or E1 (branch) based on discriminator
+4. All entry edges (external + back-edges) redirect to BBM
+"""
+function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{Int})
+    nblocks = length(ir.cfg.blocks)
+    n_stmts = length(ir.stmts.stmt)
+
+    # Collect edges to redirect: all edges into entry blocks from outside or from SCC back-edges
+    # An "entry edge" is any edge from a block NOT in the SCC to an SCC entry,
+    # OR any back-edge from inside the SCC to an SCC entry.
+    edges_to_redirect = Tuple{Int, Int, Int}[]  # (from, to, entry_index)
+    for (ei, entry) in enumerate(entries)
+        for pred in ir.cfg.blocks[entry].preds
+            # Redirect ALL edges to entry blocks (external + internal back-edges)
+            push!(edges_to_redirect, (pred, entry, ei))
         end
     end
-    queue = Int[i for i in 1:n if indegree[i] == 0]
-    count = 0
-    while !isempty(queue)
-        v = popfirst!(queue)
-        count += 1
-        for w in adj[v]
-            indegree[w] -= 1
-            indegree[w] == 0 && push!(queue, w)
+
+    # Collect phis at each entry block
+    entry_phis = [collect_entry_phis(ir, e) for e in entries]
+
+    # --- Append multiplexer statements ---
+    bbm_idx = nblocks + 1
+    new_stmt_start = n_stmts + 1
+    si = n_stmts
+
+    # Discriminator phi: edges from all redirected sources
+    si += 1
+    disc_si = si
+    disc_edges = Int32[]
+    disc_values = Any[]
+    for (from, _, ei) in edges_to_redirect
+        push!(disc_edges, Int32(from))
+        push!(disc_values, ei - 1)  # 0-indexed discriminator
+    end
+    push!(ir.stmts.stmt, PhiNode(disc_edges, disc_values))
+    push!(ir.stmts.type, Int)
+    push!(ir.stmts.info, NoCallInfo())
+    push!(ir.stmts.line, Int32(0))
+    push!(ir.stmts.flag, UInt32(0))
+
+    # Union phis: for each entry's phi, create a multiplexer phi
+    # that carries the value from the appropriate predecessor
+    phi_ssa_map = Dict{Int, Int}()  # original_phi_si → multiplexer_phi_si
+    for (ei, phis) in enumerate(entry_phis)
+        for (orig_si, orig_type) in phis
+            si += 1
+            phi_edges = Int32[]
+            phi_values = Vector{Any}(undef, 0)
+            for (from, _, edge_ei) in edges_to_redirect
+                push!(phi_edges, Int32(from))
+                if edge_ei == ei
+                    # This edge targets the same entry — use the original phi value
+                    val = get_phi_value_for_edge(ir, orig_si, from)
+                    push!(phi_values, val)
+                else
+                    # Different entry — Undef
+                    push!(phi_values, Undef(orig_type))
+                end
+            end
+            push!(ir.stmts.stmt, PhiNode(phi_edges, phi_values))
+            push!(ir.stmts.type, orig_type)
+            push!(ir.stmts.info, NoCallInfo())
+            push!(ir.stmts.line, Int32(0))
+            push!(ir.stmts.flag, UInt32(0))
+            phi_ssa_map[orig_si] = si
         end
     end
-    count < n && throw(UnstructuredControlFlowError(
-        "irreducible control flow detected (multi-entry cycle)"))
+
+    # Dispatch: compare discriminator and branch to correct entry.
+    # Use GotoIfNot + GotoNode (not fallthrough) since BBM may not be
+    # adjacent to E0 in block order.
+    if length(entries) == 2
+        si += 1
+        cmp_si = si
+        push!(ir.stmts.stmt, Expr(:call, GlobalRef(Base, :(===)), SSAValue(disc_si), 0))
+        push!(ir.stmts.type, Bool)
+        push!(ir.stmts.info, NoCallInfo())
+        push!(ir.stmts.line, Int32(0))
+        push!(ir.stmts.flag, UInt32(0))
+
+        si += 1
+        push!(ir.stmts.stmt, GotoIfNot(SSAValue(cmp_si), entries[2]))
+        push!(ir.stmts.type, Any)
+        push!(ir.stmts.info, NoCallInfo())
+        push!(ir.stmts.line, Int32(0))
+        push!(ir.stmts.flag, UInt32(0))
+
+        # Explicit goto E0 (can't rely on fallthrough — BBM is appended at end)
+        si += 1
+        push!(ir.stmts.stmt, GotoNode(entries[1]))
+        push!(ir.stmts.type, Any)
+        push!(ir.stmts.info, NoCallInfo())
+        push!(ir.stmts.line, Int32(0))
+        push!(ir.stmts.flag, UInt32(0))
+    else
+        error("irreducible control flow with >2 entries not yet supported")
+    end
+
+    new_stmt_end = si
+
+    # --- Create multiplexer basic block ---
+    bbm = BasicBlock(StmtRange(new_stmt_start, new_stmt_end), Int[], Int[])
+    push!(ir.cfg.blocks, bbm)
+    # Extend cfg.index for new statements
+    for _ in new_stmt_start:new_stmt_end
+        push!(ir.cfg.index, bbm_idx)
+    end
+
+    # BBM successors: E0 (fallthrough) and E1 (branch target)
+    push!(bbm.succs, entries[1])  # fallthrough
+    length(entries) >= 2 && push!(bbm.succs, entries[2])
+
+    # --- Redirect edges ---
+    for (from, to, _) in edges_to_redirect
+        # Remove old edge from→to
+        filter!(!=(to), ir.cfg.blocks[from].succs)
+        filter!(!=(from), ir.cfg.blocks[to].preds)
+
+        # Add new edge from→BBM (if not already present)
+        if bbm_idx ∉ ir.cfg.blocks[from].succs
+            push!(ir.cfg.blocks[from].succs, bbm_idx)
+        end
+        if from ∉ bbm.preds
+            push!(bbm.preds, from)
+        end
+
+        # Add BBM→to pred (if not already present)
+        if bbm_idx ∉ ir.cfg.blocks[to].preds
+            push!(ir.cfg.blocks[to].preds, bbm_idx)
+        end
+
+        # Update GotoNode/GotoIfNot at `from` to target BBM instead of `to`
+        redirect_terminator!(ir, from, to, bbm_idx)
+    end
+
+    # --- Update phis at original entries ---
+    # Replace single-edge phis with identity expressions so emit_block_stmts! emits them
+    # (PhiNodes are skipped by the structurizer; these now have only the BBM edge)
+    for (ei, entry) in enumerate(entries)
+        phis = entry_phis[ei]
+        for (orig_si, _) in phis
+            mux_si = phi_ssa_map[orig_si]
+            ir.stmts.stmt[orig_si] = SSAValue(mux_si)
+        end
+    end
+
+    return ir
+end
+
+"""Collect phis at a block: returns [(ssa_idx, type), ...]"""
+function collect_entry_phis(ir::IRCode, block::Int)
+    result = Tuple{Int, Any}[]
+    bb = ir.cfg.blocks[block]
+    for si in first(bb.stmts):last(bb.stmts)
+        ir.stmts.stmt[si] isa PhiNode && push!(result, (si, ir.stmts.type[si]))
+    end
+    result
+end
+
+"""Get the value a PhiNode carries from a specific predecessor edge."""
+function get_phi_value_for_edge(ir::IRCode, phi_si::Int, from::Int)
+    stmt = ir.stmts.stmt[phi_si]
+    stmt isa PhiNode || return nothing
+    for (idx, edge) in enumerate(stmt.edges)
+        if Int(edge) == from && isassigned(stmt.values, idx)
+            return stmt.values[idx]
+        end
+    end
+    return nothing  # edge not found
+end
+
+"""Redirect a block's terminator from targeting `old_dest` to `new_dest`."""
+function redirect_terminator!(ir::IRCode, from::Int, old_dest::Int, new_dest::Int)
+    bb = ir.cfg.blocks[from]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        if stmt isa GotoNode && stmt.label == old_dest
+            ir.stmts.stmt[si] = GotoNode(new_dest)
+        elseif stmt isa GotoIfNot && stmt.dest == old_dest
+            ir.stmts.stmt[si] = GotoIfNot(stmt.cond, new_dest)
+        end
+    end
 end
 
 #=============================================================================
@@ -138,8 +353,8 @@ end
 Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForOp.
 """
 function structurize(ir::IRCode)
+    ir = normalize_irreducible(ir)
     ctx = StructurizeCtx(ir)
-    check_reducibility(ir, ctx.domtree)
     all_blocks = Set(1:length(ir.cfg.blocks))
     entry = structurize_region!(ctx, 1, all_blocks)
     promote_loops!(entry, ctx)
@@ -317,7 +532,10 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
 
     # GotoIfNot: cond=false → dest, cond=true → fallthrough
     false_dest = gotoifnot.dest
-    true_dest = current + 1
+    # Derive fallthrough from CFG successors (not current+1, which assumes sequential layout)
+    bb_succs = ir.cfg.blocks[current].succs
+    true_dest = length(bb_succs) == 1 ? only(bb_succs) :
+                first(s for s in bb_succs if s != false_dest)
     cond = remap_ssa_ref(gotoifnot.cond, ctx.ssa_remap)
 
     # Determine branch regions and merge block using dominance
@@ -325,8 +543,16 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         ctx, current, true_dest, false_dest, region_blocks)
 
     # If merge exists and is in region, extract its phis.
-    # Skip phis at loop headers — those are loop-carried values, not branch merge values.
-    merge_phis = if merge !== nothing && merge ∈ region_blocks && !haskey(ctx.loop_map, merge)
+    # Skip phis at loop headers — UNLESS the header has multiple non-loop predecessors
+    # (entry multiplexer case: branch must yield the correct entry values).
+    is_multi_entry_header = if merge !== nothing && haskey(ctx.loop_map, merge)
+        loop_body = ctx.loop_map[merge]
+        count(p -> p ∉ loop_body, ir.cfg.blocks[merge].preds) > 1
+    else
+        false
+    end
+    merge_phis = if merge !== nothing && merge ∈ region_blocks &&
+                   (!haskey(ctx.loop_map, merge) || is_multi_entry_header)
         phis = extract_merge_phis(ir, merge, region_blocks)
         # If merge has no phis, check its successors for phis
         # (handles pass-through merge blocks like in || patterns)
@@ -478,9 +704,12 @@ function find_exit_predecessor(merge_phis::Vector{MergePhiInfo}, blocks::Set{Int
     nblocks = length(ir.cfg.blocks)
     seeds = isempty(blocks) ? Set{Int}([fallback]) : blocks
 
-    # Check seeds directly
+    # Check seeds and fallback directly (before BFS)
     for b in seeds, phi in merge_phis
         haskey(phi.edge_values, b) && return b
+    end
+    for phi in merge_phis
+        haskey(phi.edge_values, fallback) && return fallback
     end
 
     # BFS through successors of seeds (handles pass-through blocks)
@@ -730,7 +959,10 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     subs = Dict{Int, BlockArgument}()
 
     for phi in phi_info
-        push!(init_values, phi.entry_val)
+        # If a preceding IfOp already defined this phi SSA (via getfield),
+        # use that as init_val — it captures the correct branch-selected value.
+        init_val = haskey(block.body, phi.ssa_idx) ? SSAValue(phi.ssa_idx) : phi.entry_val
+        push!(init_values, init_val)
         push!(carried_values, phi.carried_val)
         push!(phi_indices, phi.ssa_idx)
         push!(phi_types, ctx.types[phi.ssa_idx])

@@ -6,7 +6,8 @@ using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
 using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
                      construct_domtree, DomTree, dominates,
                      construct_postdomtree, PostDomTree, postdominates,
-                     bb_unreachable, widenconst
+                     CFGReachability, bb_in_irreducible_loop,
+                     NoCallInfo, bb_unreachable, widenconst
 using Base: code_ircode
 
 # structured IR definitions
