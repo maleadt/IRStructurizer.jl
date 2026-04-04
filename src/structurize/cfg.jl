@@ -176,31 +176,18 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
     end
 
     # Dispatch: compare discriminator and branch to correct entry.
-    # Use GotoIfNot + GotoNode (not fallthrough) since BBM may not be
-    # adjacent to E0 in block order.
+    # Currently supports 2-entry SCCs. For N>2, entry multiplexing would need
+    # a dispatch chain — deferred until needed (requires multi-block dispatch).
     if length(entries) == 2
         si += 1
         cmp_si = si
-        push!(ir.stmts.stmt, Expr(:call, GlobalRef(Base, :(===)), SSAValue(disc_si), 0))
-        push!(ir.stmts.type, Bool)
-        push!(ir.stmts.info, NoCallInfo())
-        push!(ir.stmts.line, Int32(0))
-        push!(ir.stmts.flag, UInt32(0))
+        append_stmt!(ir, si, Expr(:call, GlobalRef(Base, :(===)), SSAValue(disc_si), 0), Bool)
 
         si += 1
-        push!(ir.stmts.stmt, GotoIfNot(SSAValue(cmp_si), entries[2]))
-        push!(ir.stmts.type, Any)
-        push!(ir.stmts.info, NoCallInfo())
-        push!(ir.stmts.line, Int32(0))
-        push!(ir.stmts.flag, UInt32(0))
+        append_stmt!(ir, si, GotoIfNot(SSAValue(cmp_si), entries[2]), Any)
 
-        # Explicit goto E0 (can't rely on fallthrough — BBM is appended at end)
         si += 1
-        push!(ir.stmts.stmt, GotoNode(entries[1]))
-        push!(ir.stmts.type, Any)
-        push!(ir.stmts.info, NoCallInfo())
-        push!(ir.stmts.line, Int32(0))
-        push!(ir.stmts.flag, UInt32(0))
+        append_stmt!(ir, si, GotoNode(entries[1]), Any)
     else
         error("irreducible control flow with >2 entries not yet supported")
     end
@@ -210,13 +197,11 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
     # --- Create multiplexer basic block ---
     bbm = BasicBlock(StmtRange(new_stmt_start, new_stmt_end), Int[], Int[])
     push!(ir.cfg.blocks, bbm)
-    # Extend cfg.index for new statements
     for _ in new_stmt_start:new_stmt_end
         push!(ir.cfg.index, bbm_idx)
     end
 
-    # BBM successors: E0 (fallthrough) and E1 (branch target)
-    push!(bbm.succs, entries[1])  # fallthrough
+    push!(bbm.succs, entries[1])
     length(entries) >= 2 && push!(bbm.succs, entries[2])
 
     # --- Redirect edges ---
@@ -264,29 +249,26 @@ end
 """
 Insert an exit latch block that consolidates back-edges and exit edges.
 
-All edges leaving SCC blocks (back-edges to multiplexer + exits to return blocks)
-are redirected to the latch. The latch has a shouldRepeat flag that dispatches:
-  shouldRepeat=1 → loop header (multiplexer) with carried values
-  shouldRepeat=0 → exit block with return value
+All edges leaving SCC blocks (back-edges to multiplexer + exits outside the SCC)
+are redirected through the latch. The latch has a shouldRepeat flag that dispatches:
+  shouldRepeat=true → loop header (multiplexer) with carried values
+  shouldRepeat=false → exit block (BBX) with consolidated exit values
 
-This gives the loop exactly one back-edge and one exit edge.
+Handles both ReturnNode and GotoNode exit blocks uniformly. Exit blocks become
+pass-throughs to the latch; their original destinations are reached via BBX.
 """
 function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{Int},
                               bbm_idx::Int, disc_si::Int, phi_ssa_map::Dict{Int, Int})
     nblocks = length(ir.cfg.blocks)
     si = length(ir.stmts.stmt)
 
-    # Classify edges from SCC blocks
-    # back_edges: SCC block → entry block (now BBM after mux redirect)
-    # exit_edges: SCC block → return block (outside SCC)
-    back_edges = Tuple{Int, Int}[]   # (from, original_entry_idx)
-    exit_edges = Tuple{Int, Int, Any}[]  # (from, exit_block, return_value)
+    # === Phase 1: Classify edges from SCC blocks ===
+    back_edges = Tuple{Int, Int}[]   # (from, disc_val)
+    exit_edges = Tuple{Int, Int}[]   # (scc_block, exit_block)
 
     for b in scc_blocks
         for succ in ir.cfg.blocks[b].succs
             if succ == bbm_idx
-                # Back-edge: determine which entry it targets from disc phi
-                # Find the disc value this block carries
                 disc_stmt = ir.stmts.stmt[disc_si]
                 disc_val = 0
                 for (idx, edge) in enumerate(disc_stmt.edges)
@@ -294,31 +276,72 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
                 end
                 push!(back_edges, (b, disc_val))
             elseif succ ∉ scc_blocks && succ != bbm_idx
-                # Exit edge: extract the return value from the exit block
-                exit_bb = ir.cfg.blocks[succ]
-                ret_val = nothing
-                for esi in first(exit_bb.stmts):last(exit_bb.stmts)
-                    s = ir.stmts.stmt[esi]
-                    if s isa ReturnNode && isdefined(s, :val)
-                        ret_val = s.val
-                    end
-                end
-                push!(exit_edges, (b, succ, ret_val))
+                push!(exit_edges, (b, succ))
             end
         end
     end
 
     (isempty(back_edges) && isempty(exit_edges)) && return
 
-    # --- Create latch block (BBL) ---
+    # === Phase 2: Analyze exit blocks ===
+    # For each exit block, determine its original destination and the values
+    # it carries there. Exit blocks with ReturnNode carry a return value;
+    # exit blocks with GotoNode carry phi values to their destination.
+    exit_block_set = Set{Int}(eb for (_, eb) in exit_edges)
+    exit_block_dest = Dict{Int, Int}()     # exit_block → original dest (0 = return)
+    exit_block_val = Dict{Int, Any}()      # exit_block → value to thread through latch
+    goto_dest = 0                           # common goto destination (if all go to same)
+    all_return = true
+    all_goto_same = true
+
+    for eb in exit_block_set
+        exit_bb = ir.cfg.blocks[eb]
+        for esi in first(exit_bb.stmts):last(exit_bb.stmts)
+            s = ir.stmts.stmt[esi]
+            if s isa ReturnNode
+                exit_block_dest[eb] = 0
+                exit_block_val[eb] = isdefined(s, :val) ? s.val : nothing
+                all_goto_same = false
+            elseif s isa GotoNode
+                dest = s.label
+                exit_block_dest[eb] = dest
+                all_return = false
+                if goto_dest == 0
+                    goto_dest = dest
+                elseif goto_dest != dest
+                    all_goto_same = false
+                end
+                # Find the phi value at dest from this exit block
+                exit_block_val[eb] = find_first_phi_value(ir, dest, eb)
+            end
+        end
+    end
+
+    # Determine the exit value type
+    exit_val_type = Any
+    for (eb, val) in exit_block_val
+        val === nothing && continue
+        if val isa SSAValue
+            exit_val_type = ir.stmts.type[val.id]
+        else
+            dest = exit_block_dest[eb]
+            if dest == 0  # return — try to get type from the value
+                exit_val_type = val isa SSAValue ? ir.stmts.type[val.id] : typeof(val)
+            else  # goto — type from destination phi
+                dest_bb = ir.cfg.blocks[dest]
+                for dsi in first(dest_bb.stmts):last(dest_bb.stmts)
+                    ir.stmts.stmt[dsi] isa PhiNode && (exit_val_type = ir.stmts.type[dsi]; break)
+                end
+            end
+        end
+        break
+    end
+
+    # === Phase 3: Create latch block (BBL) ===
     bbl_idx = nblocks + 1
     latch_start = si + 1
 
-    # Exit-edge predecessors to the latch are the EXIT BLOCKS (BB4, BB7),
-    # not the SCC blocks that branch to them (BB3, BB6).
-    exit_block_set = Set{Int}(eb for (_, eb, _) in exit_edges)
-
-    # Phi 1: shouldRepeat (1 for back-edges, 0 for exit edges)
+    # Phi 1: shouldRepeat (true for back-edges, false for exit edges)
     si += 1; sr_si = si
     sr_edges = Int32[]; sr_values = Any[]
     for (from, _) in back_edges
@@ -346,10 +369,8 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         si += 1
         push!(latch_carry_sis, si)
         phi_edges = Int32[]; phi_values = Any[]
-        # Back-edges: carry the value from the multiplexer phi for this entry
         mux_phi = ir.stmts.stmt[mux_si]
         for (from, _) in back_edges
-            # Find the value this block would carry for this phi
             val = nothing
             if mux_phi isa PhiNode
                 for (idx, edge) in enumerate(mux_phi.edges)
@@ -359,7 +380,6 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
             push!(phi_edges, Int32(from))
             push!(phi_values, something(val, Undef(ir.stmts.type[mux_si])))
         end
-        # Exit blocks: Undef (not going back to header)
         for eb in exit_block_set
             push!(phi_edges, Int32(eb))
             push!(phi_values, Undef(ir.stmts.type[mux_si]))
@@ -367,31 +387,21 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         append_stmt!(ir, si, PhiNode(phi_edges, phi_values), ir.stmts.type[mux_si])
     end
 
-    # Phi for return value (from exit blocks, Undef from back-edges)
-    si += 1; ret_val_si = si
-    rv_edges = Int32[]; rv_values = Any[]
-    # Determine return type from exit blocks
-    ret_type = Any
-    for (_, eb, rv) in exit_edges
-        if rv !== nothing
-            ret_type = ir.stmts.type[rv isa SSAValue ? rv.id : first(ir.cfg.blocks[eb].stmts)]
-            break
-        end
-    end
+    # Exit value phi: consolidates the value each exit block carries to its destination
+    # (return value for ReturnNode exits, downstream phi value for GotoNode exits)
+    si += 1; exit_val_si = si
+    ev_edges = Int32[]; ev_values = Any[]
     for (from, _) in back_edges
-        push!(rv_edges, Int32(from)); push!(rv_values, Undef(ret_type))
+        push!(ev_edges, Int32(from)); push!(ev_values, Undef(exit_val_type))
     end
-    # Group exit values by exit block
-    for (_, eb, ret_val) in exit_edges
-        if Int32(eb) ∉ rv_edges
-            push!(rv_edges, Int32(eb))
-            push!(rv_values, something(ret_val, Undef(ret_type)))
-        end
+    for eb in exit_block_set
+        push!(ev_edges, Int32(eb))
+        push!(ev_values, something(get(exit_block_val, eb, nothing), Undef(exit_val_type)))
     end
-    append_stmt!(ir, si, PhiNode(rv_edges, rv_values), ret_type)
+    append_stmt!(ir, si, PhiNode(ev_edges, ev_values), exit_val_type)
 
     # Dispatch: GotoIfNot(shouldRepeat, exit_block) + GotoNode(header)
-    bbx_idx = bbl_idx + 1  # exit block index
+    bbx_idx = bbl_idx + 1
 
     si += 1
     append_stmt!(ir, si, GotoIfNot(SSAValue(sr_si), bbx_idx), Any)
@@ -400,29 +410,36 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
 
     latch_end = si
 
-    # --- Create exit block (BBX) ---
+    # === Phase 4: Create exit block (BBX) ===
     bbx_start = si + 1
-    si += 1
-    append_stmt!(ir, si, ReturnNode(SSAValue(ret_val_si)), Any)
+    if all_return
+        # All exits return — BBX returns the consolidated value
+        si += 1
+        append_stmt!(ir, si, ReturnNode(SSAValue(exit_val_si)), Any)
+    elseif all_goto_same && goto_dest != 0
+        # All exits go to the same destination — BBX branches there
+        si += 1
+        append_stmt!(ir, si, GotoNode(goto_dest), Any)
+    else
+        error("irreducible control flow with mixed return/goto exits not yet supported")
+    end
     bbx_end = si
 
-    # --- Add blocks to CFG ---
+    # === Phase 5: Add blocks to CFG ===
     bbl = BasicBlock(StmtRange(latch_start, latch_end), Int[], Int[])
     push!(ir.cfg.blocks, bbl)
     for s in latch_start:latch_end; push!(ir.cfg.index, bbl_idx); end
 
-    bbx = BasicBlock(StmtRange(bbx_start, bbx_end), Int[bbl_idx], Int[])
+    bbx_succs = all_return ? Int[] : Int[goto_dest]
+    bbx = BasicBlock(StmtRange(bbx_start, bbx_end), Int[bbl_idx], bbx_succs)
     push!(ir.cfg.blocks, bbx)
     for s in bbx_start:bbx_end; push!(ir.cfg.index, bbx_idx); end
 
-    # Latch succs: exit block + header
     push!(bbl.succs, bbx_idx)
     push!(bbl.succs, bbm_idx)
-    # Header now has latch as predecessor (will update phis below)
     push!(ir.cfg.blocks[bbm_idx].preds, bbl_idx)
-    push!(ir.cfg.blocks[bbm_idx].succs, bbl_idx)  # not really a succ, but for edge tracking
 
-    # --- Redirect back-edges: SCC→BBM to SCC→BBL ---
+    # === Phase 6: Redirect back-edges (SCC→BBM to SCC→BBL) ===
     for (from, _) in back_edges
         filter!(!=(bbm_idx), ir.cfg.blocks[from].succs)
         push!(ir.cfg.blocks[from].succs, bbl_idx)
@@ -431,31 +448,46 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         redirect_terminator!(ir, from, bbm_idx, bbl_idx)
     end
 
-    # --- Redirect exit edges: convert exit blocks (return) to pass-through (goto latch) ---
-    # Don't redirect the predecessor's terminator (would destroy GotoIfNot).
-    # Instead, replace the exit block's ReturnNode with GotoNode(latch).
+    # === Phase 7: Redirect exit blocks to latch (pass-through) ===
+    # Replace each exit block's terminator with GotoNode(latch).
+    # For GotoNode exits, also update the destination's phis.
     redirected_exit_blocks = Set{Int}()
-    for (from, exit_blk, _) in exit_edges
-        if exit_blk ∉ redirected_exit_blocks
-            push!(redirected_exit_blocks, exit_blk)
-            # Replace return with goto latch
-            exit_bb = ir.cfg.blocks[exit_blk]
-            for esi in first(exit_bb.stmts):last(exit_bb.stmts)
-                if ir.stmts.stmt[esi] isa ReturnNode
-                    ir.stmts.stmt[esi] = GotoNode(bbl_idx)
-                end
+    for (_, exit_blk) in exit_edges
+        exit_blk ∈ redirected_exit_blocks && continue
+        push!(redirected_exit_blocks, exit_blk)
+
+        exit_bb = ir.cfg.blocks[exit_blk]
+        dest = get(exit_block_dest, exit_blk, 0)
+
+        # Replace terminator with GotoNode(latch)
+        for esi in first(exit_bb.stmts):last(exit_bb.stmts)
+            s = ir.stmts.stmt[esi]
+            if s isa ReturnNode || s isa GotoNode
+                ir.stmts.stmt[esi] = GotoNode(bbl_idx)
             end
-            # Update CFG: exit_block now goes to latch
-            push!(exit_bb.succs, bbl_idx)
-            push!(bbl.preds, exit_blk)
+        end
+
+        # Update CFG: exit_block → latch
+        filter!(!=(dest), exit_bb.succs)  # remove old dest (0 for returns = no-op)
+        push!(exit_bb.succs, bbl_idx)
+        push!(bbl.preds, exit_blk)
+
+        # For goto exits: update destination's phis and CFG
+        if dest != 0
+            # Remove exit_block as predecessor of dest, add BBX
+            filter!(!=(exit_blk), ir.cfg.blocks[dest].preds)
+            if bbx_idx ∉ ir.cfg.blocks[dest].preds
+                push!(ir.cfg.blocks[dest].preds, bbx_idx)
+            end
+            # Update phis at dest: replace exit_block edge with BBX edge
+            update_phi_predecessor!(ir, dest, exit_blk, bbx_idx, SSAValue(exit_val_si))
         end
     end
 
-    # --- Update multiplexer phis: remove old back-edge entries, add latch entry ---
+    # === Phase 8: Update multiplexer phis (remove back-edge entries, add latch) ===
     for phi_si in [disc_si; collect(values(phi_ssa_map))]
         stmt = ir.stmts.stmt[phi_si]
         stmt isa PhiNode || continue
-        # Build new phi: keep external entries (not from back-edge sources), add latch
         new_edges = Int32[]; new_values = Any[]
         back_sources = Set{Int}(from for (from, _) in back_edges)
         for (idx, edge) in enumerate(stmt.edges)
@@ -464,12 +496,10 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
                 push!(new_values, isassigned(stmt.values, idx) ? stmt.values[idx] : Undef(ir.stmts.type[phi_si]))
             end
         end
-        # Add latch edge with the latch's corresponding phi
         push!(new_edges, Int32(bbl_idx))
         if phi_si == disc_si
             push!(new_values, SSAValue(latch_disc_si))
         else
-            # Find the latch carry phi for this mux phi
             mux_phis_sorted = sort(collect(phi_ssa_map), by=first)
             carry_idx = findfirst(p -> p[2] == phi_si, mux_phis_sorted)
             push!(new_values, SSAValue(latch_carry_sis[carry_idx]))
@@ -478,6 +508,55 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
     end
 
     return ir
+end
+
+"""Find the value of the first PhiNode at `block` on the edge from `pred`."""
+function find_first_phi_value(ir::IRCode, block::Int, pred::Int)
+    bb = ir.cfg.blocks[block]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+        val = get_phi_value_for_edge(ir, si, pred)
+        val !== nothing && return val
+    end
+    return nothing
+end
+
+"""
+Update phis at `block`: replace edges from `old_pred` with edges from `new_pred`.
+If `new_pred` already has an edge in the phi, just removes the `old_pred` edge
+(the values are consolidated through the latch phi). If the phi reduces to a
+single edge, replaces it with an identity expression (PhiNodes are skipped by
+the structurizer; single-edge phis must become SSAValues).
+"""
+function update_phi_predecessor!(ir::IRCode, block::Int, old_pred::Int, new_pred::Int,
+                                  @nospecialize(new_val))
+    bb = ir.cfg.blocks[block]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+        new_edges = Int32[]; new_values = Any[]
+        has_new_pred = any(Int(e) == new_pred for e in stmt.edges)
+        for (idx, edge) in enumerate(stmt.edges)
+            if Int(edge) == old_pred
+                # If new_pred already exists, just drop the old edge (consolidated)
+                if !has_new_pred
+                    push!(new_edges, Int32(new_pred))
+                    push!(new_values, new_val)
+                    has_new_pred = true
+                end
+            else
+                push!(new_edges, edge)
+                push!(new_values, isassigned(stmt.values, idx) ? stmt.values[idx] : Undef(ir.stmts.type[si]))
+            end
+        end
+        if length(new_edges) == 1
+            # Single-edge phi → identity expression (PhiNodes are skipped by structurizer)
+            ir.stmts.stmt[si] = new_values[1]
+        else
+            ir.stmts.stmt[si] = PhiNode(new_edges, new_values)
+        end
+    end
 end
 
 """Append a statement to the IR's instruction stream."""

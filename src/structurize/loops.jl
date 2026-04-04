@@ -408,8 +408,10 @@ function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
     result
 end
 
-function stmt_ssa_uses(stmt)
-    if stmt isa Expr
+function stmt_ssa_uses(@nospecialize(stmt))
+    if stmt isa SSAValue
+        return (stmt,)
+    elseif stmt isa Expr
         return Iterators.filter(x -> x isa SSAValue, stmt.args)
     elseif stmt isa GotoIfNot && stmt.cond isa SSAValue
         return (stmt.cond,)

@@ -37,7 +37,9 @@ alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 """Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""
 function remap_stmt(@nospecialize(stmt), remap::Dict{Int, Int})
     isempty(remap) && return stmt
-    if stmt isa Expr
+    if stmt isa SSAValue
+        return remap_ssa_ref(stmt, remap)
+    elseif stmt isa Expr
         new_args = Any[remap_ssa_ref(a, remap) for a in stmt.args]
         return Expr(stmt.head, new_args...)
     elseif stmt isa PiNode
