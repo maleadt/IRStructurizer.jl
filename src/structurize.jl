@@ -853,6 +853,15 @@ function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
         end
         if entry_val !== nothing && carried_val !== nothing
             push!(result, LoopPhiInfo(si, entry_val, carried_val))
+        elseif entry_val !== nothing || carried_val !== nothing
+            # A phi with edges from only one side of the loop boundary is
+            # malformed — the optimizer may have removed a dead edge, or
+            # the loop has unusual structure. Error rather than silently
+            # producing wrong loop-carried values.
+            has_entry = entry_val !== nothing
+            error("internal error: loop header phi %$si at BB$header has ",
+                  has_entry ? "entry" : "carried", " value but no ",
+                  has_entry ? "carried" : "entry", " value")
         end
     end
     result
