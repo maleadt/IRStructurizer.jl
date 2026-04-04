@@ -14,6 +14,7 @@
 mutable struct StructurizeCtx
     ir::IRCode
     domtree::DomTree
+    postdomtree::PostDomTree
     # header → set of block indices in the natural loop
     loop_map::Dict{Int, Set{Int}}
     next_ssa::Int
@@ -24,9 +25,10 @@ end
 
 function StructurizeCtx(ir::IRCode)
     domtree = construct_domtree(ir)
+    postdomtree = construct_postdomtree(ir)
     loops = compute_natural_loops(ir, domtree)
     n = length(ir.stmts.stmt)
-    StructurizeCtx(ir, domtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}())
+    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}())
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
@@ -576,57 +578,46 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
         collect_dominated!(then_blocks, ctx.domtree, true_dest, region_blocks)
     end
 
-    if false_dest ∈ region_blocks && false_dest <= nblocks
-        npreds = count_non_backedge_preds(ir, ctx, false_dest, region_blocks)
-        if npreds == 1
-            collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
-        elseif !isempty(then_blocks)
-            # Short-circuit AND pattern: multiple blocks in then-chain have
-            # false-edges to false_dest. These are short-circuit exits, not
-            # independent entries. Only apply when:
-            # 1. Multiple then-blocks are predecessors (short-circuit signature)
-            # 2. false_dest has no phis from then-blocks (not a merge block)
-            then_pred_count = count(p -> p ∈ then_blocks, ir.cfg.blocks[false_dest].preds)
-            if then_pred_count > 1 && !has_phi_from(ir, false_dest, then_blocks)
-                npreds_excl = count_non_backedge_preds_excluding(ir, ctx, false_dest, region_blocks, then_blocks)
-                if npreds_excl == 1
-                    collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
-                end
-            end
-        end
+    if false_dest ∈ region_blocks && false_dest <= nblocks &&
+       count_non_backedge_preds(ir, ctx, false_dest, region_blocks) == 1
+        collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
     end
 
     # Remove any overlap with loop bodies that will be handled separately
     # (a block should only be in one region)
     setdiff!(then_blocks, else_blocks)
 
-    # Merge = the first block reachable from both branches that's not in either.
-    # It must be a successor of some block in then_blocks or else_blocks (or current),
-    # and it must be dominated by `current` (not an unrelated earlier block).
+    # Merge = the block where all paths from `current` reconverge.
+    # Prefer the immediate post-dominator (structurally exact).
+    # Fall back to successor-candidate search when early returns prevent
+    # real post-dominance (ipdom = 0 = virtual exit).
     merge = nothing
-    candidates = Set{Int}()
-    for b in then_blocks
-        for s in ir.cfg.blocks[b].succs
-            s ∉ then_blocks && s != current && push!(candidates, s)
+    ipdom = ctx.postdomtree.idoms_bb[current]
+    if ipdom != 0 && ipdom ∈ region_blocks && ipdom ∉ then_blocks && ipdom ∉ else_blocks
+        merge = ipdom
+    else
+        candidates = Set{Int}()
+        for b in then_blocks
+            for s in ir.cfg.blocks[b].succs
+                s ∉ then_blocks && s != current && push!(candidates, s)
+            end
         end
-    end
-    for b in else_blocks
-        for s in ir.cfg.blocks[b].succs
-            s ∉ else_blocks && s != current && push!(candidates, s)
+        for b in else_blocks
+            for s in ir.cfg.blocks[b].succs
+                s ∉ else_blocks && s != current && push!(candidates, s)
+            end
         end
-    end
-    # Also check direct successors of current (for if-then patterns)
-    if true_dest ∈ region_blocks && true_dest ∉ then_blocks
-        push!(candidates, true_dest)
-    end
-    if false_dest ∈ region_blocks && false_dest ∉ else_blocks
-        push!(candidates, false_dest)
-    end
-
-    for c in sort!(collect(candidates))
-        if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
-            merge = c
-            break
+        if true_dest ∈ region_blocks && true_dest ∉ then_blocks
+            push!(candidates, true_dest)
+        end
+        if false_dest ∈ region_blocks && false_dest ∉ else_blocks
+            push!(candidates, false_dest)
+        end
+        for c in sort!(collect(candidates))
+            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
+                merge = c
+                break
+            end
         end
     end
 
@@ -647,31 +638,6 @@ function count_non_backedge_preds(ir::IRCode, ctx::StructurizeCtx, block::Int, r
     count
 end
 
-"""Check if `block` has any PhiNode edges from blocks in `source_blocks`."""
-function has_phi_from(ir::IRCode, block::Int, source_blocks::Set{Int})
-    bb = ir.cfg.blocks[block]
-    for si in first(bb.stmts):last(bb.stmts)
-        stmt = ir.stmts.stmt[si]
-        stmt isa PhiNode || continue
-        for (edge_idx, edge) in enumerate(stmt.edges)
-            Int(edge) ∈ source_blocks && return true
-        end
-    end
-    return false
-end
-
-"""Count predecessors of `block` in `region`, excluding blocks in `exclude` and loop backedges."""
-function count_non_backedge_preds_excluding(ir::IRCode, ctx::StructurizeCtx, block::Int,
-                                             region::Set{Int}, exclude::Set{Int})
-    count = 0
-    for pred in ir.cfg.blocks[block].preds
-        pred ∈ region || continue
-        pred ∈ exclude && continue
-        dominates(ctx.domtree, block, pred) && continue
-        count += 1
-    end
-    count
-end
 
 """Collect all blocks in `region` dominated by `root` (including root itself)."""
 function collect_dominated!(result::Set{Int}, domtree::DomTree, root::Int, region::Set{Int})
