@@ -189,7 +189,9 @@ function insert_entry_multiplexer!(ir::IRCode, scc_blocks::Set{Int}, entries::Ve
         si += 1
         append_stmt!(ir, si, GotoNode(entries[1]), Any)
     else
-        error("irreducible control flow with >2 entries not yet supported")
+        throw(UnstructuredControlFlowError(
+            "irreducible control flow with $(length(entries)) entries " *
+            "(blocks $(join(entries, ", "))) — only 2-entry SCCs are handled"))
     end
 
     new_stmt_end = si
@@ -421,7 +423,10 @@ function insert_exit_latch!(ir::IRCode, scc_blocks::Set{Int}, entries::Vector{In
         si += 1
         append_stmt!(ir, si, GotoNode(goto_dest), Any)
     else
-        error("irreducible control flow with mixed return/goto exits not yet supported")
+        dests = unique(d for (_, d) in exit_block_dest if d != 0)
+        throw(UnstructuredControlFlowError(
+            "irreducible SCC has mixed exit types (returns and gotos to blocks " *
+            "$(join(dests, ", "))) — only uniform exits are handled"))
     end
     bbx_end = si
 
