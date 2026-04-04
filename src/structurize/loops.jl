@@ -164,8 +164,9 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     # 1. Extract header phi nodes
     phi_info = extract_loop_phis(ir, header, loop_blocks)
 
-    # 2. Find exit destination
-    exit_dest = find_loop_exit(ir, loop_blocks)
+    # 2. Find exit destination (prefer the post-dominator of the header —
+    #    the structurally correct continuation, not an error/unreachable path)
+    exit_dest = find_loop_exit(ctx, header, loop_blocks)
 
     # 3. Find extra exit values (loop-internal SSAs used outside)
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
@@ -325,14 +326,43 @@ function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
     result
 end
 
-"""Find the block index that the loop exits to (first successor outside loop_blocks)."""
-function find_loop_exit(ir::IRCode, loop_blocks::Set{Int})
+"""
+Find the primary exit destination of a loop.
+
+Prefers the immediate post-dominator of the header (the structurally correct
+continuation point). Falls back to any exit with successors (non-dead-end),
+then any exit at all.
+"""
+function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
+    ir = ctx.ir
+    nblocks = length(ir.cfg.blocks)
+    # Collect all exits
+    exits = Int[]
     for b in loop_blocks
         for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks && return succ
+            succ ∉ loop_blocks && succ ∉ exits && push!(exits, succ)
         end
     end
-    return nothing
+    isempty(exits) && return nothing
+    length(exits) == 1 && return exits[1]
+    # Prefer post-dominator of header (the natural continuation)
+    ipdom = ctx.postdomtree.idoms_bb[header]
+    if ipdom != 0 && ipdom ∉ loop_blocks && ipdom ∈ exits
+        return ipdom
+    end
+    # Fall back: prefer exits that have successors, then non-throw dead-ends
+    # (return blocks), then throw blocks as last resort.
+    for e in exits
+        e <= nblocks && !isempty(ir.cfg.blocks[e].succs) && return e
+    end
+    for e in exits
+        if e <= nblocks && isempty(ir.cfg.blocks[e].succs)
+            # Prefer return blocks over throw/unreachable blocks
+            last_type = ir.stmts.type[last(ir.cfg.blocks[e].stmts)]
+            last_type !== Union{} && return e
+        end
+    end
+    return first(exits)
 end
 
 """Find all blocks outside `loop_blocks` that are successors of loop blocks."""
@@ -359,12 +389,22 @@ function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
     result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
     seen = Set{Int}()
 
-    # Collect all non-loop blocks reachable from loop exit edges
+    # Collect non-loop blocks reachable from loop exit edges.
+    # Skip throw/unreachable blocks (terminal type Union{}): these are error
+    # paths whose values don't need threading because find_loop_exit prefers
+    # non-throw continuations, so throw blocks are not walked after the loop.
     reachable = Set{Int}()
     worklist = Int[]
+    nblocks = length(ir.cfg.blocks)
     for b in loop_blocks
         for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks && push!(worklist, succ)
+            succ ∉ loop_blocks || continue
+            # Skip throw/unreachable blocks
+            if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
+               ir.stmts.type[last(ir.cfg.blocks[succ].stmts)] === Union{}
+                continue
+            end
+            push!(worklist, succ)
         end
     end
     while !isempty(worklist)
