@@ -96,15 +96,10 @@
         @test contains(out_default, "@ int.jl:")
         @test contains(out_default, "within")
 
-        # With :none: no annotations
+        # With :none via IOContext: no annotations
         out_none = sprint(io -> show(IOContext(io, :debuginfo => :none),
                                      MIME"text/plain"(), sci))
         @test !contains(out_none, "within")
-
-        # code_structured(; debuginfo=:none) suppresses debug info
-        sci_none, _ = code_structured(h_disp, Tuple{Int}; debuginfo=:none) |> only
-        out_none2 = sprint(show, MIME"text/plain"(), sci_none)
-        @test !contains(out_none2, "within")
     end
 
     @testset "LLVM IR has source annotations after roundtrip" begin
