@@ -1404,6 +1404,31 @@ end
     @test @roundtrip f_desc(0)
 end
 
+@testset "StepRange ForOp has no duplicate undef carries" begin
+    # Regression: the iteration protocol produces two carries with the same continue
+    # value — the real accumulator (init=0.0f0) and a shadow (init=undef). Before the
+    # fix, the ForOp kept both and downstream getfield used the undef-initialized one.
+    sci, _ = code_structured(Tuple{Int32, Int32, Int32}) do start::Int32, step::Int32, stop::Int32
+        acc = 0.0f0
+        for i in start:step:stop
+            acc += Float32(i)
+        end
+        return acc
+    end |> only
+
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
+    if !isempty(for_ops)
+        fop = first(for_ops)
+        @test length(fop.init_values) == 1
+        @test !(fop.init_values[1] isa IRStructurizer.Undef)
+    end
+
+    f_step = (s::Int32, st::Int32, sp::Int32) -> (acc=0.0f0; for i in s:st:sp; acc+=Float32(i); end; acc)
+    @test @roundtrip f_step(Int32(1), Int32(2), Int32(10))
+    @test @roundtrip f_step(Int32(1), Int32(1), Int32(5))
+    @test @roundtrip f_step(Int32(5), Int32(1), Int32(0))  # empty range
+end
+
 end  # Julia for-in-range integration
 
 @testset "BlockArgument uniqueness across sibling loops" begin
