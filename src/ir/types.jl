@@ -674,7 +674,6 @@ end
 @static if VERSION >= v"1.12-"
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
-    sci.debuginfo_table === nothing && return SourceLocation[]
     pc = resolve_line(sci.line_map, ssa_idx)
     pc == 0 && return SourceLocation[]
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
@@ -724,7 +723,6 @@ end
 else # Julia 1.11
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
-    sci.debuginfo_table === nothing && return SourceLocation[]
     li = resolve_line(sci.line_map, ssa_idx)
     li == 0 && return SourceLocation[]
     linetable = sci.debuginfo_table::Vector
