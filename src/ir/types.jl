@@ -572,6 +572,34 @@ StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
     StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, Dict{Int,Int}())
 
 """
+    Base.deepcopy_internal(sci::StructuredIRCode, stackdict::IdDict)
+
+Custom deepcopy that shares `debuginfo_table` and `line_map` (immutable debug info)
+instead of deepcopying them. On Julia 1.11, `debuginfo_table` contains
+`Core.LineInfoNode` with `Module` fields that cannot be deepcopied.
+"""
+function Base.deepcopy_internal(sci::StructuredIRCode, stackdict::IdDict)
+    haskey(stackdict, sci) && return stackdict[sci]::StructuredIRCode
+    # Sever the entry→SCI backref to avoid circular deepcopy, then restore
+    sci.entry.parent = nothing
+    entry_copy = Base.deepcopy_internal(sci.entry, stackdict)
+    sci.entry.parent = sci
+    new_sci = StructuredIRCode(
+        Base.deepcopy_internal(sci.argtypes, stackdict),
+        Base.deepcopy_internal(sci.sptypes, stackdict),
+        entry_copy,
+        sci.max_ssa_idx,
+        sci.max_arg_idx,
+        sci.debuginfo_table,  # shared — contains Module refs on 1.11, safe to share (read-only)
+        copy(sci.line_map),
+    )
+    new_sci.entry.parent = new_sci
+    fix_parents!(new_sci.entry)
+    stackdict[sci] = new_sci
+    return new_sci
+end
+
+"""
     StructuredIRCode(ir::IRCode; structurize=true, validate=true)
 
 Create a StructuredIRCode from Julia IRCode.
