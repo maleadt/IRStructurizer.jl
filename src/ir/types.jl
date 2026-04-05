@@ -1,7 +1,8 @@
 # structured IR definitions
 
 export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, block,
-       insert_before!, insert_after!, terminator, terminator!, operands
+       insert_before!, insert_after!, terminator, terminator!, operands,
+       SourceLocation, source_location
 
 #=============================================================================
  Block Arguments (for loop carried values)
@@ -522,6 +523,26 @@ operands(op::WhileOp) = copy(op.init_values)
 operands(op::LoopOp)  = copy(op.init_values)
 
 #=============================================================================
+ Source Location (debug info)
+=============================================================================#
+
+"""
+    SourceLocation
+
+A resolved source location entry. An inlining stack is represented as
+`Vector{SourceLocation}` ordered `[outermost, ..., innermost]`.
+"""
+struct SourceLocation
+    method::Any   # Method, MethodInstance, or Symbol
+    file::Symbol
+    line::Int32
+end
+
+function Base.show(io::IO, loc::SourceLocation)
+    print(io, loc.method, " at ", loc.file, ":", loc.line)
+end
+
+#=============================================================================
  StructuredIRCode - the structured IR for a function
 =============================================================================#
 
@@ -539,10 +560,14 @@ mutable struct StructuredIRCode
     entry::Block
     max_ssa_idx::Int
     max_arg_idx::Int
+    # Debug info — access via source_location()
+    const debuginfo_table::Any     # linetable (1.11) or DebugInfoStream (1.12+), or nothing
+    const n_original_stmts::Int    # number of stmts in original IRCode
+    const line_map::Dict{Int, Int} # ssa_idx → anchor PC (1.12+) or linetable index (1.11)
 end
 
 StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
-    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0)
+    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, 0, Dict{Int,Int}())
 
 """
     StructuredIRCode(ir::IRCode; structurize=true, validate=true)
@@ -564,6 +589,19 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     types = ir.stmts.type
     n = length(stmts)
 
+    # Capture debug info
+    @static if VERSION >= v"1.12-"
+        debuginfo_table = ir.debuginfo          # DebugInfoStream; codelocs is identity
+        line_map = Dict{Int, Int}()             # original stmts use SSA idx as PC directly
+    else
+        debuginfo_table = copy(ir.linetable)    # Vector{LineInfoNode}
+        line_map = Dict{Int, Int}()
+        for i in 1:n
+            li = Int(ir.stmts.line[i])
+            li != 0 && (line_map[i] = li)
+        end
+    end
+
     # Build flat entry block
     entry = Block()
     for i in 1:n
@@ -575,13 +613,17 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         end
     end
 
-    sci = StructuredIRCode(argtypes, sptypes, entry, n, 0)
+    sci = StructuredIRCode(argtypes, sptypes, entry, n, 0,
+                           debuginfo_table, n, line_map)
 
     if structurize && n > 0
-        entry, max_ssa, max_arg = IRStructurizer.structurize(ir)
+        entry, max_ssa, max_arg, updated_line_map =
+            IRStructurizer.structurize(ir, line_map)
         sci.entry = entry
         sci.max_ssa_idx = max_ssa
         sci.max_arg_idx = max_arg
+        # line_map was mutated in-place by structurize, but merge any extras
+        merge!(sci.line_map, updated_line_map)
     end
 
     # Set parent chain: entry → SCI, sub-blocks → containing block.
@@ -600,3 +642,88 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
 
     return sci
 end
+
+#=============================================================================
+ source_location — resolve SSA index to inlining stack
+=============================================================================#
+
+"""
+    source_location(sci::StructuredIRCode, ssa_idx::Int) -> Vector{SourceLocation}
+    source_location(sci::StructuredIRCode, inst::Instruction) -> Vector{SourceLocation}
+
+Returns the inlining stack for a statement: `[outermost, ..., innermost]`.
+Returns `SourceLocation[]` if no debug info is available.
+"""
+source_location(sci::StructuredIRCode, inst::Instruction) = source_location(sci, inst.ssa_idx)
+
+@static if VERSION >= v"1.12-"
+
+function source_location(sci::StructuredIRCode, ssa_idx::Int)
+    sci.debuginfo_table === nothing && return SourceLocation[]
+    # Original stmts: SSA index IS the PC. Synthesized: look up anchor.
+    pc = get(sci.line_map, ssa_idx, 0)
+    if pc == 0
+        pc = ssa_idx <= sci.n_original_stmts ? ssa_idx : 0
+    end
+    pc == 0 && return SourceLocation[]
+    debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
+    return _resolve_debuginfo(debuginfo, debuginfo.def, pc)
+end
+
+function _resolve_debuginfo(debuginfo, @nospecialize(def), pc::Int)
+    scopes = SourceLocation[]
+    _append_scopes!(scopes, pc, debuginfo, def)
+    return scopes
+end
+
+# Reimplements Compiler/src/ssair/show.jl append_scopes! for SourceLocation
+function _append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nospecialize(def))
+    doupdate = true
+    while true
+        debuginfo.def isa Symbol || (def = debuginfo.def)
+        codeloc = Core.Compiler.getdebugidx(debuginfo, pc)
+        line::Int = codeloc[1]
+        inl_to::Int = codeloc[2]
+        doupdate &= line != 0 || inl_to != 0
+        if debuginfo.linetable === nothing || pc <= 0 || line < 0
+            line < 0 && (doupdate = false; line = 0)
+            push!(scopes, SourceLocation(def, _debuginfo_file(debuginfo), Int32(line)))
+        else
+            doupdate = _append_scopes!(scopes, line, debuginfo.linetable::Core.DebugInfo, def) && doupdate
+        end
+        inl_to == 0 && return doupdate
+        def = :var"macro expansion"
+        debuginfo = debuginfo.edges[inl_to]
+        pc = Int(codeloc[3])
+    end
+end
+
+function _debuginfo_file(debuginfo)
+    def = debuginfo.def
+    if def isa MethodInstance
+        def = def.def
+    end
+    if def isa Method
+        def = def.file
+    end
+    def isa Symbol && return def
+    return :var"<unknown>"
+end
+
+else # Julia 1.11
+
+function source_location(sci::StructuredIRCode, ssa_idx::Int)
+    sci.debuginfo_table === nothing && return SourceLocation[]
+    idx = get(sci.line_map, ssa_idx, 0)
+    idx == 0 && return SourceLocation[]
+    linetable = sci.debuginfo_table::Vector
+    stack = SourceLocation[]
+    while idx != 0
+        entry = linetable[idx]::Core.LineInfoNode
+        pushfirst!(stack, SourceLocation(entry.method, entry.file, entry.line))
+        idx = Int(entry.inlined_at)
+    end
+    return stack
+end
+
+end # @static if

@@ -136,6 +136,7 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
         idx = get(remap, si, si)
         stmt = remap_stmt(stmt, remap)
         push!(block, idx, stmt, ir.stmts.type[si])
+        idx != si && anchor_line!(ctx, idx, si)
     end
 end
 
@@ -236,6 +237,9 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         make_empty_branch_block(false_dest, current, sub_merge_phis, loop_ctx, ir, ctx)
     end
 
+    # Anchor for debug info: use the branch terminator's location
+    branch_anchor = last(ir.cfg.blocks[current].stmts)
+
     if merge !== nothing && merge ∈ region_blocks && merge_phis !== nothing
         # --- Inner merge exists: standard IfOp ---
         set_branch_yields!(then_blk, merge_phis, then_blocks, current, ir, block, ctx)
@@ -244,14 +248,16 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         if_op = IfOp(cond, then_blk, else_blk)
         phi_indices = [p.ssa_idx for p in merge_phis]
         phi_types = [ctx.types[p.ssa_idx] for p in merge_phis]
-        emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx)
+        emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx, branch_anchor)
         return merge
     elseif merge !== nothing && merge ∈ region_blocks
         # Merge exists but no phis
         set_yield_if_needed!(then_blk)
         set_yield_if_needed!(else_blk)
         if_op = IfOp(cond, then_blk, else_blk)
-        push!(block, alloc_ssa!(ctx), if_op, Tuple{})
+        if_ssa = alloc_ssa!(ctx)
+        push!(block, if_ssa, if_op, Tuple{})
+        anchor_line!(ctx, if_ssa, branch_anchor)
         # If merge is the loop header, both branches already handle the loop flow
         # (break/continue inside). Don't continue walking at the header.
         if loop_ctx !== nothing && merge == loop_ctx.header
@@ -274,15 +280,19 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
             if_ssa = alloc_ssa!(ctx)
             result_type = Tuple{phi_types...}
             push!(block, if_ssa, if_op, result_type)
+            anchor_line!(ctx, if_ssa, branch_anchor)
             yield_values = IRValue[]
             for (i, phi_type) in enumerate(phi_types)
                 fresh = alloc_ssa!(ctx)
                 push!(block, fresh, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
+                anchor_line!(ctx, fresh, branch_anchor)
                 push!(yield_values, SSAValue(fresh))
             end
             block.terminator = YieldOp(yield_values)
         else
-            push!(block, alloc_ssa!(ctx), if_op, Nothing)
+            if_ssa = alloc_ssa!(ctx)
+            push!(block, if_ssa, if_op, Nothing)
+            anchor_line!(ctx, if_ssa, branch_anchor)
         end
         return nothing
     end

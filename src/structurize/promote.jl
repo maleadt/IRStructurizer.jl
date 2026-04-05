@@ -392,6 +392,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     lower = loop.init_values[iv_pos]
     # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step
     adj_ssa = alloc_ssa!(ctx)
+    anchor_line!(ctx, adj_ssa, cond_val.id)
     upper_type = iv_candidate.type
     add_expr = Expr(:call, GlobalRef(Base, :add_int), bound, step)
     push!(new_body, (adj_ssa, add_expr, upper_type))
@@ -625,6 +626,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # Exclusive upper bound: add 1 if inclusive
     if is_inclusive
         adj_ssa = alloc_ssa!(ctx)
+        anchor_line!(ctx, adj_ssa, cond_val.id)
         upper_type = iv_candidate.type
         add_expr = Expr(:call, GlobalRef(Base, :add_int), upper, one(upper_type))
         push!(new_body, (adj_ssa, add_expr, upper_type))

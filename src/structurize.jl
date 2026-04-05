@@ -21,18 +21,34 @@ mutable struct StructurizeCtx
     next_arg::Int
     types::Vector{Any}
     ssa_remap::Dict{Int, Int}   # original → fresh (for inner defs)
+    line_map::Dict{Int, Int}    # ssa_idx → anchor PC/linetable index
 end
 
-function StructurizeCtx(ir::IRCode)
+function StructurizeCtx(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}())
     domtree = construct_domtree(ir)
     postdomtree = construct_postdomtree(ir)
     loops = compute_natural_loops(ir, domtree)
     n = length(ir.stmts.stmt)
-    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}())
+    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}(), line_map)
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
 alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
+
+"""Map a synthesized SSA index to the same source location as an existing SSA index."""
+function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
+    anchor = _get_anchor(ctx, source_ssa)
+    anchor != 0 && (ctx.line_map[new_ssa] = anchor)
+end
+
+function _get_anchor(ctx::StructurizeCtx, ssa::Int)
+    v = get(ctx.line_map, ssa, 0)
+    v != 0 && return v
+    # On 1.12+: original stmts (≤ n) are their own PC anchor.
+    # On 1.11: all original stmts are pre-populated, so this is only reached
+    #          for un-anchored synthesized stmts.
+    return ssa <= length(ctx.ir.stmts.stmt) ? ssa : 0
+end
 
 """Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""
 function remap_stmt(@nospecialize(stmt), remap::Dict{Int, Int})
@@ -66,15 +82,15 @@ include("structurize/loops.jl")
 =============================================================================#
 
 """
-    structurize(ir::IRCode) -> (Block, max_ssa, max_arg)
+    structurize(ir::IRCode, line_map) -> (Block, max_ssa, max_arg, line_map)
 
 Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForOp.
 """
-function structurize(ir::IRCode)
+function structurize(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}())
     check_irreducible(ir)
-    ctx = StructurizeCtx(ir)
+    ctx = StructurizeCtx(ir, line_map)
     all_blocks = Set(1:length(ir.cfg.blocks))
     entry = structurize_region!(ctx, 1, all_blocks)
     promote_loops!(entry, ctx)
-    return entry, ctx.next_ssa - 1, ctx.next_arg - 1
+    return entry, ctx.next_ssa - 1, ctx.next_arg - 1, ctx.line_map
 end
