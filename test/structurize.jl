@@ -604,7 +604,7 @@ end
 end
 
 @testset "swap_loop phi references" begin
-    # Native for-in-range produces LoopOp (iterator protocol is non-SESE)
+    # Swap pattern stays as LoopOp (break/continue values differ at used positions)
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             x, y = 1, 2
@@ -681,7 +681,7 @@ end
     @test @roundtrip f_pow(2, 1)
 end
 
-@testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin
+@testset "SESE while-loop and for-in-range both become ForOp" begin
     # Simple SESE while-loop → ForOp
     sci_while, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
@@ -696,8 +696,7 @@ end
     for_ops = filter(x -> x isa ForOp, collect(statements(sci_while.entry.body)))
     @test length(for_ops) == 1
 
-    # Native for-in-range (non-SESE due to iterator protocol) → LoopOp
-    # LoopOp is nested inside IfOps from iterator protocol's branch structure
+    # Native for-in-range (iterator protocol) → also promoted to ForOp
     sci_for, _ = code_structured(Tuple{Int}) do n::Int
         acc = 0
         for i in 1:n
@@ -706,7 +705,6 @@ end
         return acc
     end |> only
 
-    # LoopOp will be nested inside IfOps, just verify the IR is valid
     @test sci_for isa StructuredIRCode
 
     f_while_acc = (n::Int) -> (i=0; acc=0; while i<n; acc+=i; i+=1; end; acc)
@@ -1398,6 +1396,12 @@ end
             return acc + x
         end
     end
+end
+
+@testset "descending for-in-range stays as LoopOp" begin
+    f_desc = (n::Int) -> (s=0; for i in n:-1:0; s+=i; end; s)
+    @test @roundtrip f_desc(5)
+    @test @roundtrip f_desc(0)
 end
 
 end  # Julia for-in-range integration

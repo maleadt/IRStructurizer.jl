@@ -314,6 +314,9 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
     step === nothing && return (loop, Int[])
 
+    # ForOp requires positive step (ascending loops only)
+    step isa Integer && step < 0 && return (loop, Int[])
+
     # Step and bound must be loop-invariant
     if step isa SSAValue && haskey(body.body, step.id)
         return (loop, Int[])
@@ -563,6 +566,9 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         end
     end
     step === nothing && return (op, 0)
+
+    # ForOp requires positive step (ascending loops only)
+    step isa Integer && step < 0 && return (op, 0)
 
     # Step must be loop-invariant (not defined inside the loop body)
     if step isa SSAValue && (haskey(op.after.body, step.id) || haskey(op.before.body, step.id))
