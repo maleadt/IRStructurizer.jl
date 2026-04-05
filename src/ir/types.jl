@@ -2,7 +2,7 @@
 
 export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, block,
        insert_before!, insert_after!, terminator, terminator!, operands,
-       SourceLocation, source_location
+       source_location
 
 #=============================================================================
  Block Arguments (for loop carried values)

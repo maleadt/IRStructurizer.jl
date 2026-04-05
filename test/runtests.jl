@@ -9,7 +9,7 @@ using Core: SSAValue, ReturnNode, GotoNode, GotoIfNot, PhiNode
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
                       YieldOp, ContinueOp, BreakOp, ConditionOp,
                       validate_scf, validate_terminators, validate_ssa_defs,
-                      statements, BlockArgument
+                      statements, BlockArgument, SourceLocation
 using Base: code_ircode
 
 # Used by "step defined inside loop body" test — must be module-level const
