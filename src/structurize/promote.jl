@@ -509,7 +509,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
                           ctx::StructurizeCtx)
     op isa WhileOp || return (op, 0)
 
-    # Look for: condition is slt_int/sle_int/=== on a block arg vs loop-invariant bound
+    # Look for: condition is slt_int/sle_int on a block arg vs loop-invariant bound
     before = op.before
     before.terminator isa ConditionOp || return (op, 0)
     cond_op = before.terminator
@@ -527,11 +527,10 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     iv_candidate = cond_expr.args[2]
     bound = cond_expr.args[3]
 
-    # Check condition function
+    # Check condition function (=== is not a counting pattern; handled by Path A)
     is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
     is_sle = func isa GlobalRef && func.name === :sle_int
-    is_eq = (func isa GlobalRef && func.name === :(===)) || func === :(===)
-    (is_slt || is_sle || is_eq) || return (op, 0)
+    (is_slt || is_sle) || return (op, 0)
 
     # IV must be a block argument
     iv_candidate isa BlockArgument || return (op, 0)
@@ -583,7 +582,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # Build ForOp
     lower = op.init_values[iv_pos]
     upper = bound
-    is_inclusive = is_sle || is_eq
+    is_inclusive = is_sle
 
     # Exclusive upper bound: add 1 if inclusive
     if is_inclusive
