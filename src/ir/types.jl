@@ -561,7 +561,7 @@ mutable struct StructuredIRCode
     max_ssa_idx::Int
     max_arg_idx::Int
     # Debug info — access via source_location()
-    const debuginfo_table::Any     # linetable (1.11) or DebugInfoStream (1.12+), or nothing
+    debuginfo_table::Any           # linetable (1.11) or DebugInfoStream (1.12+), or nothing
     const line_map::Dict{Int, Int} # ssa_idx → anchor PC (1.12+) or linetable index (1.11)
 end
 
