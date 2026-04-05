@@ -1,5 +1,6 @@
 using Test
 using FileCheck
+using InteractiveUtils: code_llvm
 
 using IRStructurizer
 using Core: SSAValue, ReturnNode, GotoNode, GotoIfNot, PhiNode

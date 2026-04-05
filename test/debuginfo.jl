@@ -87,6 +87,50 @@
         @test sprint(show, loc) == "foo at bar:42"
     end
 
+    @testset "LLVM IR has source annotations after roundtrip" begin
+        CC = Core.Compiler
+
+        g_llvm(x) = x > 0 ? x + 1 : x - 1
+        ir, _ = only(code_ircode(g_llvm, Tuple{Int}))
+        sci = StructuredIRCode(ir)
+        ir2 = CC.copy(CC.IRCode(sci))
+        ir2.argtypes[1] = Tuple{}
+        @static if VERSION >= v"1.12-"
+            ir2.debuginfo.def = ir.debuginfo.def
+        end
+        oc = Core.OpaqueClosure(ir2)
+
+        buf = IOBuffer()
+        code_llvm(buf, oc, Tuple{Int}; debuginfo=:source)
+        llvm = String(take!(buf))
+
+        # Should have inlined source annotations from the original code
+        @test contains(llvm, "int.jl")   # + or - calls Base.add_int / sub_int
+        @test contains(llvm, "within")   # inlining markers
+
+        # Without debug info, these annotations are absent
+        ir3, _ = only(code_ircode(g_llvm, Tuple{Int}))
+        sci3 = StructuredIRCode(ir3)
+        ir_zeroed = CC.copy(CC.IRCode(sci3))
+        ir_zeroed.argtypes[1] = Tuple{}
+        fill!(ir_zeroed.stmts.line, Int32(0))
+        @static if VERSION >= v"1.12-"
+            ir_zeroed.debuginfo.def = Symbol("zeroed")
+            ir_zeroed.debuginfo.linetable = nothing
+            empty!(ir_zeroed.debuginfo.edges)
+        else
+            empty!(ir_zeroed.linetable)
+        end
+        oc_zeroed = Core.OpaqueClosure(ir_zeroed)
+
+        buf2 = IOBuffer()
+        code_llvm(buf2, oc_zeroed, Tuple{Int}; debuginfo=:source)
+        llvm_zeroed = String(take!(buf2))
+
+        # Zeroed version should NOT have inlined source annotations
+        @test !contains(llvm_zeroed, "int.jl")
+    end
+
     @testset "loop debug info preserved" begin
         function loop_fn(n)
             s = 0
