@@ -662,17 +662,17 @@ function source_location(sci::StructuredIRCode, ssa_idx::Int)
     # Synthesized stmts are in line_map; original stmts use SSA idx as PC directly.
     pc = get(sci.line_map, ssa_idx, ssa_idx)
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
-    return _resolve_debuginfo(debuginfo, debuginfo.def, pc)
+    return resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
 
-function _resolve_debuginfo(debuginfo, @nospecialize(def), pc::Int)
+function resolve_debuginfo(debuginfo, @nospecialize(def), pc::Int)
     scopes = SourceLocation[]
-    _append_scopes!(scopes, pc, debuginfo, def) || empty!(scopes)
+    append_scopes!(scopes, pc, debuginfo, def) || empty!(scopes)
     return scopes
 end
 
 # Reimplements Compiler/src/ssair/show.jl append_scopes! for SourceLocation
-function _append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nospecialize(def))
+function append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nospecialize(def))
     doupdate = true
     while true
         debuginfo.def isa Symbol || (def = debuginfo.def)
@@ -682,9 +682,9 @@ function _append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @no
         doupdate &= line != 0 || inl_to != 0
         if debuginfo.linetable === nothing || pc <= 0 || line < 0
             line < 0 && (doupdate = false; line = 0)
-            push!(scopes, SourceLocation(def, _debuginfo_file(debuginfo), Int32(line)))
+            push!(scopes, SourceLocation(def, debuginfo_file(debuginfo), Int32(line)))
         else
-            doupdate = _append_scopes!(scopes, line, debuginfo.linetable::Core.DebugInfo, def) && doupdate
+            doupdate = append_scopes!(scopes, line, debuginfo.linetable::Core.DebugInfo, def) && doupdate
         end
         inl_to == 0 && return doupdate
         def = :var"macro expansion"
@@ -693,7 +693,7 @@ function _append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @no
     end
 end
 
-function _debuginfo_file(debuginfo)
+function debuginfo_file(debuginfo)
     def = debuginfo.def
     if def isa MethodInstance
         def = def.def

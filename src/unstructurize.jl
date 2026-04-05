@@ -101,26 +101,26 @@ function emit_resolved!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int,
     sparse = emit!(ctx, bb, resolved, typ)
     ctx.ssa_rename[old_ssa] = sparse
     # Propagate debug info: old_ssa → sparse
-    _propagate_line!(ctx, sparse, old_ssa)
+    propagate_line!(ctx, sparse, old_ssa)
     return sparse
 end
 
 # Propagate/anchor line info between structured IR SSA indices and sparse SSAs.
 @static if VERSION >= v"1.12-"
     # On 1.12+: not in line_map → original stmt, use SSA idx as PC
-    function _propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+    function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
         ctx.line_map[sparse_ssa] = get(ctx.line_map, old_ssa, old_ssa)
     end
-    function _anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+    function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
         ctx.line_map[sparse_ssa] = get(ctx.line_map, source_old_ssa, source_old_ssa)
     end
 else
     # On 1.11: not in line_map → no debug info
-    function _propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+    function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
         anchor = get(ctx.line_map, old_ssa, 0)
         anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
     end
-    function _anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+    function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
         anchor = get(ctx.line_map, source_old_ssa, 0)
         anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
     end
@@ -195,7 +195,7 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
 
     # Emit GotoIfNot with placeholder dest (fixed after then-region)
     branch_ssa = emit!(ctx, bb, GotoIfNot(cond, -1), Any)
-    _anchor_sparse_line!(ctx, branch_ssa, cfop_idx)
+    anchor_sparse_line!(ctx, branch_ssa, cfop_idx)
     branch_pos = length(ctx.bbs[bb].stmts)
 
     # then_bb is next in sequence → correct fallthrough for GotoIfNot
@@ -249,7 +249,7 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
                 push_phi_value!(phi, else_last, resolve_value(ctx, else_vals[i]))
             end
             ssa = emit!(ctx, merge_bb, phi, result_types[i])
-            _anchor_sparse_line!(ctx, ssa, cfop_idx)
+            anchor_sparse_line!(ctx, ssa, cfop_idx)
             push!(phi_ssas, ssa)
         end
 
