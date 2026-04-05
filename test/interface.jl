@@ -173,7 +173,7 @@ end
     @test occursin("while", output)
 end
 
-@testset "display: LoopOp" begin
+@testset "display: ForOp" begin
     sci, _ = code_structured(Tuple{Int}) do n::Int
         acc = 0
         for i in 1:n
@@ -183,7 +183,7 @@ end
     end |> only
 
     output = sprint(show, MIME"text/plain"(), sci)
-    @test occursin("loop", output)
+    @test occursin("for", output)
 end
 
 @testset "display: nested" begin
