@@ -561,8 +561,11 @@ mutable struct StructuredIRCode
     max_ssa_idx::Int
     max_arg_idx::Int
     # Debug info — access via source_location()
-    const debuginfo_table::Any     # linetable (1.11) or DebugInfoStream (1.12+), or nothing
-    const line_map::Dict{Int, Int} # ssa_idx → anchor PC (1.12+) or linetable index (1.11)
+    # debuginfo_table: the original source table (linetable or DebugInfoStream), or nothing
+    # line_map: ssa_idx → val, where val < 0 means direct reference (-val is PC or linetable idx),
+    #           val > 0 means anchor (val is another SSA idx to follow). empty!(line_map) wipes all.
+    const debuginfo_table::Any
+    const line_map::Dict{Int, Int}
 end
 
 StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
@@ -588,16 +591,19 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     types = ir.stmts.type
     n = length(stmts)
 
-    # Capture debug info
+    # Capture debug info: negative values = direct reference into table
     @static if VERSION >= v"1.12-"
-        debuginfo_table = ir.debuginfo          # DebugInfoStream; codelocs is identity
-        line_map = Dict{Int, Int}()             # original stmts use SSA idx as PC directly
+        debuginfo_table = ir.debuginfo
+        line_map = Dict{Int, Int}()
+        for i in 1:n
+            line_map[i] = -i              # PC = i (identity mapping)
+        end
     else
-        debuginfo_table = copy(ir.linetable)    # Vector{LineInfoNode}
+        debuginfo_table = copy(ir.linetable)
         line_map = Dict{Int, Int}()
         for i in 1:n
             li = Int(ir.stmts.line[i])
-            li != 0 && (line_map[i] = li)
+            li != 0 && (line_map[i] = -li)  # linetable index
         end
     end
 
@@ -655,12 +661,22 @@ Returns `SourceLocation[]` if no debug info is available.
 """
 source_location(sci::StructuredIRCode, inst::Instruction) = source_location(sci, inst.ssa_idx)
 
+"""Resolve line_map entry: follow positive anchors to a negative direct reference.
+Returns the direct reference (a positive PC or linetable index), or 0 if not found."""
+function resolve_line(line_map::Dict{Int, Int}, ssa_idx::Int)
+    val = get(line_map, ssa_idx, 0)
+    while val > 0
+        val = get(line_map, val, 0)
+    end
+    return -val  # 0 if not found, positive otherwise
+end
+
 @static if VERSION >= v"1.12-"
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     sci.debuginfo_table === nothing && return SourceLocation[]
-    # Synthesized stmts are in line_map; original stmts use SSA idx as PC directly.
-    pc = get(sci.line_map, ssa_idx, ssa_idx)
+    pc = resolve_line(sci.line_map, ssa_idx)
+    pc == 0 && return SourceLocation[]
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
     return resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
@@ -709,10 +725,11 @@ else # Julia 1.11
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     sci.debuginfo_table === nothing && return SourceLocation[]
-    idx = get(sci.line_map, ssa_idx, 0)
-    idx == 0 && return SourceLocation[]
+    li = resolve_line(sci.line_map, ssa_idx)
+    li == 0 && return SourceLocation[]
     linetable = sci.debuginfo_table::Vector
     stack = SourceLocation[]
+    idx = li
     while idx != 0
         entry = linetable[idx]::Core.LineInfoNode
         pushfirst!(stack, SourceLocation(entry.method, entry.file, entry.line))

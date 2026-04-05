@@ -37,20 +37,8 @@ alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 
 """Map a synthesized SSA index to the same source location as an existing SSA index."""
 function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
-    anchor = get_anchor(ctx, source_ssa)
-    anchor != 0 && (ctx.line_map[new_ssa] = anchor)
-end
-
-@static if VERSION >= v"1.12-"
-    function get_anchor(ctx::StructurizeCtx, ssa::Int)
-        # Synthesized stmts are in line_map; original stmts use SSA idx as PC.
-        return get(ctx.line_map, ssa, ssa)
-    end
-else
-    function get_anchor(ctx::StructurizeCtx, ssa::Int)
-        # All stmts with debug info are in line_map (linetable indices).
-        return get(ctx.line_map, ssa, 0)
-    end
+    haskey(ctx.line_map, source_ssa) || return
+    ctx.line_map[new_ssa] = source_ssa  # positive anchor → follow to resolve
 end
 
 """Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""

@@ -106,24 +106,15 @@ function emit_resolved!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int,
 end
 
 # Propagate/anchor line info between structured IR SSA indices and sparse SSAs.
-@static if VERSION >= v"1.12-"
-    # On 1.12+: not in line_map → original stmt, use SSA idx as PC
-    function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
-        ctx.line_map[sparse_ssa] = get(ctx.line_map, old_ssa, old_ssa)
-    end
-    function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
-        ctx.line_map[sparse_ssa] = get(ctx.line_map, source_old_ssa, source_old_ssa)
-    end
-else
-    # On 1.11: not in line_map → no debug info
-    function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
-        anchor = get(ctx.line_map, old_ssa, 0)
-        anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
-    end
-    function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
-        anchor = get(ctx.line_map, source_old_ssa, 0)
-        anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
-    end
+# Resolve to the final negative value immediately to avoid cycles (sparse SSA
+# indices can overlap with old structured SSA indices in the same line_map).
+function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+    val = resolve_line(ctx.line_map, old_ssa)
+    val != 0 && (ctx.line_map[sparse_ssa] = -val)
+end
+function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+    val = resolve_line(ctx.line_map, source_old_ssa)
+    val != 0 && (ctx.line_map[sparse_ssa] = -val)
 end
 
 #=============================================================================
@@ -611,9 +602,9 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
             for bb in ctx.bbs
                 for (sparse_ssa, _, _) in bb.stmts
                     pos += 1
-                    anchor = get(ctx.line_map, sparse_ssa, 0)
-                    anchor == 0 && continue
-                    codeloc = CC.getdebugidx(sci.debuginfo_table, anchor)
+                    pc = resolve_line(ctx.line_map, sparse_ssa)
+                    pc == 0 && continue
+                    codeloc = CC.getdebugidx(sci.debuginfo_table, pc)
                     off = 3*(pos-1)
                     line[off+1] = codeloc[1]
                     line[off+2] = codeloc[2]
@@ -628,8 +619,8 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
             for bb in ctx.bbs
                 for (sparse_ssa, _, _) in bb.stmts
                     pos += 1
-                    idx = get(ctx.line_map, sparse_ssa, 0)
-                    line[pos] = Int32(idx)
+                    li = resolve_line(ctx.line_map, sparse_ssa)
+                    line[pos] = Int32(li)
                 end
             end
         end
