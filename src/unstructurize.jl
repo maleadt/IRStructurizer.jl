@@ -30,11 +30,14 @@ mutable struct UnstructurizeCtx
     arg_rename::Dict{Int, Int}               # BlockArgument.id → sparse SSA of phi
     cfop_results::Dict{Int, Vector{Int}}     # cfop old SSA → result phi sparse SSAs
     loop_stack::Vector{LoopTarget}
+    # Debug info: maps sparse SSA → anchor (same semantics as StructurizeCtx.line_map)
+    line_map::Dict{Int, Int}
 end
 
-function UnstructurizeCtx()
+function UnstructurizeCtx(line_map::Dict{Int, Int}=Dict{Int, Int}())
     UnstructurizeCtx(FlatBB[], 0, Dict{Int,Int}(), Dict{Int,Int}(),
-                     Dict{Int,Vector{Int}}(), LoopTarget[])
+                     Dict{Int,Vector{Int}}(), LoopTarget[],
+                     line_map)
 end
 
 #=============================================================================
@@ -97,7 +100,21 @@ function emit_resolved!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int,
     resolved = resolve_stmt(ctx, stmt)
     sparse = emit!(ctx, bb, resolved, typ)
     ctx.ssa_rename[old_ssa] = sparse
+    # Propagate debug info: old_ssa → sparse
+    propagate_line!(ctx, sparse, old_ssa)
     return sparse
+end
+
+# Propagate/anchor line info between structured IR SSA indices and sparse SSAs.
+# Resolve to the final negative value immediately to avoid cycles (sparse SSA
+# indices can overlap with old structured SSA indices in the same line_map).
+function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+    val = resolve_line(ctx.line_map, old_ssa)
+    val !== nothing && (ctx.line_map[sparse_ssa] = -val)
+end
+function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+    val = resolve_line(ctx.line_map, source_old_ssa)
+    val !== nothing && (ctx.line_map[sparse_ssa] = -val)
 end
 
 #=============================================================================
@@ -168,7 +185,8 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     cond = resolve_value(ctx, op.condition)
 
     # Emit GotoIfNot with placeholder dest (fixed after then-region)
-    emit!(ctx, bb, GotoIfNot(cond, -1), Any)
+    branch_ssa = emit!(ctx, bb, GotoIfNot(cond, -1), Any)
+    anchor_sparse_line!(ctx, branch_ssa, cfop_idx)
     branch_pos = length(ctx.bbs[bb].stmts)
 
     # then_bb is next in sequence → correct fallthrough for GotoIfNot
@@ -222,6 +240,7 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
                 push_phi_value!(phi, else_last, resolve_value(ctx, else_vals[i]))
             end
             ssa = emit!(ctx, merge_bb, phi, result_types[i])
+            anchor_sparse_line!(ctx, ssa, cfop_idx)
             push!(phi_ssas, ssa)
         end
 
@@ -573,13 +592,38 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
         end
     end
 
-    # Build InstructionStream
+    # Build InstructionStream with debug info
     info = Vector{CC.CallInfo}(undef, n)
     fill!(info, CC.NoCallInfo())
     @static if VERSION >= v"1.12-"
         line = fill(Int32(0), n * 3)
+        if sci.debuginfo_table !== nothing
+            pos = 0
+            for bb in ctx.bbs
+                for (sparse_ssa, _, _) in bb.stmts
+                    pos += 1
+                    pc = resolve_line(ctx.line_map, sparse_ssa)
+                    pc === nothing && continue
+                    codeloc = CC.getdebugidx(sci.debuginfo_table, pc)
+                    off = 3*(pos-1)
+                    line[off+1] = codeloc[1]
+                    line[off+2] = codeloc[2]
+                    line[off+3] = codeloc[3]
+                end
+            end
+        end
     else
         line = fill(Int32(0), n)
+        if sci.debuginfo_table !== nothing
+            pos = 0
+            for bb in ctx.bbs
+                for (sparse_ssa, _, _) in bb.stmts
+                    pos += 1
+                    li = resolve_line(ctx.line_map, sparse_ssa)
+                    li !== nothing && (line[pos] = Int32(li))
+                end
+            end
+        end
     end
     flag = fill(UInt32(0), n)
     stmts = InstructionStream(all_stmts, all_types, info, line, flag)
@@ -623,9 +667,19 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
 
     @static if VERSION >= v"1.12-"
         debuginfo = CC.DebugInfoStream(stmts.line)
+        if sci.debuginfo_table !== nothing
+            orig = sci.debuginfo_table::CC.DebugInfoStream
+            debuginfo.def = orig.def
+            debuginfo.linetable = orig.linetable
+            debuginfo.edges = copy(orig.edges)
+        end
         return IRCode(stmts, cfg, debuginfo, argtypes, meta, sptypes)
     else
-        linetable = Core.LineInfoNode[]
+        linetable = if sci.debuginfo_table isa Vector
+            copy(sci.debuginfo_table)
+        else
+            Core.LineInfoNode[]
+        end
         return IRCode(stmts, cfg, linetable, argtypes, meta, sptypes)
     end
 end
@@ -646,7 +700,7 @@ Convert a StructuredIRCode back to flat Julia IRCode with explicit control flow
 (GotoNode, GotoIfNot, PhiNode, ReturnNode).
 """
 function CC.IRCode(sci::StructuredIRCode)
-    ctx = UnstructurizeCtx()
+    ctx = UnstructurizeCtx(copy(sci.line_map))
     bb = new_bb!(ctx)
     bb = lower_block_body!(ctx, bb, sci.entry)
 

@@ -129,20 +129,25 @@ end
  IfOp Result Emission
 =============================================================================#
 
-"""Push an IfOp and generate getfield statements at each phi index."""
+"""Push an IfOp and generate getfield statements at each phi index.
+`line_anchor` is the SSA index to inherit debug info from (typically the branch terminator)."""
 function emit_ifop_result!(block::Block, if_op::IfOp, phi_indices::Vector{Int},
-                            phi_types::AbstractVector, ctx::StructurizeCtx)
+                            phi_types::AbstractVector, ctx::StructurizeCtx,
+                            line_anchor::Int=0)
     if_ssa = alloc_ssa!(ctx)
     remap = ctx.ssa_remap
     if !isempty(phi_indices)
         result_type = Tuple{phi_types...}
         push!(block, if_ssa, if_op, result_type)
+        line_anchor != 0 && anchor_line!(ctx, if_ssa, line_anchor)
         for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
             idx = get(remap, phi_idx, phi_idx)
             push!(block, idx, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
+            idx != phi_idx && anchor_line!(ctx, idx, line_anchor != 0 ? line_anchor : phi_idx)
         end
     else
         push!(block, if_ssa, if_op, Tuple{})
+        line_anchor != 0 && anchor_line!(ctx, if_ssa, line_anchor)
     end
     return if_ssa
 end
@@ -199,6 +204,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     for ex in extra_exits
         fresh = alloc_ssa!(ctx)
         ctx.ssa_remap[ex.ssa_idx] = fresh
+        anchor_line!(ctx, fresh, ex.ssa_idx)
         push!(init_values, Undef(ex.type))
         push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
         push!(phi_indices, ex.ssa_idx)           # getfield OUTSIDE uses original
@@ -228,10 +234,14 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     apply_substitutions!(body, subs, ctx)
 
     # 7. Emit LoopOp + getfields
+    # Anchor debug info to the loop header's first statement
+    header_anchor = first(ir.cfg.blocks[header].stmts)
+
     loop_op = LoopOp(body, init_values)
     loop_ssa = alloc_ssa!(ctx)
     result_type = Tuple{phi_types...}
     push!(block, loop_ssa, loop_op, result_type)
+    anchor_line!(ctx, loop_ssa, header_anchor)
 
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         # If a preceding IfOp already defined this phi SSA (multi-entry header),
@@ -240,6 +250,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         # the loop result is accessed via the fresh index (only used if phi changes in loop).
         idx = haskey(block.body, phi_idx) ? alloc_ssa!(ctx) : phi_idx
         push!(block, idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
+        idx != phi_idx && anchor_line!(ctx, idx, header_anchor)
     end
 
     return exit_dest

@@ -53,9 +53,10 @@ julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only  # destructure
 ```
 """
 function code_structured(@nospecialize(f), @nospecialize(argtypes=default_tt(f));
-                         validate::Bool=true, kwargs...)
+                         validate::Bool=true, debuginfo::Symbol=:source, kwargs...)
     map(code_ircode(f, argtypes; kwargs...)) do (ir, ret_type)
         sci = StructuredIRCode(ir; validate)
+        debuginfo === :none && empty!(sci.line_map)
         sci => ret_type
     end
 end
