@@ -657,7 +657,7 @@ end
     source_location(sci::StructuredIRCode, inst::Instruction) -> Vector{SourceLocation}
 
 Returns the inlining stack for a statement: `[outermost, ..., innermost]`.
-Returns `SourceLocation[]` if no debug info is available (e.g. after `empty!(sci.line_map)`).
+Returns `SourceLocation[]` if no debug info is available.
 """
 source_location(sci::StructuredIRCode, inst::Instruction) = source_location(sci, inst.ssa_idx)
 
@@ -674,8 +674,9 @@ end
 @static if VERSION >= v"1.12-"
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
-    isempty(sci.line_map) && return SourceLocation[]
+    sci.debuginfo_table === nothing && return SourceLocation[]
     pc = resolve_line(sci.line_map, ssa_idx)
+    pc == 0 && return SourceLocation[]
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
     return resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
@@ -723,8 +724,9 @@ end
 else # Julia 1.11
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
-    isempty(sci.line_map) && return SourceLocation[]
+    sci.debuginfo_table === nothing && return SourceLocation[]
     li = resolve_line(sci.line_map, ssa_idx)
+    li == 0 && return SourceLocation[]
     linetable = sci.debuginfo_table::Vector
     stack = SourceLocation[]
     idx = li
