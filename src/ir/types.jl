@@ -662,20 +662,20 @@ Returns `SourceLocation[]` if no debug info is available.
 source_location(sci::StructuredIRCode, inst::Instruction) = source_location(sci, inst.ssa_idx)
 
 """Resolve line_map entry: follow positive anchors to a negative direct reference.
-Returns the direct reference (a positive PC or linetable index), or 0 if not found."""
+Returns the direct reference (a positive PC or linetable index), or `nothing` if not found."""
 function resolve_line(line_map::Dict{Int, Int}, ssa_idx::Int)
     val = get(line_map, ssa_idx, 0)
     while val > 0
         val = get(line_map, val, 0)
     end
-    return -val  # 0 if not found, positive otherwise
+    return val == 0 ? nothing : -val
 end
 
 @static if VERSION >= v"1.12-"
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     pc = resolve_line(sci.line_map, ssa_idx)
-    pc == 0 && return SourceLocation[]
+    pc === nothing && return SourceLocation[]
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
     return resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
@@ -724,7 +724,7 @@ else # Julia 1.11
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     li = resolve_line(sci.line_map, ssa_idx)
-    li == 0 && return SourceLocation[]
+    li === nothing && return SourceLocation[]
     linetable = sci.debuginfo_table::Vector
     stack = SourceLocation[]
     idx = li

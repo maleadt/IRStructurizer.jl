@@ -110,11 +110,11 @@ end
 # indices can overlap with old structured SSA indices in the same line_map).
 function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
     val = resolve_line(ctx.line_map, old_ssa)
-    val != 0 && (ctx.line_map[sparse_ssa] = -val)
+    val !== nothing && (ctx.line_map[sparse_ssa] = -val)
 end
 function anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
     val = resolve_line(ctx.line_map, source_old_ssa)
-    val != 0 && (ctx.line_map[sparse_ssa] = -val)
+    val !== nothing && (ctx.line_map[sparse_ssa] = -val)
 end
 
 #=============================================================================
@@ -603,7 +603,7 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
                 for (sparse_ssa, _, _) in bb.stmts
                     pos += 1
                     pc = resolve_line(ctx.line_map, sparse_ssa)
-                    pc == 0 && continue
+                    pc === nothing && continue
                     codeloc = CC.getdebugidx(sci.debuginfo_table, pc)
                     off = 3*(pos-1)
                     line[off+1] = codeloc[1]
@@ -620,7 +620,7 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
                 for (sparse_ssa, _, _) in bb.stmts
                     pos += 1
                     li = resolve_line(ctx.line_map, sparse_ssa)
-                    line[pos] = Int32(li)
+                    li !== nothing && (line[pos] = Int32(li))
                 end
             end
         end
