@@ -6,12 +6,15 @@ export UnstructuredControlFlowError
 Exception thrown when unstructured control flow is detected in structured IR.
 """
 struct UnstructuredControlFlowError <: Exception
-    stmt_indices::Vector{Int}
+    msg::String
 end
 
+UnstructuredControlFlowError(stmt_indices::Vector{Int}) =
+    UnstructuredControlFlowError("unstructured control flow at statement(s): " *
+                                  join(stmt_indices, ", "))
+
 function Base.showerror(io::IO, e::UnstructuredControlFlowError)
-    print(io, "UnstructuredControlFlowError: unstructured control flow at statement(s): ",
-          join(e.stmt_indices, ", "))
+    print(io, "UnstructuredControlFlowError: ", e.msg)
 end
 
 
@@ -367,8 +370,8 @@ check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
     validate_ssa_uniqueness(sci::StructuredIRCode) -> Bool
 
 Validate that no SSA index is defined in more than one block.
-This should hold after `rebuildssa!` has run; any remaining duplicates
-indicate a bug in the structurizer.
+Holds by construction — the structurizer allocates fresh indices for inner defs.
+Any duplicates indicate a bug in the structurizer.
 """
 function validate_ssa_uniqueness(sci::StructuredIRCode)
     seen = Set{Int}()

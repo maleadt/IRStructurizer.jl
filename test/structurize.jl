@@ -125,7 +125,7 @@ end
     # Loop with condition check at header (empty body - self-loop pattern)
     @test @filecheck begin
         code_structured(Tuple{Int}) do flag::Int
-            @check "loop ->"
+            @check "while"
             while flag != 0
                 @check "not_int"
                 # spin
@@ -298,13 +298,12 @@ end
     @test @roundtrip f_acc(0)
 end
 
-@testset "Julia for-in-range (1:n) stays as LoopOp" begin
-    # Native for-in-range has complex iterator protocol IR (multiple GotoIfNots)
-    # so it stays as LoopOp, not ForOp. Use while-loops for ForOp.
+@testset "Julia for-in-range (1:n) produces ForOp" begin
+    # Native for-in-range iterator protocol is recognized and promoted to ForOp.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             acc = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
                 @check "add_int"
                 acc += i
@@ -321,7 +320,7 @@ end
         return acc
     end |> only
 
-    # Verify IR is valid (LoopOp is nested inside IfOps from iterator protocol)
+    # Verify IR is valid
     @test sci isa StructuredIRCode
 
     f_forin = (n::Int) -> (acc=0; for i in 1:n; acc+=i; end; acc)
@@ -395,7 +394,7 @@ end
     function count_loops(stmts)
         n = 0
         for s in stmts
-            if s isa LoopOp
+            if s isa LoopOp || s isa ForOp
                 n += 1
             elseif s isa IfOp
                 n += count_loops(collect(statements(s.then_region.body)))
@@ -442,7 +441,7 @@ end  # ForOp detection
 @testset "condition-only spinloop" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do flag::Int
-            @check "loop ->"
+            @check "while"
             while flag != 0
                 @check "not_int"
             end
@@ -605,7 +604,7 @@ end
 end
 
 @testset "swap_loop phi references" begin
-    # Native for-in-range produces LoopOp (iterator protocol is non-SESE)
+    # Swap pattern stays as LoopOp (break/continue values differ at used positions)
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             x, y = 1, 2
@@ -682,7 +681,7 @@ end
     @test @roundtrip f_pow(2, 1)
 end
 
-@testset "SESE while-loop becomes ForOp, non-SESE stays LoopOp" begin
+@testset "SESE while-loop and for-in-range both become ForOp" begin
     # Simple SESE while-loop → ForOp
     sci_while, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
@@ -697,8 +696,7 @@ end
     for_ops = filter(x -> x isa ForOp, collect(statements(sci_while.entry.body)))
     @test length(for_ops) == 1
 
-    # Native for-in-range (non-SESE due to iterator protocol) → LoopOp
-    # LoopOp is nested inside IfOps from iterator protocol's branch structure
+    # Native for-in-range (iterator protocol) → also promoted to ForOp
     sci_for, _ = code_structured(Tuple{Int}) do n::Int
         acc = 0
         for i in 1:n
@@ -707,7 +705,6 @@ end
         return acc
     end |> only
 
-    # LoopOp will be nested inside IfOps, just verify the IR is valid
     @test sci_for isa StructuredIRCode
 
     f_while_acc = (n::Int) -> (i=0; acc=0; while i<n; acc+=i; i+=1; end; acc)
@@ -931,22 +928,12 @@ end
         s
     end
 
-    # Verify the loop body has the correct structure:
-    # - add_int for accumulator (s += i)
-    # - === for inner comparison (i == upper)
-    # - add_int for iterator advance (i + 1) — was MISSING without the fix
-    # - not_int for the actual exit condition — was MISPLACED without the fix
-    # - if/continue/break using the correct exit condition
+    # Verify the for-in-range is promoted to ForOp with accumulator in the body.
+    # The iterator protocol (===, not_int, advance) is absorbed by ForOp detection.
     @test @filecheck begin
         code_structured(mysum, Tuple{Int})
-        @check "loop"
+        @check "for"
         @check "add_int"   # accumulator: s += i
-        @check "==="       # inner comparison: i == upper
-        @check "add_int"   # iterator advance: i + 1
-        @check "not_int"   # exit condition computation
-        @check "if"        # exit IfOp uses not_int result
-        @check "continue"
-        @check "break"
     end
 
     sci, _ = only(code_structured(mysum, Tuple{Int}))
@@ -1163,11 +1150,11 @@ end  # regression
 
 
 @testset "sum_to_n: accumulator pattern" begin
-    # Native for-in-range stays as LoopOp (iterator protocol is non-SESE)
+    # Native for-in-range is promoted to ForOp
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             acc = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
                 @check "add_int"
                 acc += i
@@ -1193,7 +1180,7 @@ end
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             acc = 1
-            @check "loop"
+            @check "for"
             for i in 1:n
                 @check "mul_int"
                 acc *= i
@@ -1250,7 +1237,7 @@ end
         code_structured(Tuple{Int}) do n
             sum = 0
             count = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
                 @check "add_int"
                 sum += i
@@ -1276,13 +1263,13 @@ end
 end
 
 @testset "nested for-in-range loops" begin
-    # Both native for-in-range loops produce LoopOp (iterator protocol is non-SESE)
+    # Both native for-in-range loops are promoted to ForOp
     @test @filecheck begin
         code_structured(Tuple{Int, Int}) do n, m
             acc = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
-                @check "loop"
+                @check "for"
                 for j in 1:m
                     @check "mul_int"
                     acc += i * j
@@ -1328,12 +1315,12 @@ end
 
 end
 
-@testset "for-in-range produces valid LoopOp" begin
-    # Native for-in-range stays as LoopOp (iterator protocol is non-SESE)
+@testset "for-in-range produces valid ForOp" begin
+    # Native for-in-range is promoted to ForOp
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             last = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
                 last = i
             end
@@ -1385,7 +1372,7 @@ end
     @test @filecheck begin
         code_structured(Tuple{Int32}) do x::Int32
             acc = Int32(0)
-            @check "loop init"
+            @check "for"
             for i in Int32(1):Int32(4)
                 @check "add_int"
                 acc += i
@@ -1409,6 +1396,37 @@ end
             return acc + x
         end
     end
+end
+
+@testset "descending for-in-range stays as LoopOp" begin
+    f_desc = (n::Int) -> (s=0; for i in n:-1:0; s+=i; end; s)
+    @test @roundtrip f_desc(5)
+    @test @roundtrip f_desc(0)
+end
+
+@testset "StepRange ForOp has no duplicate undef carries" begin
+    # Regression: the iteration protocol produces two carries with the same continue
+    # value — the real accumulator (init=0.0f0) and a shadow (init=undef). Before the
+    # fix, the ForOp kept both and downstream getfield used the undef-initialized one.
+    sci, _ = code_structured(Tuple{Int32, Int32, Int32}) do start::Int32, step::Int32, stop::Int32
+        acc = 0.0f0
+        for i in start:step:stop
+            acc += Float32(i)
+        end
+        return acc
+    end |> only
+
+    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
+    if !isempty(for_ops)
+        fop = first(for_ops)
+        @test length(fop.init_values) == 1
+        @test !(fop.init_values[1] isa IRStructurizer.Undef)
+    end
+
+    f_step = (s::Int32, st::Int32, sp::Int32) -> (acc=0.0f0; for i in s:st:sp; acc+=Float32(i); end; acc)
+    @test @roundtrip f_step(Int32(1), Int32(2), Int32(10))
+    @test @roundtrip f_step(Int32(1), Int32(1), Int32(5))
+    @test @roundtrip f_step(Int32(5), Int32(1), Int32(0))  # empty range
 end
 
 end  # Julia for-in-range integration

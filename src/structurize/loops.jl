@@ -1,391 +1,465 @@
-# Loop construction: build_while_op, build_loop_op, build_for_op
-
 #=============================================================================
- Loop Construction
+ Branch Region Splitting (dominance-based)
 =============================================================================#
 
 """
-    build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-        -> Tuple{WhileOp, Vector{Int}, Vector{Any}}
+    find_branch_regions(ctx, current, true_dest, false_dest, region_blocks)
+        -> (then_blocks, else_blocks, merge)
 
-Build a WhileOp from a REGION_WHILE_LOOP control tree.
-Returns (while_op, phi_indices, phi_types) where:
-- while_op: The constructed WhileOp with before/after regions
-- phi_indices: SSA indices of the header phi nodes (for getfield generation)
-- phi_types: Julia types of the header phi nodes
-
-The WhileOp structure:
-- before: header statements + ConditionOp(condition, carried_args)
-- after: body statements + YieldOp(carried_values)
+Split region_blocks into then/else regions using dominance.
+A successor with a single predecessor gets all blocks it dominates.
+A successor with multiple predecessors is a merge block (empty region).
 """
-function build_while_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-    stmts = ir.stmts.stmt
-    types = ir.stmts.type
-    header_idx = node_index(tree)
-    loop_blocks = get_loop_blocks(tree, ir)
+function find_branch_regions(ctx::StructurizeCtx, current::Int,
+                              true_dest::Int, false_dest::Int,
+                              region_blocks::Set{Int})
+    ir = ctx.ir
     nblocks = length(ir.cfg.blocks)
 
-    @assert 1 <= header_idx <= nblocks "Invalid header_idx from control tree: $header_idx"
-    header_bb = ir.cfg.blocks[header_idx]
-    header_range = first(header_bb.stmts):last(header_bb.stmts)
+    then_blocks = Set{Int}()
+    else_blocks = Set{Int}()
 
-    # Extract phi node information
-    phi_info = extract_header_phis(header_idx, ir, loop_blocks)
-    (; phi_indices, phi_types, init_values, carried_values) = phi_info
-
-    # Find the condition for loop exit
-    condition = nothing
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa GotoIfNot
-            condition = stmt.cond
-            break
-        end
+    # Collect blocks dominated by each successor (if single-entry from outside).
+    # A successor is "single-entry" if only one predecessor from the region is
+    # NOT a loop backedge to it. Loop backedges don't count because the loop body
+    # is structurally inside the branch, not a separate entry path.
+    if true_dest ∈ region_blocks && true_dest <= nblocks &&
+       count_non_backedge_preds(ir, ctx, true_dest, region_blocks) == 1
+        collect_dominated!(then_blocks, ctx.domtree, true_dest, region_blocks)
     end
 
-    # Build "before" region: header statements + ConditionOp
-    before = Block()
-    emit_condition_block_stmts!(before, header_idx, ir)
-
-    condition_args = IRValue[SSAValue(idx) for idx in phi_indices]
-    cond_value = condition !== nothing ? convert_phi_value(condition) : true
-    before.terminator = ConditionOp(cond_value, condition_args)
-
-    # Build "after" region: body statements + YieldOp
-    after = Block()
-    collect_loop_body_stmts!(after, tree, header_idx, ir, ctx)
-    after.terminator = YieldOp(copy(carried_values))
-
-    # Create BlockArguments and apply substitutions immediately
-    subs = Substitutions()
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        id = alloc_arg_id!(ctx)
-        arg = BlockArgument(id, phi_type)
-        push!(before.args, arg)
-        push!(after.args, BlockArgument(id, phi_type))
-        subs[phi_idx] = arg
-    end
-    apply_substitutions!(before, subs, ctx)
-    apply_substitutions!(after, subs, ctx)
-
-    while_op = WhileOp(before, after, init_values)
-    return while_op, phi_indices, phi_types
-end
-
-"""
-    find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
-
-Find the GotoIfNot in `loop_blocks` that controls the loop exit.
-Returns `(; cond, idx, block, dest, inverted)` or `nothing`.
-
-A `GotoIfNot(cond, dest)` has two successors:
-- `dest` (taken when `cond` is false)
-- fallthrough to the next block (taken when `cond` is true)
-
-When `dest` exits the loop: `inverted=false` (cond=true → stay, cond=false → exit).
-When the fallthrough exits: `inverted=true` (cond=true → exit, cond=false → stay).
-"""
-function find_loop_exit_condition(ir::IRCode, loop_blocks::Set{Int})
-    nblocks = length(ir.cfg.blocks)
-    for block_idx in loop_blocks
-        bb = ir.cfg.blocks[block_idx]
-        for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa GotoIfNot
-                if stmt.dest ∉ loop_blocks
-                    return (; cond=stmt.cond, idx=si, block=block_idx, dest=stmt.dest, inverted=false)
-                end
-                # Check fallthrough successor (next block in sequence)
-                fallthrough = block_idx + 1
-                if fallthrough <= nblocks && fallthrough ∉ loop_blocks
-                    return (; cond=stmt.cond, idx=si, block=block_idx, dest=fallthrough, inverted=true)
-                end
-            end
-        end
-    end
-    return nothing
-end
-
-"""
-    build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-        -> Tuple{LoopOp, Vector{Int}, Vector{Any}, Vector{Int}}
-
-Build a LoopOp from a control tree and return phi node information.
-Returns (loop_op, phi_indices, phi_types, post_loop_blocks) where:
-- loop_op: The constructed LoopOp
-- phi_indices: SSA indices of the header phi nodes (for getfield generation)
-- phi_types: Julia types of the header phi nodes
-- post_loop_blocks: block indices whose content should be emitted after the loop
-
-Uses CFG-based natural loop blocks for exit detection, which correctly excludes
-exit-target blocks that may have been absorbed into the control tree by
-TERMINATION regions.
-"""
-function build_loop_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-    stmts = ir.stmts.stmt
-    types = ir.stmts.type
-    header_idx = node_index(tree)
-    nblocks = length(ir.cfg.blocks)
-
-    @assert 1 <= header_idx <= nblocks "Invalid header_idx from control tree: $header_idx"
-
-    # Use CFG-based natural loop blocks for exit detection.
-    # The control tree may include exit-target blocks (via TERMINATION regions),
-    # but the natural loop only contains blocks reachable from the header via backedges.
-    natural_blocks = compute_natural_loop_blocks(ir, header_idx)
-
-    # 1. Extract phis from header
-    phi_info = extract_header_phis(header_idx, ir, natural_blocks)
-    (; phi_indices, phi_types, init_values, carried_values) = phi_info
-
-    # 2. Find exit condition (using natural loop blocks)
-    exit = find_loop_exit_condition(ir, natural_blocks)
-
-    # 3. Classify children: determine exit child, post-loop blocks, and cache
-    #    child_blocks to avoid redundant get_region_blocks calls in step 4.
-    exit_child_idx = nothing
-    post_loop_set = Set{Int}()
-    child_block_cache = Vector{Set{Int}}()
-    for (i, child) in enumerate(children(tree))
-        child_blocks = get_region_blocks(child, ir)
-        push!(child_block_cache, child_blocks)
-        if exit !== nothing
-            if exit.block ∈ child_blocks
-                exit_child_idx = i
-            end
-            for blk in child_blocks
-                if blk ∉ natural_blocks && 1 <= blk <= nblocks
-                    push!(post_loop_set, blk)
-                end
-            end
-        end
+    if false_dest ∈ region_blocks && false_dest <= nblocks &&
+       count_non_backedge_preds(ir, ctx, false_dest, region_blocks) == 1
+        collect_dominated!(else_blocks, ctx.domtree, false_dest, region_blocks)
     end
 
-    # 4. Process children in two phases:
-    #    - Up to and including the exit child → body (pre-condition stmts)
-    #    - After the exit child → then_blk (post-condition stmts, continue branch)
-    #    For children containing the exit block AND post-loop blocks (TERMINATION
-    #    regions), only collect statements from the in-loop blocks directly.
-    body = Block()
-    then_blk = Block()
+    # Remove any overlap with loop bodies that will be handled separately
+    # (a block should only be in one region)
+    setdiff!(then_blocks, else_blocks)
 
-    for (i, child) in enumerate(children(tree))
-        child_blocks = child_block_cache[i]
-
-        # Skip children entirely outside the natural loop
-        if !isempty(post_loop_set) && issubset(child_blocks, post_loop_set)
-            continue
-        end
-
-        # For mixed children (e.g., TERMINATION with exit + post-loop blocks),
-        # only collect statements from the in-loop blocks directly
-        if !isempty(post_loop_set) && !isempty(intersect(child_blocks, post_loop_set))
-            target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
-            for blk_idx in sort!(collect(setdiff(child_blocks, post_loop_set)))
-                collect_block_statements!(target, blk_idx, ir; capture_terminator=false)
-            end
-            continue
-        end
-
-        target = (exit_child_idx !== nothing && i > exit_child_idx) ? then_blk : body
-        process_child_region!(target, child, ir, ctx)
-    end
-
-    # 5. BlockArguments for header phis + substitutions
-    # NOTE: must happen before pad_extra_exits! so body.args order matches
-    # init_values/carried_values order (header phis first, then extra exits).
-    n_header_phis = length(phi_indices)
-    subs = Substitutions()
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_header_phis], phi_types))
-        id = alloc_arg_id!(ctx)
-        arg = BlockArgument(id, phi_type)
-        push!(body.args, arg)
-        subs[phi_idx] = arg
-    end
-
-    # 6. Find and pad extra exit values into the loop-carry chain.
-    extra_exits = if exit !== nothing
-        find_extra_exit_values(ir, exit.dest, natural_blocks, Set(phi_indices))
+    # Merge = the block where all paths from `current` reconverge.
+    # Prefer the immediate post-dominator (structurally exact).
+    # Fall back to successor-candidate search when early returns prevent
+    # real post-dominance (ipdom = 0 = virtual exit).
+    merge = nothing
+    ipdom = ctx.postdomtree.idoms_bb[current]
+    if ipdom != 0 && ipdom ∈ region_blocks && ipdom ∉ then_blocks && ipdom ∉ else_blocks
+        merge = ipdom
     else
-        @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
-    end
-    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, ctx)
-
-    # 7. Build exit control flow
-    if exit !== nothing
-        cond_value = convert_phi_value(exit.cond)
-
-        then_blk.terminator = ContinueOp(copy(carried_values))
-
-        else_blk = Block()
-        break_values = IRValue[v for v in carried_values]
-        # Replace header phi carried values with SSAValue refs (they're block args)
-        for (i, idx) in enumerate(phi_indices[1:n_header_phis])
-            break_values[i] = SSAValue(idx)
+        candidates = Set{Int}()
+        for b in then_blocks
+            for s in ir.cfg.blocks[b].succs
+                s ∉ then_blocks && s != current && push!(candidates, s)
+            end
         end
-        else_blk.terminator = BreakOp(break_values)
+        for b in else_blocks
+            for s in ir.cfg.blocks[b].succs
+                s ∉ else_blocks && s != current && push!(candidates, s)
+            end
+        end
+        if true_dest ∈ region_blocks && true_dest ∉ then_blocks
+            push!(candidates, true_dest)
+        end
+        if false_dest ∈ region_blocks && false_dest ∉ else_blocks
+            push!(candidates, false_dest)
+        end
+        for c in sort!(collect(candidates))
+            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
+                merge = c
+                break
+            end
+        end
+    end
 
-        if exit.inverted
-            # Exit through fallthrough: cond=true → exit, cond=false → stay in loop
-            push!(body, exit.idx, IfOp(cond_value, else_blk, then_blk), Nothing)
-        else
-            # Exit through goto dest: cond=true → stay in loop, cond=false → exit
-            push!(body, exit.idx, IfOp(cond_value, then_blk, else_blk), Nothing)
+    return then_blocks, else_blocks, merge
+end
+
+"""Count predecessors of `block` in `region` that are not loop backedges to `block`."""
+function count_non_backedge_preds(ir::IRCode, ctx::StructurizeCtx, block::Int, region::Set{Int})
+    count = 0
+    for pred in ir.cfg.blocks[block].preds
+        pred ∈ region || continue
+        # A backedge is an edge where the target dominates the source
+        if dominates(ctx.domtree, block, pred)
+            continue  # skip loop backedge
+        end
+        count += 1
+    end
+    count
+end
+
+
+"""Collect all blocks in `region` dominated by `root` (including root itself)."""
+function collect_dominated!(result::Set{Int}, domtree::DomTree, root::Int, region::Set{Int})
+    root ∈ region || return
+    push!(result, root)
+    for child in domtree.nodes[root].children
+        child ∈ region && collect_dominated!(result, domtree, child, region)
+    end
+end
+
+#=============================================================================
+ Merge Phi Extraction
+=============================================================================#
+
+"""Extract phi nodes at `merge_idx` that have edges from blocks in `region`."""
+function extract_merge_phis(ir::IRCode, merge_idx::Int, region_blocks::Set{Int})
+    result = MergePhiInfo[]
+    nblocks = length(ir.cfg.blocks)
+    1 <= merge_idx <= nblocks || return result
+
+    bb = ir.cfg.blocks[merge_idx]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+
+        edge_values = Dict{Int, Any}()
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            if isassigned(stmt.values, edge_idx)
+                # Include edges from region blocks AND direct predecessors
+                edge_values[Int(edge)] = stmt.values[edge_idx]
+            end
+        end
+        !isempty(edge_values) && push!(result, MergePhiInfo(si, edge_values))
+    end
+    return result
+end
+
+#=============================================================================
+ IfOp Result Emission
+=============================================================================#
+
+"""Push an IfOp and generate getfield statements at each phi index."""
+function emit_ifop_result!(block::Block, if_op::IfOp, phi_indices::Vector{Int},
+                            phi_types::AbstractVector, ctx::StructurizeCtx)
+    if_ssa = alloc_ssa!(ctx)
+    remap = ctx.ssa_remap
+    if !isempty(phi_indices)
+        result_type = Tuple{phi_types...}
+        push!(block, if_ssa, if_op, result_type)
+        for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+            idx = get(remap, phi_idx, phi_idx)
+            push!(block, idx, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
         end
     else
-        body.terminator = ContinueOp(copy(carried_values))
+        push!(block, if_ssa, if_op, Tuple{})
     end
-
-    apply_substitutions!(body, subs, ctx)
-
-    loop_op = LoopOp(body, init_values)
-
-    # Collect post-loop children: children entirely outside the natural loop,
-    # or the post-loop subtrees of mixed children (e.g., TERMINATION regions
-    # that span loop exit + post-loop code).
-    post_loop_children = ControlTree[]
-    for (i, child) in enumerate(children(tree))
-        child_blocks = child_block_cache[i]
-        if !isempty(post_loop_set) && issubset(child_blocks, post_loop_set)
-            # Entirely post-loop child — needs full structurization
-            push!(post_loop_children, child)
-        elseif !isempty(post_loop_set) && !isempty(intersect(child_blocks, post_loop_set))
-            # Mixed child — extract the post-loop subtrees
-            for sub in children(child)
-                sub_blocks = get_region_blocks(sub, ir)
-                if issubset(sub_blocks, post_loop_set)
-                    push!(post_loop_children, sub)
-                end
-            end
-        end
-    end
-
-    return loop_op, phi_indices, phi_types, post_loop_children
+    return if_ssa
 end
 
+#=============================================================================
+ Loop Lifting (LoopOp)
+=============================================================================#
+
 """
-    build_for_op(tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-        -> Tuple{ForOp, Vector{Int}, Vector{Any}}
+    emit_loop!(block, ctx, header, loop_blocks, region_blocks) -> exit_dest
 
-Build a ForOp directly from a REGION_FOR_LOOP control tree using metadata from CFG analysis.
-Returns (for_op, phi_indices, phi_types) where:
-- for_op: The constructed ForOp with bounds, step, IV, and body
-- phi_indices: SSA indices of the non-IV phi nodes (for getfield generation)
-- phi_types: Julia types of the non-IV phi nodes
-
-The ForOp structure:
-- lower: Lower bound from ForLoopInfo
-- upper: Exclusive upper bound (adjusted +1 for inclusive patterns like `<=`)
-- step: Step value from ForLoopInfo
-- iv_arg: BlockArgument for the induction variable
-- body: Loop body statements + ContinueOp with carried values
-- init_values: Non-IV loop-carried values
+Build a LoopOp for the natural loop at `header` and emit it into `block`.
+Returns the exit destination block (may be outside region_blocks).
 """
-function build_for_op(block::Block, tree::ControlTree, ir::IRCode, ctx::StructurizationContext)
-    stmts = ir.stmts.stmt
-    types = ir.stmts.type
-    header_idx = node_index(tree)
-    loop_blocks = get_loop_blocks(tree, ir)
-    for_info = metadata(tree)::ForLoopInfo
-    nblocks = length(ir.cfg.blocks)
+function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
+                     loop_blocks::Set{Int}, region_blocks::Set{Int})
+    ir = ctx.ir
 
-    @assert 1 <= header_idx <= nblocks "Invalid header_idx from control tree: $header_idx"
-    header_bb = ir.cfg.blocks[header_idx]
-    header_range = first(header_bb.stmts):last(header_bb.stmts)
+    # 1. Extract header phi nodes
+    phi_info = extract_loop_phis(ir, header, loop_blocks)
 
-    # Extract phi info with IV excluded from init/carried values
-    iv_phi_idx = for_info.iv_phi_idx
-    all_phi_info = extract_header_phis(header_idx, ir, loop_blocks; exclude_iv=iv_phi_idx)
-    (; init_values, carried_values) = all_phi_info
+    # 2. Find exit destination (prefer the post-dominator of the header —
+    #    the structurally correct continuation, not an error/unreachable path)
+    exit_dest = find_loop_exit(ctx, header, loop_blocks)
 
-    # Build result phi_indices and phi_types (excluding IV)
+    # 3. Find extra exit values (loop-internal SSAs used outside)
+    already_exported = Set{Int}(p.ssa_idx for p in phi_info)
+    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported)
+
+    # 4. Build init/carried values and block arguments
+    init_values = IRValue[]
+    carried_values = IRValue[]
     phi_indices = Int[]
     phi_types = Any[]
-    for (idx, typ) in zip(all_phi_info.phi_indices, all_phi_info.phi_types)
-        if idx != iv_phi_idx
-            push!(phi_indices, idx)
-            push!(phi_types, typ)
-        end
-    end
-
-    # Get IV type
-    iv_type = types[iv_phi_idx]
-
-    # Create BlockArgument for IV (first in ForOp's block args)
-    iv_arg = BlockArgument(alloc_arg_id!(ctx), iv_type)
-
-    # Build the body block
     body = Block()
+    subs = Dict{Int, BlockArgument}()
 
-    # Find the condition SSA from GotoIfNot and compute the condition chain to exclude
-    cond_ssa = nothing
-    for si in header_range
-        stmt = stmts[si]
-        if stmt isa GotoIfNot && stmt.cond isa SSAValue
-            cond_ssa = stmt.cond
-            break
-        end
-    end
-    excluded = cond_ssa !== nothing ?
-        find_condition_chain(stmts, header_range, cond_ssa) : Set{Int}()
-
-    # Collect header statements (excluding phi nodes, control flow, and condition chain)
-    for si in header_range
-        stmt = stmts[si]
-        if si ∉ excluded && !(stmt isa PhiNode || stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode)
-            push!(body, si, stmt, types[si])
-        end
-    end
-
-    # Process loop body blocks (excluding header)
-    collect_loop_body_stmts!(body, tree, header_idx, ir, ctx)
-
-    # Find and pad extra exit values into the loop-carry chain
-    exit_info = find_loop_exit_condition(ir, loop_blocks)
-    already_exported = Set{Int}([iv_phi_idx; phi_indices])
-    extra_exits = if exit_info !== nothing
-        find_extra_exit_values(ir, exit_info.dest, loop_blocks, already_exported)
-    else
-        @NamedTuple{value::IRValue, getfield_idx::Int, type::Any}[]
-    end
-    n_phi = length(phi_indices)
-
-    # Create BlockArguments for header phis BEFORE padding extra exits,
-    # so body.args order matches init_values/carried_values order
-    # (header phis first, then extra exits).
-    subs = Substitutions()
-    subs[iv_phi_idx] = iv_arg  # IV at index 1
-    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices[1:n_phi], phi_types))
-        id = alloc_arg_id!(ctx)
-        arg = BlockArgument(id, phi_type)
+    for phi in phi_info
+        # If a preceding IfOp already defined this phi SSA (via getfield),
+        # use that as init_val — it captures the correct branch-selected value.
+        init_val = haskey(block.body, phi.ssa_idx) ? SSAValue(phi.ssa_idx) : phi.entry_val
+        push!(init_values, init_val)
+        push!(carried_values, phi.carried_val)
+        push!(phi_indices, phi.ssa_idx)
+        push!(phi_types, ctx.types[phi.ssa_idx])
+        arg = BlockArgument(alloc_arg!(ctx), ctx.types[phi.ssa_idx])
         push!(body.args, arg)
-        subs[phi_idx] = arg
+        subs[phi.ssa_idx] = arg
     end
 
-    pad_extra_exits!(extra_exits, init_values, carried_values, body, phi_indices, phi_types, ctx)
-
-    # ContinueOp with non-IV carried values (including extra exits)
-    body.terminator = ContinueOp(copy(carried_values))
-
-    # Build ForOp with bounds from ForLoopInfo.
-    # ForOp uses exclusive upper bound semantics (loop iterates while iv < upper).
-    lower = convert_phi_value(for_info.lower)
-    upper = convert_phi_value(for_info.upper)
-    step = convert_phi_value(for_info.step)
-
-    # Normalize inclusive bounds (e.g., `while j <= n`) to exclusive (upper + 1)
-    if for_info.is_inclusive
-        adj_ssa_idx = ctx.next_value_idx
-        ctx.next_value_idx += 1
-        upper_type = get_value_type(for_info.upper, ir)
-        add_int_expr = Expr(:call, GlobalRef(Base, :add_int), upper, one(upper_type))
-        push!(block, adj_ssa_idx, add_int_expr, upper_type)
-        upper = SSAValue(adj_ssa_idx)
+    # Save remap state and add extra-exit remappings for the loop body.
+    # Inner defs get fresh indices; outer getfields keep the originals.
+    saved_remap = copy(ctx.ssa_remap)
+    for ex in extra_exits
+        fresh = alloc_ssa!(ctx)
+        ctx.ssa_remap[ex.ssa_idx] = fresh
+        push!(init_values, Undef(ex.type))
+        push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
+        push!(phi_indices, ex.ssa_idx)           # getfield OUTSIDE uses original
+        push!(phi_types, ex.type)
+        arg = BlockArgument(alloc_arg!(ctx), ex.type)
+        push!(body.args, arg)
     end
 
+    # Remap header phi carried values that reference extra exit SSAs
+    if !isempty(ctx.ssa_remap)
+        n_header = length(phi_info)
+        for i in 1:n_header
+            v = carried_values[i]
+            if v isa SSAValue
+                carried_values[i] = SSAValue(get(ctx.ssa_remap, v.id, v.id))
+            end
+        end
+    end
+
+    # 5. Build loop body
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
+
+    # Restore remap (scoped to loop body)
+    ctx.ssa_remap = saved_remap
+
+    # 6. Apply phi→arg substitutions
     apply_substitutions!(body, subs, ctx)
 
-    for_op = ForOp(lower, upper, step, iv_arg, body, init_values)
+    # 7. Emit LoopOp + getfields
+    loop_op = LoopOp(body, init_values)
+    loop_ssa = alloc_ssa!(ctx)
+    result_type = Tuple{phi_types...}
+    push!(block, loop_ssa, loop_op, result_type)
 
-    return for_op, phi_indices, phi_types
+    for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
+        # If a preceding IfOp already defined this phi SSA (multi-entry header),
+        # use a fresh index for the loop's getfield to avoid SSA uniqueness violation.
+        # Downstream code references phi_idx which is the IfOp's definition;
+        # the loop result is accessed via the fresh index (only used if phi changes in loop).
+        idx = haskey(block.body, phi_idx) ? alloc_ssa!(ctx) : phi_idx
+        push!(block, idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
+    end
+
+    return exit_dest
 end
+
+#=============================================================================
+ Loop Body Construction
+=============================================================================#
+
+"""
+Build the body of a LoopOp using `structurize_region!` with a LoopCtx.
+The LoopCtx makes the region walk loop-aware: back-edges → ContinueOp, exits → BreakOp.
+"""
+function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
+                           loop_blocks::Set{Int}, carried_values::Vector{IRValue},
+                           subs::Dict{Int, BlockArgument})
+    break_values = IRValue[arg for arg in body.args]
+    # Extra exits (beyond header phis) must carry the current iteration's
+    # computed value, not the stale block arg from the previous iteration.
+    n_header_phis = length(subs)
+    for i in (n_header_phis + 1):length(break_values)
+        break_values[i] = carried_values[i]
+    end
+    lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
+
+    # Use structurize_region! with loop context for the entire loop body
+    content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)
+
+    # Merge content into the pre-existing body (which already has args)
+    merge_block_into!(body, content)
+end
+
+function merge_block_into!(dst::Block, src::Block)
+    for (idx, entry) in src.body
+        push!(dst.body, (idx, entry.stmt, entry.typ))
+    end
+    if src.terminator !== nothing && dst.terminator === nothing
+        dst.terminator = src.terminator
+    end
+end
+
+#=============================================================================
+ Loop Analysis Helpers
+=============================================================================#
+
+struct LoopPhiInfo
+    ssa_idx::Int
+    entry_val::Any
+    carried_val::Any
+end
+
+"""Extract phi nodes from a loop header, separating entry and carried values."""
+function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
+    result = LoopPhiInfo[]
+    bb = ir.cfg.blocks[header]
+    for si in first(bb.stmts):last(bb.stmts)
+        stmt = ir.stmts.stmt[si]
+        stmt isa PhiNode || continue
+        entry_val = nothing
+        carried_val = nothing
+        for (edge_idx, edge) in enumerate(stmt.edges)
+            isassigned(stmt.values, edge_idx) || continue
+            val = stmt.values[edge_idx]
+            if Int(edge) ∈ loop_blocks
+                carried_val = val
+            else
+                entry_val = val
+            end
+        end
+        if entry_val !== nothing && carried_val !== nothing
+            push!(result, LoopPhiInfo(si, entry_val, carried_val))
+        elseif entry_val !== nothing || carried_val !== nothing
+            # A phi with edges from only one side of the loop boundary is
+            # malformed — the optimizer may have removed a dead edge, or
+            # the loop has unusual structure. Error rather than silently
+            # producing wrong loop-carried values.
+            has_entry = entry_val !== nothing
+            error("internal error: loop header phi %$si at BB$header has ",
+                  has_entry ? "entry" : "carried", " value but no ",
+                  has_entry ? "carried" : "entry", " value")
+        end
+    end
+    result
+end
+
+"""
+Find the primary exit destination of a loop.
+
+Prefers the immediate post-dominator of the header (the structurally correct
+continuation point). Falls back to any exit with successors (non-dead-end),
+then any exit at all.
+"""
+function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
+    ir = ctx.ir
+    nblocks = length(ir.cfg.blocks)
+    exits = Int[]
+    for b in loop_blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ loop_blocks && succ ∉ exits && push!(exits, succ)
+        end
+    end
+    isempty(exits) && return nothing
+    length(exits) == 1 && return exits[1]
+    # Prefer post-dominator of header (the natural continuation)
+    ipdom = ctx.postdomtree.idoms_bb[header]
+    ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
+    # Fall back: prefer exits with successors, then non-throw dead-ends
+    for e in exits
+        e <= nblocks && !isempty(ir.cfg.blocks[e].succs) && return e
+    end
+    for e in exits
+        if e <= nblocks && isempty(ir.cfg.blocks[e].succs)
+            ir.stmts.type[last(ir.cfg.blocks[e].stmts)] !== Union{} && return e
+        end
+    end
+    return first(exits)
+end
+
+"""Find all blocks outside `loop_blocks` that are successors of loop blocks."""
+function find_loop_exits(ir::IRCode, loop_blocks::Set{Int})
+    exits = Set{Int}()
+    for b in loop_blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ loop_blocks && push!(exits, succ)
+        end
+    end
+    exits
+end
+
+"""
+Find loop-internal SSA values referenced outside the loop.
+
+Scans blocks reachable from loop exit edges (not the entire IR). This is more
+precise than scanning all non-loop blocks: it excludes blocks before the loop
+or on branches that bypass it. Values escape through exit-block phis, direct
+references at downstream blocks, or as operands of sequential loops.
+"""
+function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
+                                 already_exported::Set{Int})
+    result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
+    seen = Set{Int}()
+
+    # Collect non-loop blocks reachable from loop exit edges.
+    # Skip throw/unreachable blocks (terminal type Union{}): these are error
+    # paths whose values don't need threading because find_loop_exit prefers
+    # non-throw continuations, so throw blocks are not walked after the loop.
+    reachable = Set{Int}()
+    worklist = Int[]
+    nblocks = length(ir.cfg.blocks)
+    for b in loop_blocks
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ loop_blocks || continue
+            # Skip throw/unreachable blocks
+            if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
+               ir.stmts.type[last(ir.cfg.blocks[succ].stmts)] === Union{}
+                continue
+            end
+            push!(worklist, succ)
+        end
+    end
+    while !isempty(worklist)
+        b = pop!(worklist)
+        b ∈ reachable && continue
+        b ∈ loop_blocks && continue
+        push!(reachable, b)
+        for succ in ir.cfg.blocks[b].succs
+            succ ∉ reachable && succ ∉ loop_blocks && push!(worklist, succ)
+        end
+    end
+
+    for blk_idx in reachable
+        bb = ir.cfg.blocks[blk_idx]
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            if stmt isa PhiNode
+                si ∈ already_exported && continue
+                for (edge_idx, edge) in enumerate(stmt.edges)
+                    if isassigned(stmt.values, edge_idx) && Int(edge) ∈ loop_blocks
+                        loop_val = stmt.values[edge_idx]
+                        gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                        gf_idx ∈ seen && continue
+                        gf_idx ∈ already_exported && continue
+                        push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
+                        push!(seen, gf_idx)
+                    end
+                end
+            else
+                # Single-predecessor exit blocks may reference loop values directly
+                for arg in stmt_ssa_uses(stmt)
+                    is_defined_in(arg, loop_blocks, ir) || continue
+                    arg.id ∈ already_exported && continue
+                    arg.id ∈ seen && continue
+                    push!(result, (; ssa_idx=arg.id, value=arg, type=ir.stmts.type[arg.id]))
+                    push!(seen, arg.id)
+                end
+            end
+        end
+    end
+    result
+end
+
+function stmt_ssa_uses(@nospecialize(stmt))
+    if stmt isa SSAValue
+        return (stmt,)
+    elseif stmt isa Expr
+        return Iterators.filter(x -> x isa SSAValue, stmt.args)
+    elseif stmt isa GotoIfNot && stmt.cond isa SSAValue
+        return (stmt.cond,)
+    elseif stmt isa ReturnNode && isdefined(stmt, :val) && stmt.val isa SSAValue
+        return (stmt.val,)
+    else
+        return ()
+    end
+end
+
+function is_defined_in(val::SSAValue, blocks::Set{Int}, ir::IRCode)
+    for blk_idx in blocks
+        bb = ir.cfg.blocks[blk_idx]
+        val.id in first(bb.stmts):last(bb.stmts) && return true
+    end
+    false
+end
+is_defined_in(val, blocks, ir) = false

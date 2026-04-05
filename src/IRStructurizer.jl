@@ -4,26 +4,22 @@ using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
             GotoNode, GotoIfNot, ReturnNode, PhiNode, PiNode, QuoteNode, GlobalRef
 
 using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
-                     construct_domtree, DomTree, dominates, bb_unreachable,
+                     construct_domtree, DomTree, dominates,
+                     construct_postdomtree, PostDomTree, postdominates,
+                     CFGReachability, bb_in_irreducible_loop,
                      widenconst
 using Base: code_ircode
-
-# auxiliary data structures and analyses
-include("graph.jl")
-include("cfg.jl")
-
-# control tree construction
-include("control_tree.jl")
 
 # structured IR definitions
 include("ir/types.jl")
 include("ir/show.jl")
 
-# control tree to structured IR
+# substitution machinery (phi refs → block args)
 include("structurize/substitutions.jl")
-include("structurize/helpers.jl")
-include("structurize/regions.jl")
-include("structurize/loops.jl")
+
+# structurization: IRCode → StructuredIRCode
+include("structurize.jl")
+include("structurize/promote.jl")
 
 # IR utilities & validation
 include("ir/utilities.jl")
