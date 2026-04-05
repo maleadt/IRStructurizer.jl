@@ -41,13 +41,16 @@ function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
     anchor != 0 && (ctx.line_map[new_ssa] = anchor)
 end
 
-function _get_anchor(ctx::StructurizeCtx, ssa::Int)
-    v = get(ctx.line_map, ssa, 0)
-    v != 0 && return v
-    # On 1.12+: original stmts (≤ n) are their own PC anchor.
-    # On 1.11: all original stmts are pre-populated, so this is only reached
-    #          for un-anchored synthesized stmts.
-    return ssa <= length(ctx.ir.stmts.stmt) ? ssa : 0
+@static if VERSION >= v"1.12-"
+    function _get_anchor(ctx::StructurizeCtx, ssa::Int)
+        # Synthesized stmts are in line_map; original stmts use SSA idx as PC.
+        return get(ctx.line_map, ssa, ssa)
+    end
+else
+    function _get_anchor(ctx::StructurizeCtx, ssa::Int)
+        # All stmts with debug info are in line_map (linetable indices).
+        return get(ctx.line_map, ssa, 0)
+    end
 end
 
 """Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""

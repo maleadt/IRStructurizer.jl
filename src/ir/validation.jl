@@ -98,7 +98,7 @@ end
 
 # Convenience method for testing: wrap block in minimal SCI
 function validate_terminators(entry::Block)
-    sci = StructuredIRCode(Any[], Any[], entry, 0, 0, nothing, 0, Dict{Int,Int}())
+    sci = StructuredIRCode(Any[], Any[], entry, 0, 0, nothing, Dict{Int,Int}())
     return validate_terminators(sci)
 end
 

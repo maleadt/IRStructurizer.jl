@@ -562,12 +562,11 @@ mutable struct StructuredIRCode
     max_arg_idx::Int
     # Debug info — access via source_location()
     const debuginfo_table::Any     # linetable (1.11) or DebugInfoStream (1.12+), or nothing
-    const n_original_stmts::Int    # number of stmts in original IRCode
     const line_map::Dict{Int, Int} # ssa_idx → anchor PC (1.12+) or linetable index (1.11)
 end
 
 StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
-    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, 0, Dict{Int,Int}())
+    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, Dict{Int,Int}())
 
 """
     StructuredIRCode(ir::IRCode; structurize=true, validate=true)
@@ -614,7 +613,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     end
 
     sci = StructuredIRCode(argtypes, sptypes, entry, n, 0,
-                           debuginfo_table, n, line_map)
+                           debuginfo_table, line_map)
 
     if structurize && n > 0
         entry, max_ssa, max_arg, updated_line_map =
@@ -660,19 +659,15 @@ source_location(sci::StructuredIRCode, inst::Instruction) = source_location(sci,
 
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     sci.debuginfo_table === nothing && return SourceLocation[]
-    # Original stmts: SSA index IS the PC. Synthesized: look up anchor.
-    pc = get(sci.line_map, ssa_idx, 0)
-    if pc == 0
-        pc = ssa_idx <= sci.n_original_stmts ? ssa_idx : 0
-    end
-    pc == 0 && return SourceLocation[]
+    # Synthesized stmts are in line_map; original stmts use SSA idx as PC directly.
+    pc = get(sci.line_map, ssa_idx, ssa_idx)
     debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
     return _resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
 
 function _resolve_debuginfo(debuginfo, @nospecialize(def), pc::Int)
     scopes = SourceLocation[]
-    _append_scopes!(scopes, pc, debuginfo, def)
+    _append_scopes!(scopes, pc, debuginfo, def) || empty!(scopes)
     return scopes
 end
 

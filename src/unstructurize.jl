@@ -32,13 +32,12 @@ mutable struct UnstructurizeCtx
     loop_stack::Vector{LoopTarget}
     # Debug info: maps sparse SSA → anchor (same semantics as StructurizeCtx.line_map)
     line_map::Dict{Int, Int}
-    n_original_stmts::Int
 end
 
-function UnstructurizeCtx(line_map::Dict{Int, Int}=Dict{Int, Int}(), n_original_stmts::Int=0)
+function UnstructurizeCtx(line_map::Dict{Int, Int}=Dict{Int, Int}())
     UnstructurizeCtx(FlatBB[], 0, Dict{Int,Int}(), Dict{Int,Int}(),
                      Dict{Int,Vector{Int}}(), LoopTarget[],
-                     line_map, n_original_stmts)
+                     line_map)
 end
 
 #=============================================================================
@@ -106,25 +105,24 @@ function emit_resolved!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int,
     return sparse
 end
 
-"""Propagate line info from a structured IR SSA index to a new sparse SSA."""
-function _propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
-    # Check if old_ssa has an explicit anchor
-    anchor = get(ctx.line_map, old_ssa, 0)
-    if anchor != 0
-        ctx.line_map[sparse_ssa] = anchor
-    elseif old_ssa <= ctx.n_original_stmts
-        # Original stmt: it is its own anchor (1.12+ identity; 1.11 pre-populated)
-        ctx.line_map[sparse_ssa] = old_ssa
+# Propagate/anchor line info between structured IR SSA indices and sparse SSAs.
+@static if VERSION >= v"1.12-"
+    # On 1.12+: not in line_map → original stmt, use SSA idx as PC
+    function _propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+        ctx.line_map[sparse_ssa] = get(ctx.line_map, old_ssa, old_ssa)
     end
-end
-
-"""Anchor a synthesized sparse SSA to an old structured SSA's location."""
-function _anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
-    anchor = get(ctx.line_map, source_old_ssa, 0)
-    if anchor != 0
-        ctx.line_map[sparse_ssa] = anchor
-    elseif source_old_ssa <= ctx.n_original_stmts
-        ctx.line_map[sparse_ssa] = source_old_ssa
+    function _anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+        ctx.line_map[sparse_ssa] = get(ctx.line_map, source_old_ssa, source_old_ssa)
+    end
+else
+    # On 1.11: not in line_map → no debug info
+    function _propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
+        anchor = get(ctx.line_map, old_ssa, 0)
+        anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
+    end
+    function _anchor_sparse_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, source_old_ssa::Int)
+        anchor = get(ctx.line_map, source_old_ssa, 0)
+        anchor != 0 && (ctx.line_map[sparse_ssa] = anchor)
     end
 end
 
@@ -711,7 +709,7 @@ Convert a StructuredIRCode back to flat Julia IRCode with explicit control flow
 (GotoNode, GotoIfNot, PhiNode, ReturnNode).
 """
 function CC.IRCode(sci::StructuredIRCode)
-    ctx = UnstructurizeCtx(copy(sci.line_map), sci.n_original_stmts)
+    ctx = UnstructurizeCtx(copy(sci.line_map))
     bb = new_bb!(ctx)
     bb = lower_block_body!(ctx, bb, sci.entry)
 
