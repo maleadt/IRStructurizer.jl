@@ -571,6 +571,25 @@ end
 StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
     StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, Dict{Int,Int}())
 
+function Base.copy(sci::StructuredIRCode)
+    # Sever entry→SCI backref before deepcopy to avoid pulling in
+    # debuginfo_table (contains Module on 1.11, which can't be deepcopied)
+    sci.entry.parent = nothing
+    entry_copy = deepcopy(sci.entry)
+    sci.entry.parent = sci
+    new_sci = StructuredIRCode(
+        copy(sci.argtypes), copy(sci.sptypes),
+        entry_copy,
+        sci.max_ssa_idx, sci.max_arg_idx,
+        sci.debuginfo_table,  # shared (read-only)
+        copy(sci.line_map),
+    )
+    new_sci.entry.parent = new_sci
+    fix_parents!(new_sci.entry)
+    return new_sci
+end
+
+
 """
     StructuredIRCode(ir::IRCode; structurize=true, validate=true)
 

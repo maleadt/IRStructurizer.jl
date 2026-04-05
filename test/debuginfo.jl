@@ -146,6 +146,19 @@
         @test !contains(llvm_zeroed, "int.jl")
     end
 
+    @testset "copy preserves debug info" begin
+        f(x) = x + 1
+        sci, _ = code_structured(f, Tuple{Int}) |> only
+        sci2 = copy(sci)
+        # Debug info should be preserved
+        for inst in instructions(sci2.entry)
+            @test source_location(sci2, inst) == source_location(sci, inst.ssa_idx)
+        end
+        # Mutating the copy should not affect the original
+        sci2.max_ssa_idx = 999
+        @test sci.max_ssa_idx != 999
+    end
+
     @testset "loop debug info preserved" begin
         function loop_fn(n)
             s = 0
