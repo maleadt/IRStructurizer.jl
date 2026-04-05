@@ -87,6 +87,21 @@
         @test sprint(show, loc) == "foo at bar:42"
     end
 
+    @testset "pretty-print with debuginfo=:source" begin
+        h_disp(x) = x > 0 ? x + 1 : x - 1
+        sci, _ = code_structured(h_disp, Tuple{Int}) |> only
+
+        # Default: no annotations
+        out_default = sprint(show, MIME"text/plain"(), sci)
+        @test !contains(out_default, "within")
+
+        # With :source: has annotations
+        out_source = sprint(io -> show(IOContext(io, :debuginfo => :source),
+                                       MIME"text/plain"(), sci))
+        @test contains(out_source, "@ int.jl:")
+        @test contains(out_source, "within")
+    end
+
     @testset "LLVM IR has source annotations after roundtrip" begin
         CC = Core.Compiler
 

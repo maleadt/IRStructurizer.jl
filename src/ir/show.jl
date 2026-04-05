@@ -7,7 +7,9 @@ function Base.show(io::IO, ::MIME"text/plain", sci::StructuredIRCode)
     println(io, "StructuredIRCode(")
 
     # Create printer with │ prefix for the entry block (2 chars, not 4)
-    base_p = IRPrinter(io, sci.max_ssa_idx)
+    debuginfo = get(io, :debuginfo, :none)
+    lineinfo = debuginfo === :source ? LineInfoTracker(sci) : nothing
+    base_p = IRPrinter(io, sci.max_ssa_idx; lineinfo)
     p = child_printer(base_p, sci.entry, "│ ")
 
     # Print entry block body - use is_closing_self=true so the last item
@@ -28,30 +30,58 @@ end
 Context for printing structured IR with proper indentation and value formatting.
 Uses Julia's IRCode style with box-drawing characters.
 """
+mutable struct LineInfoTracker
+    sci::StructuredIRCode
+    last_loc::SourceLocation      # last printed location (to suppress duplicates)
+end
+
+LineInfoTracker(sci::StructuredIRCode) =
+    LineInfoTracker(sci, SourceLocation(nothing, Symbol(""), Int32(0)))
+
 mutable struct IRPrinter
     io::IO
     indent::Int
     line_prefix::String    # Prefix for continuation lines (│, spaces)
     max_idx_width::Int     # Max width of "%N = " for alignment
     color::Bool            # Whether to use colors
+    lineinfo::Union{Nothing, LineInfoTracker}
 end
 
-function IRPrinter(io::IO, max_ssa_idx::Int)
+function IRPrinter(io::IO, max_ssa_idx::Int; lineinfo=nothing)
     # Compute max index width for alignment: "%N = " where N is the max index
     max_idx_width = ndigits(max_ssa_idx) + 4  # % + digits + space + = + space
     color = get(io, :color, false)::Bool
-    IRPrinter(io, 0, "", max_idx_width, color)
+    IRPrinter(io, 0, "", max_idx_width, color, lineinfo)
 end
 
 function indent(p::IRPrinter, n::Int=1)
     new_prefix = p.line_prefix * "  "  # 2 spaces per indent level
-    return IRPrinter(p.io, p.indent + n, new_prefix, p.max_idx_width, p.color)
+    return IRPrinter(p.io, p.indent + n, new_prefix, p.max_idx_width, p.color, p.lineinfo)
 end
 
 # Create a child printer for a nested Block
 function child_printer(p::IRPrinter, nested_block::Block, cont_prefix::String)
     # Use parent's max_idx_width since SSA indices are global
-    IRPrinter(p.io, p.indent + 1, p.line_prefix * cont_prefix, p.max_idx_width, p.color)
+    IRPrinter(p.io, p.indent + 1, p.line_prefix * cont_prefix, p.max_idx_width, p.color, p.lineinfo)
+end
+
+# Emit a "@ file:line within `method`" annotation if the location changed
+function emit_lineinfo!(p::IRPrinter, ssa_idx::Int)
+    li = p.lineinfo
+    li === nothing && return
+    locs = source_location(li.sci, ssa_idx)
+    isempty(locs) && return
+    loc = last(locs)  # innermost frame
+    loc == li.last_loc && return
+    li.last_loc = loc
+    print_indent(p)
+    m = loc.method
+    m isa MethodInstance && (m = m.def)
+    m isa Method && (m = m.name)
+    name = m isa Symbol ? string(m) : ""
+    print_colored(p, "@ $(loc.file):$(loc.line)", :yellow)
+    !isempty(name) && print_colored(p, " within `$name`", :yellow)
+    println(p.io)
 end
 
 # Print region header: "├ label:" or "└ label:" for last/empty region
@@ -363,9 +393,10 @@ function print_block_body(p::IRPrinter, block::Block; is_last_in_parent::Bool=fa
     for (i, item) in enumerate(items)
         is_last = (i == length(items))
         if item[1] == :expr
-            # No box-drawing for expressions, just print with indent
+            emit_lineinfo!(p, item[2])
             print_expr_with_type(p, item[2], item[3], item[4])
         elseif item[1] == :nested
+            emit_lineinfo!(p, item[2])
             # Control flow ops handle their own box-drawing
             print_control_flow(p, item[3], item[2], item[4]; is_last=is_last && is_last_in_parent)
         else  # :term
