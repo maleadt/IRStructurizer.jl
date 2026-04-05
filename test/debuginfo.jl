@@ -91,14 +91,14 @@
         h_disp(x) = x > 0 ? x + 1 : x - 1
         sci, _ = code_structured(h_disp, Tuple{Int}) |> only
 
-        # Default: :source annotations
+        # Default: shows source annotations
         out_default = sprint(show, MIME"text/plain"(), sci)
         @test contains(out_default, "@ int.jl:")
         @test contains(out_default, "within")
 
-        # With :none via IOContext: no annotations
-        out_none = sprint(io -> show(IOContext(io, :debuginfo => :none),
-                                     MIME"text/plain"(), sci))
+        # debuginfo=:none strips line_map, so no annotations
+        sci_none, _ = code_structured(h_disp, Tuple{Int}; debuginfo=:none) |> only
+        out_none = sprint(show, MIME"text/plain"(), sci_none)
         @test !contains(out_none, "within")
     end
 

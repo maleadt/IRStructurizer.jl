@@ -7,10 +7,8 @@ function Base.show(io::IO, ::MIME"text/plain", sci::StructuredIRCode)
     println(io, "StructuredIRCode(")
 
     # Create printer with │ prefix for the entry block (2 chars, not 4)
-    # Default to :source (show debug info), matching CodeInfo behavior.
-    # Pass :none via IOContext to suppress.
-    debuginfo = get(io, :debuginfo, :source)
-    lineinfo = debuginfo === :source ? LineInfoTracker(sci) : nothing
+    # Show debug info if line_map is populated (use empty!(sci.line_map) to strip).
+    lineinfo = isempty(sci.line_map) ? nothing : LineInfoTracker(sci)
     base_p = IRPrinter(io, sci.max_ssa_idx; lineinfo)
     p = child_printer(base_p, sci.entry, "│ ")
 
