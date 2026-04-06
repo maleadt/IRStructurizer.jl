@@ -1290,12 +1290,10 @@ end  # operands(op::ControlFlowOp)
         x + 1
     end |> only
 
-    # Find a call instruction (first instruction may not be an Expr on all Julia versions)
     found = false
     for inst in instructions(sci.entry)
         if iscall(inst)
             ops = operands(sci.entry, inst)
-            @test ops isa Vector
             @test !isempty(ops)
             found = true
             break
@@ -1382,3 +1380,138 @@ end
 end
 
 end  # def
+
+@testset "is_defined_outside" begin
+    using IRStructurizer: is_defined_outside, eachblock
+
+    # Simple loop: for i in 1:n; acc += i; end
+    sci, _ = code_structured(Tuple{Int}) do n::Int
+        acc = 0
+        for i in 1:n
+            acc += i
+        end
+        return acc
+    end |> only
+
+    # Find the ForOp (may be nested inside IfOps from bounds checking)
+    for_op = nothing
+    for b in eachblock(sci.entry)
+        for inst in instructions(b)
+            if stmt(inst) isa ForOp
+                for_op = stmt(inst)::ForOp
+                break
+            end
+        end
+        for_op !== nothing && break
+    end
+    @test for_op !== nothing
+
+    # Function argument is defined outside the loop body
+    @test is_defined_outside(Core.Argument(1), for_op.body)
+
+    # The ForOp's IV is not in body.args but the ForOp overload handles it
+    @test is_defined_outside(for_op.iv_arg, for_op.body)  # block check: not in body.args
+    @test !is_defined_outside(for_op.iv_arg, for_op)      # loop-op check: IS the IV
+
+    # Loop body block args (carries) are inside
+    for ba in for_op.body.args
+        @test !is_defined_outside(ba, for_op.body)
+    end
+
+    # SSAValues defined in the entry block are outside the loop body
+    first_inst = first(instructions(sci.entry))
+    @test is_defined_outside(SSAValue(first_inst.ssa_idx), for_op.body)
+
+    # Constants and literals are always outside
+    @test is_defined_outside(42, for_op.body)
+    @test is_defined_outside(GlobalRef(Base, :+), for_op.body)
+end
+
+@testset "move_before! / move_after!" begin
+    # Use a function that generates multiple entry-level instructions
+    sci, _ = code_structured(Tuple{Int, Int}) do x::Int, y::Int
+        a = x + y
+        b = a * 2
+        return b
+    end |> only
+
+    insts = collect(instructions(sci.entry))
+    @test length(insts) >= 2
+
+    # Record initial order
+    initial_ids = [inst.ssa_idx for inst in insts]
+
+    # Move the last instruction before the first
+    last_inst = insts[end]
+    first_inst = insts[1]
+    move_before!(last_inst, first_inst)
+
+    new_ids = [inst.ssa_idx for inst in instructions(sci.entry)]
+    @test new_ids[1] == initial_ids[end]
+    @test new_ids[2:end] == initial_ids[1:end-1]
+
+    # Move it back after the (now) last instruction
+    insts2 = collect(instructions(sci.entry))
+    move_after!(insts2[1], insts2[end])
+
+    restored_ids = [inst.ssa_idx for inst in instructions(sci.entry)]
+    @test restored_ids == initial_ids
+end
+
+@testset "move_before! across blocks" begin
+    # Create a function with an if/else to get multiple blocks
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        if x > 0
+            y = x + 1
+            y + 2
+        else
+            x - 1
+        end
+    end |> only
+
+    # Find the IfOp
+    if_inst = nothing
+    for inst in instructions(sci.entry)
+        if stmt(inst) isa IfOp
+            if_inst = inst
+            break
+        end
+    end
+    @test if_inst !== nothing
+    if_op = stmt(if_inst)::IfOp
+
+    then_block = if_op.then_region
+    then_insts = collect(instructions(then_block))
+    @test length(then_insts) >= 1
+
+    # Move first instruction from then-block to entry (before the IfOp)
+    moved = then_insts[1]
+    moved_id = moved.ssa_idx
+    move_before!(moved, if_inst)
+
+    # Verify it's no longer in then-block
+    then_ids = [i.ssa_idx for i in instructions(then_block)]
+    @test moved_id ∉ then_ids
+
+    # Verify it's now in entry block, before the IfOp
+    entry_ids = [i.ssa_idx for i in instructions(sci.entry)]
+    if_pos = findfirst(==(if_inst.ssa_idx), entry_ids)
+    moved_pos = findfirst(==(moved_id), entry_ids)
+    @test moved_pos !== nothing
+    @test moved_pos < if_pos
+end
+
+@testset "operands dispatches on IR types" begin
+    # PiNode
+    pi = Core.PiNode(SSAValue(1), Int)
+    block = Block()
+    @test operands(block, pi) == Any[SSAValue(1)]
+
+    # ControlFlowOp (IfOp) — delegates to operands(op)
+    if_op = IfOp(SSAValue(5), Block(), Block())
+    @test operands(block, if_op) == Any[SSAValue(5)]
+
+    # Unknown type falls back to empty
+    @test operands(block, 42) == Any[]
+    @test operands(block, GlobalRef(Base, :+)) == Any[]
+end

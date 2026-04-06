@@ -72,7 +72,7 @@ Get the values flowing into a control flow operation from the parent scope:
 
 #### `operands(block, inst)` → `Vector{Any}`
 
-Extract all value operands from an instruction's statement (Expr args).
+Extract data operands from an instruction's statement. Handles `Expr` (`:call`/`:invoke`/`:new`/`:splatnew`), `PiNode`, and `ControlFlowOp`. Returns `Any[]` for unknown types. Extensible via `operands(::Block, s::MyType)` for domain-specific IR nodes.
 
 #### `arguments(block::Block)` → `Vector{BlockArg}`
 
@@ -159,6 +159,10 @@ Append or prepend an instruction.
 
 Insert relative to an existing `Inst` or `SSAValue`.
 
+#### `move_before!(inst, target)` / `move_after!(inst, target)`
+
+Move an instruction from its current block to before/after `target` in `target`'s block. The instruction retains its SSA index. Analogous to MLIR's `Operation::moveBefore`/`moveAfter`.
+
 #### `delete!(block, inst::Inst)`
 
 Remove an instruction from a block.
@@ -170,6 +174,10 @@ Remove all instructions from the block body, preserving args, terminator, and pa
 #### `val in block` / `val ∈ block` → `Bool`
 
 Check if a value is defined in this block. Returns `true` for `SSAValue`s in the body and `BlockArgument`s in the args; `false` for everything else (constants, `Argument`s, etc.).
+
+#### `is_defined_outside(val, block_or_loop_op)` → `Bool`
+
+Check whether a value is defined outside a block (and all its descendants), or outside a loop operation's regions. The loop-op overloads handle values like `ForOp.iv_arg` that aren't in the body's block args. Analogous to MLIR's `LoopLikeOpInterface::isDefinedOutsideOfLoop`.
 
 #### `update_type!(block, inst, new_type)`
 
