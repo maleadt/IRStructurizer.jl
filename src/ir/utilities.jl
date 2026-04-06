@@ -6,6 +6,8 @@
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
 # Expression inspection: resolve_call, iscall, callee, callargs
+# Scope queries: is_defined_outside
+# Instruction movement: move_before!, move_after!
 
 
 #=============================================================================
@@ -17,7 +19,8 @@ export insert_before!, insert_after!, eachblock, findblock,
        update_type!, new_block_arg!,
        resolve_call, iscall, callee, callargs,
        reachable_terminators, walk, after_arg,
-       def, defs
+       def, defs,
+       is_defined_outside, move_before!, move_after!
 
 """
     parent(block::Block) -> Union{Block, StructuredIRCode}
@@ -974,32 +977,30 @@ callargs(inst::Instruction) = callargs(inst.stmt::Expr)
 
 """
     operands(block::Block, inst::Instruction) -> Vector{Any}
+    operands(block::Block, stmt) -> Vector{Any}
 
 Extract data operands from an instruction's statement — the values the
-instruction consumes. Excludes the callee and type refs (use `callee()`
-or `callargs()` for call-specific access). Extensible via dispatch on
-the statement type for domain-specific IR nodes.
+instruction consumes. Handles `PiNode` and `ControlFlowOp` types natively.
+Returns `Any[]` for unknown statement types.
+
+Extend via `operands(::Block, s::MyType)` for domain-specific IR nodes.
 """
 operands(block::Block, inst::Instruction) = operands(block, inst.stmt)
 
-function operands(block::Block, @nospecialize(s))
-    s isa Expr || return Any[]
+operands(::Block, s::PiNode) = Any[s.val]
+operands(::Block, s::ControlFlowOp) = operands(s)
+function operands(::Block, s::Expr)
     if s.head === :call
-        # args = [callee, arg1, arg2, ...] — skip callee
-        return collect(Any, @view s.args[2:end])
+        return @view s.args[2:end]
     elseif s.head === :invoke
-        # args = [CodeInstance, callee, arg1, arg2, ...] — skip CI and callee
-        return collect(Any, @view s.args[3:end])
-    elseif s.head === :new
-        # args = [Type, field1, field2, ...] — skip type
-        return collect(Any, @view s.args[2:end])
-    elseif s.head === :splatnew
-        # args = [Type, tuple] — skip type
-        return collect(Any, @view s.args[2:end])
+        return @view s.args[3:end]
+    elseif s.head === :new || s.head === :splatnew
+        return @view s.args[2:end]
     else
-        return collect(Any, s.args)
+        return s.args
     end
 end
+operands(::Block, @nospecialize(_)) = Any[]
 
 
 #=============================================================================
@@ -1062,3 +1063,115 @@ O(1) lookup of the instruction defining `val`.
 def(idx::DefIndex, val::Core.SSAValue) = get(idx.map, val.id, nothing)
 
 Base.haskey(idx::DefIndex, val::Core.SSAValue) = haskey(idx.map, val.id)
+
+
+#=============================================================================
+ Scope queries
+=============================================================================#
+
+"""
+    is_defined_outside(val, block::Block) -> Bool
+    is_defined_outside(val, op::ForOp) -> Bool
+    is_defined_outside(val, op::WhileOp) -> Bool
+    is_defined_outside(val, op::LoopOp) -> Bool
+
+Check whether `val` is defined outside a block (and all its descendants),
+or outside a loop operation's regions.
+
+The loop-op overloads handle values that are conceptually "inside" the loop
+but not stored in a block's args — e.g., `ForOp.iv_arg`.
+
+`Argument`s (function parameters), constants, `GlobalRef`s, and other
+non-SSA values are always considered outside.
+
+Analogous to MLIR's `LoopLikeOpInterface::isDefinedOutsideOfLoop`.
+"""
+function is_defined_outside(@nospecialize(val), block::Block)
+    if val isa SSAValue
+        for b in eachblock(block)
+            val ∈ b && return false
+        end
+        return true
+    elseif val isa BlockArgument
+        for b in eachblock(block)
+            val ∈ b && return false
+        end
+        return true
+    else
+        return true
+    end
+end
+
+function is_defined_outside(@nospecialize(val), op::ForOp)
+    val === op.iv_arg && return false
+    return is_defined_outside(val, op.body)
+end
+
+function is_defined_outside(@nospecialize(val), op::WhileOp)
+    return is_defined_outside(val, op.before) && is_defined_outside(val, op.after)
+end
+
+function is_defined_outside(@nospecialize(val), op::LoopOp)
+    return is_defined_outside(val, op.body)
+end
+
+
+#=============================================================================
+ Instruction movement
+=============================================================================#
+
+"""
+    move_before!(inst::Instruction, target::Instruction)
+
+Move `inst` from its current block to just before `target` in `target`'s block.
+The instruction retains its SSA index. Sub-block parents are updated if the
+instruction is a `ControlFlowOp`.
+
+Analogous to MLIR's `Operation::moveBefore`.
+"""
+function move_before!(inst::Instruction, target::Instruction)
+    src = inst.block::Block
+    dst = target.block::Block
+
+    # Remove from source
+    delete!(src.body, inst.ssa_idx)
+
+    # Insert before target in destination
+    insert_before_idx!(dst.body, target.ssa_idx, inst.ssa_idx, inst.stmt, inst.typ)
+
+    # Update sub-block parents
+    if inst.stmt isa ControlFlowOp
+        for b in blocks(inst.stmt)
+            b.parent = dst
+        end
+    end
+    return inst
+end
+
+"""
+    move_after!(inst::Instruction, target::Instruction)
+
+Move `inst` from its current block to just after `target` in `target`'s block.
+The instruction retains its SSA index. Sub-block parents are updated if the
+instruction is a `ControlFlowOp`.
+
+Analogous to MLIR's `Operation::moveAfter`.
+"""
+function move_after!(inst::Instruction, target::Instruction)
+    src = inst.block::Block
+    dst = target.block::Block
+
+    # Remove from source
+    delete!(src.body, inst.ssa_idx)
+
+    # Insert after target in destination
+    insert_after_idx!(dst.body, target.ssa_idx, inst.ssa_idx, inst.stmt, inst.typ)
+
+    # Update sub-block parents
+    if inst.stmt isa ControlFlowOp
+        for b in blocks(inst.stmt)
+            b.parent = dst
+        end
+    end
+    return inst
+end
