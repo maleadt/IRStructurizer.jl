@@ -106,7 +106,7 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
     for (idx, entry) in block.body
         stmt = entry.stmt
         if stmt isa IfOp
-            validate_if_terminators!(errors, sci, stmt, idx)
+            validate_if_terminators!(errors, sci, stmt, idx, entry.typ)
         elseif stmt isa ForOp
             validate_for_terminators!(errors, sci, stmt, idx)
         elseif stmt isa WhileOp
@@ -117,7 +117,23 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
     end
 end
 
-function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::IfOp, idx::Int)
+# Extract the per-position expected types from an IfOp's declared result type.
+# The structurizer emits `Tuple{phi_types...}` (or `Tuple{}` / `Nothing` when
+# there are no yielded values). Returns `nothing` when no per-position bound is
+# available, in which case per-position type checking is skipped.
+function ifop_expected_yield_types(@nospecialize(result_type))
+    result_type isa DataType || return nothing
+    result_type <: Tuple || return nothing
+    # Reject the unparameterized `Tuple` (no per-position info) and vararg
+    # tuples (arity isn't fixed). Concrete abstract-element tuples like
+    # `Tuple{Real}` are fine — their parameters are positionally indexable.
+    result_type === Tuple && return nothing
+    Base.isvatuple(result_type) && return nothing
+    return result_type.parameters
+end
+
+function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
+                                   op::IfOp, idx::Int, @nospecialize(result_type))
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
@@ -131,7 +147,20 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
         push!(errors, "IfOp at %$idx: else region must have explicit terminator, got nothing")
     end
 
-    # Validate yield arity and types: both branches must yield same number of values with matching types
+    # Validate yield arity and types against the IfOp's declared result type.
+    #
+    # Julia's own IR verifier (Compiler/src/ssair/verify.jl) only requires that
+    # each phi edge value's type be a sublattice element of the phi's declared
+    # type — it never compares edge values to each other. Branches may yield
+    # values whose types are disjoint (e.g. `Int` and `String` joining to
+    # `Union{Int,String}`, or `Int` and `Float64` joining to `Real`); what
+    # matters is that each yield conforms to the declared join.
+    #
+    # The structurizer records that join at the IfOp's SSA entry as
+    # `Tuple{phi_types...}` (see `emit_ifop_result!`), so we mirror Julia's
+    # check here: for each position i, both yields must be <: the i-th element
+    # of the declared tuple. `<:` is a conservative approximation of the lattice
+    # `⊑` Julia uses internally; it rejects no IR that `⊑` would accept.
     if then_term isa YieldOp && else_term isa YieldOp
         then_arity = length(then_term.values)
         else_arity = length(else_term.values)
@@ -139,14 +168,17 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
             push!(errors, "IfOp at %$idx: yield arity mismatch (then yields $then_arity, else yields $else_arity)")
         end
 
-        # Type validation for matching positions (Undef matches any type)
-        for i in 1:min(then_arity, else_arity)
-            then_term.values[i] isa Undef && continue
-            else_term.values[i] isa Undef && continue
-            then_type = resolve_type(sci, then_term.values[i])
-            else_type = resolve_type(sci, else_term.values[i])
-            if then_type !== nothing && else_type !== nothing && then_type != else_type
-                push!(errors, "IfOp at %$idx: yield type mismatch at position $i (then: $then_type, else: $else_type)")
+        expected = ifop_expected_yield_types(result_type)
+        if expected !== nothing
+            arity = min(then_arity, else_arity)
+            # Flag yield arity not matching the declared result tuple.
+            if then_arity == else_arity && then_arity != length(expected)
+                push!(errors, "IfOp at %$idx: yield arity ($then_arity) does not match declared result type $result_type (expected $(length(expected)))")
+            end
+            for i in 1:min(arity, length(expected))
+                Ti = expected[i]
+                check_yield_type!(errors, sci, then_term.values[i], Ti, idx, i, "then")
+                check_yield_type!(errors, sci, else_term.values[i], Ti, idx, i, "else")
             end
         end
     end
@@ -154,6 +186,21 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
     # Recursively validate nested ops
     validate_terminators!(errors, sci, op.then_region)
     validate_terminators!(errors, sci, op.else_region)
+end
+
+# Check a single yield value against the IfOp's declared per-position type.
+# `Undef` placeholders (used for uninitialized slots on one branch) are skipped
+# — their recorded type is already the declared slot type, so the <: check is
+# trivially satisfied, but an explicit skip keeps intent clear.
+function check_yield_type!(errors::Vector{String}, sci::StructuredIRCode,
+                            @nospecialize(value), @nospecialize(expected),
+                            idx::Int, pos::Int, branch::String)
+    value isa Undef && return
+    ty = resolve_type(sci, value)
+    ty === nothing && return
+    if !(ty <: expected)
+        push!(errors, "IfOp at %$idx: $branch yield at position $pos has type $ty, not <: declared $expected")
+    end
 end
 
 function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::ForOp, idx::Int)
