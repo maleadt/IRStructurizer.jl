@@ -64,6 +64,112 @@ end
     end
 end
 
+@testset "validation: IfOp yield types checked against declared result" begin
+    # Mirror Julia's own phi-node verifier: each yield must be <: the IfOp's
+    # declared per-position result type. Yields in the two branches do *not*
+    # need to be related to each other — Julia IR routinely merges disjoint
+    # types at phi nodes (the declared phi type is the join, not either edge).
+
+    # Helper: build a minimal SCI with an IfOp yielding one value per branch.
+    function mk_if_sci(arg_then, arg_else, argtypes, result_type)
+        then_blk = Block(); then_blk.terminator = YieldOp(Any[arg_then])
+        else_blk = Block(); else_blk.terminator = YieldOp(Any[arg_else])
+        entry = Block()
+        push!(entry, 1, IfOp(true, then_blk, else_blk), result_type)
+        push!(entry, 2, Expr(:call, Core.getfield, SSAValue(1), 1), result_type.parameters[1])
+        entry.terminator = Core.ReturnNode(SSAValue(2))
+        return StructuredIRCode(argtypes, Any[], entry, 10)
+    end
+
+    # Case 1: one branch's type subtypes the other (Ptr{Nothing} vs Any,
+    # declared Any). Both yields <: Any → accepted.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Ptr{Nothing}, Any], Tuple{Any})
+    validate_terminators(sci)  # should not throw
+
+    # Case 2: disjoint concrete types merging to a Union phi.
+    # The previous heuristic (accept only if one type subtypes the other)
+    # rejected this as a "gross mismatch". It's valid IR:
+    # `Int <: Union{Int,String}` and `String <: Union{Int,String}`.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Int, String], Tuple{Union{Int,String}})
+    validate_terminators(sci)  # should not throw
+
+    # Case 3: disjoint concrete types merging to an abstract supertype.
+    # `Int <: Real` and `Float64 <: Real`, but neither subtypes the other.
+    # Previously rejected; valid IR.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Int, Float64], Tuple{Real})
+    validate_terminators(sci)  # should not throw
+
+    # Case 3b: abstract-element tuple bounds are really checked, not skipped.
+    # A `String` yield under a declared `Tuple{Real}` must still be rejected.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Int, String], Tuple{Real})
+    @test_throws ErrorException validate_terminators(sci)
+    try
+        validate_terminators(sci)
+    catch e
+        @test occursin("not <: declared Real", e.msg)
+    end
+
+    # Case 4: both yields are unrelated concrete types joining to `Any` —
+    # what widened dynamic dispatch produces. Previously rejected as a "gross
+    # mismatch" even though `Int <: Any` and `String <: Any`.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Int, String], Tuple{Any})
+    validate_terminators(sci)  # should not throw
+
+    # Case 5: a yield that genuinely violates the declared bound (else branch).
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, Int, String], Tuple{Int})
+    @test_throws ErrorException validate_terminators(sci)
+    try
+        validate_terminators(sci)
+    catch e
+        @test occursin("else yield", e.msg)
+        @test occursin("not <: declared Int", e.msg)
+    end
+
+    # Case 6: the then branch violates the declared bound.
+    sci = mk_if_sci(Core.Argument(2), Core.Argument(3),
+                    Any[Any, String, Int], Tuple{Int})
+    @test_throws ErrorException validate_terminators(sci)
+    try
+        validate_terminators(sci)
+    catch e
+        @test occursin("then yield", e.msg)
+        @test occursin("not <: declared Int", e.msg)
+    end
+
+    # Case 7: yield arity does not match the declared result tuple.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[Core.Argument(3)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Int, Int})
+    entry.terminator = Core.ReturnNode(nothing)
+    sci = StructuredIRCode(Any[Any, Int, Int], Any[], entry, 10)
+    @test_throws ErrorException validate_terminators(sci)
+    try
+        validate_terminators(sci)
+    catch e
+        @test occursin("does not match declared result type", e.msg)
+    end
+
+    # Case 8: Undef placeholders are accepted regardless of the declared type.
+    # They stand for uninitialized slots on one branch and carry the declared
+    # slot type by construction; skipping them keeps the check focused on
+    # genuine values.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[Undef(Int)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Int})
+    push!(entry, 2, Expr(:call, Core.getfield, SSAValue(1), 1), Int)
+    entry.terminator = Core.ReturnNode(SSAValue(2))
+    sci = StructuredIRCode(Any[Any, Int], Any[], entry, 10)
+    validate_terminators(sci)  # should not throw
+end
+
 @testset "validation: scope-aware undefined SSA" begin
     # Manually construct IR where an SSA value defined inside an IfOp branch
     # is referenced in the outer scope — should be caught by scoped validation.
