@@ -658,6 +658,48 @@ end
     @test !isempty(idx[Core.Argument(2)])
 end
 
+@testset "alias statements (stmt IS a value)" begin
+    # A forwarding statement like `%N = %M` appears after structurization when a
+    # PhiNode collapses to a single predecessor. replace_uses!/users/operands
+    # must treat the raw-SSA stmt as a use site, or downstream consumers that
+    # later delete the referenced value leave dangling references.
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    push!(block.body, (2, SSAValue(1), Int))           # %2 = %1 (alias)
+    push!(block.body, (3, SSAValue(1), Int))           # %3 = %1 (alias)
+    block.terminator = ReturnNode(SSAValue(2))
+
+    idx = uses(block)
+    @test length(idx[SSAValue(1)]) == 2                # both alias stmts
+
+    u = users(block, SSAValue(1))
+    @test Set(inst.ssa_idx for inst in u) == Set([2, 3])
+
+    replace_uses!(block, SSAValue(1), SSAValue(42))
+    @test block.body.stmts[2] == SSAValue(42)
+    @test block.body.stmts[3] == SSAValue(42)
+    @test isempty(uses(block, SSAValue(1)))
+end
+
+@testset "PiNode as a statement" begin
+    # PiNode is immutable — replace_uses! must reconstruct to swap the referenced
+    # value while preserving the narrowed type.
+    block = Block()
+    push!(block.body, (1, Expr(:call, GlobalRef(Base, :+), SSAValue(0), SSAValue(0)), Int))
+    push!(block.body, (2, PiNode(SSAValue(1), Int), Int))
+    block.terminator = ReturnNode(SSAValue(2))
+
+    @test length(uses(block, SSAValue(1))) == 1
+    u = users(block, SSAValue(1))
+    @test length(u) == 1 && u[1].ssa_idx == 2
+
+    replace_uses!(block, SSAValue(1), SSAValue(99))
+    pi_stmt = block.body.stmts[2]
+    @test pi_stmt isa PiNode
+    @test pi_stmt.val == SSAValue(99)
+    @test pi_stmt.typ === Int
+end
+
 @testset "walk_uses! extensibility" begin
     using IRStructurizer: walk_uses!, IndexedUseRef
 

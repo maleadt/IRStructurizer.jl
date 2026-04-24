@@ -3,7 +3,7 @@ using FileCheck
 using InteractiveUtils: code_llvm
 
 using IRStructurizer
-using Core: SSAValue, ReturnNode, GotoNode, GotoIfNot, PhiNode
+using Core: SSAValue, ReturnNode, GotoNode, GotoIfNot, PhiNode, PiNode
 
 # Internal types used in tests for type-checking structured IR output
 using IRStructurizer: Block, ControlFlowOp, IfOp, ForOp, WhileOp, LoopOp,
