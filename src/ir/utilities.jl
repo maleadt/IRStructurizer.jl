@@ -302,6 +302,17 @@ function Base.setindex!(r::TerminatorReturnNodeUseRef, @nospecialize(v))
     r.block.terminator = ReturnNode(v)
 end
 
+# UseRef for PiNode as a statement (immutable — replacement reconstructs it).
+struct PiNodeUseRef <: UseRef
+    stmts::Vector{Any}
+    pos::Int
+end
+
+Base.getindex(r::PiNodeUseRef) = (r.stmts[r.pos]::PiNode).val
+function Base.setindex!(r::PiNodeUseRef, @nospecialize(v))
+    r.stmts[r.pos] = PiNode(v, (r.stmts[r.pos]::PiNode).typ)
+end
+
 """
     walk_uses!(f, node)
 
@@ -322,6 +333,13 @@ function walk_uses!(f, block::Block)
             walk_uses!(f, stmt)
         elseif stmt isa ReturnNode
             isdefined(stmt, :val) && f(ReturnNodeUseRef(block.body.stmts, i))
+        elseif stmt isa PiNode
+            # PiNode as a statement wraps a single value with type narrowing.
+            f(PiNodeUseRef(block.body.stmts, i))
+        elseif is_value_like_stmt(stmt)
+            # Alias/forwarding statement: stmt IS a value (SSAValue, BlockArgument,
+            # Argument, SlotNumber). Replacement swaps the stmt slot directly.
+            f(IndexedUseRef(block.body.stmts, i))
         else
             # Dispatch to user-defined methods for Expr, custom node types, etc.
             walk_uses!(f, stmt)
@@ -335,6 +353,10 @@ function walk_uses!(f, block::Block)
         walk_uses!(f, term)
     end
 end
+
+"""A statement whose raw value IS the operand — alias/forwarding form."""
+is_value_like_stmt(@nospecialize(s)) =
+    s isa SSAValue || s isa BlockArgument || s isa Argument || s isa SlotNumber
 
 # Fallback for unknown statement types (no-op)
 walk_uses!(f, ::Any) = nothing
@@ -518,6 +540,11 @@ function _references(@nospecialize(stmt), @nospecialize(target))
     elseif stmt isa ReturnNode
         isdefined(stmt, :val) || return false
         normalize_key(stmt.val) == target && return true
+    elseif stmt isa PiNode
+        normalize_key(stmt.val) == target && return true
+    elseif is_value_like_stmt(stmt)
+        # Alias statement: the stmt itself is the referenced value.
+        normalize_key(stmt) == target && return true
     end
     return false
 end
@@ -989,6 +1016,11 @@ operands(block::Block, inst::Instruction) = operands(block, inst.stmt)
 
 operands(::Block, s::PiNode) = Any[s.val]
 operands(::Block, s::ControlFlowOp) = operands(s)
+# Alias statements (stmt IS a value) forward the value itself as their sole operand.
+operands(::Block, s::SSAValue) = Any[s]
+operands(::Block, s::BlockArgument) = Any[s]
+operands(::Block, s::Argument) = Any[s]
+operands(::Block, s::SlotNumber) = Any[s]
 function operands(::Block, s::Expr)
     if s.head === :call
         return @view s.args[2:end]
