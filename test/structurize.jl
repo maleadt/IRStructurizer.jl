@@ -1016,6 +1016,57 @@ end
     @test @roundtrip f_and(-1, -1)
 end
 
+@testset "short-circuit && with sub-diamond in else branch" begin
+    # Regression: short-circuit `&&` whose `else` path is itself a non-trivial
+    # diamond produces a CFG where the false_dest has multi-pred (the branch
+    # source AND the inner condition's false edge). `find_branch_regions`
+    # leaves else_blocks empty and `make_empty_branch_block` would yield a
+    # value defined inside the (un-structurized) subtree — failing
+    # `validate_ssa_defs`. The fix tail-duplicates the dominator subtree of
+    # the empty branch's destination with fresh SSA indices.
+    f_and_diamond = (x::Int, y::Int, z::Int) -> begin
+        a = if x > 0 && y > 0
+            x * y
+        else
+            if z > 0
+                z + 1
+            else
+                -z
+            end
+        end
+        a + 100
+    end
+    @test code_structured(f_and_diamond, Tuple{Int, Int, Int}) isa Vector
+    @test @roundtrip f_and_diamond(1,  1,  1)   # %5 && %9 → x*y
+    @test @roundtrip f_and_diamond(-1, 1,  1)   # outer-else → z+1
+    @test @roundtrip f_and_diamond(1, -1,  1)   # then → inner-else (cloned subtree) → z+1
+    @test @roundtrip f_and_diamond(-1,-1, -1)   # outer-else → -z
+    @test @roundtrip f_and_diamond(1, -1, -1)   # then → inner-else (cloned subtree) → -z
+end
+
+@testset "short-circuit || with sub-diamond in then branch" begin
+    # Symmetric to the `&&` case: the merge-tail is reached from sibling
+    # regions via `||`. Triggers `set_exit_yield!`'s tail-duplication path.
+    f_or_diamond = (x::Int, y::Int, z::Int) -> begin
+        a = if x > 0 || y > 0
+            if z > 0
+                z + 1
+            else
+                -z
+            end
+        else
+            x * y
+        end
+        a + 100
+    end
+    @test code_structured(f_or_diamond, Tuple{Int, Int, Int}) isa Vector
+    @test @roundtrip f_or_diamond(1,  1,  1)
+    @test @roundtrip f_or_diamond(-1, 1,  1)
+    @test @roundtrip f_or_diamond(1, -1,  1)
+    @test @roundtrip f_or_diamond(-1,-1, -1)
+    @test @roundtrip f_or_diamond(1, -1, -1)
+end
+
 @testset "loop exit through fallthrough (not GotoIfNot dest)" begin
     # Regression test: find_loop_exit_condition only checked if GotoIfNot.dest
     # exited the loop, but missed the case where the *fallthrough* path (cond=true)

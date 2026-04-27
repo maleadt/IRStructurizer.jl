@@ -42,6 +42,19 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
     nblocks = length(ir.cfg.blocks)
     current = entry
     last_block = entry
+    # Track the dest that caused the walker to step out of `region_blocks`. Used
+    # by the exit-yield logic to inline-structurize past the region boundary
+    # when the merge phi value is defined past `last_block` (short-circuit
+    # `||`-style patterns).
+    exit_dest::Union{Nothing, Int} = nothing
+
+    # Advance the walker toward `target`; if that step leaves the region, record
+    # the target in `exit_dest` so the exit-yield logic can find the value.
+    advance = target -> begin
+        nc = resolve_dest(target, region_blocks, loop_ctx, block)
+        nc === nothing && target !== nothing && (exit_dest = target)
+        nc
+    end
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
@@ -50,14 +63,14 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
         if loop_ctx === nothing || current != loop_ctx.header
             loop_body = get_loop_at(ctx, current, region_blocks)
             if loop_body !== nothing
-                exit_dest = emit_loop!(block, ctx, current, loop_body, region_blocks)
+                loop_exit = emit_loop!(block, ctx, current, loop_body, region_blocks)
                 # Update last_block to the loop's exit predecessor (for merge phi lookup)
-                if exit_dest !== nothing
+                if loop_exit !== nothing
                     for b in loop_body
-                        exit_dest ∈ ir.cfg.blocks[b].succs && (last_block = b)
+                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b)
                     end
                 end
-                current = resolve_dest(exit_dest, region_blocks, loop_ctx, block)
+                current = advance(loop_exit)
                 continue
             end
         end
@@ -77,24 +90,21 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             end
             return block
         elseif term isa GotoNode
-            current = resolve_dest(term.label, region_blocks, loop_ctx, block)
+            current = advance(term.label)
         elseif term isa GotoIfNot
             next = emit_branch!(block, ctx, current, term, region_blocks, merge_phis, loop_ctx)
-            if next === nothing
-                return block
-            end
-            current = resolve_dest(next, region_blocks, loop_ctx, block)
+            next === nothing && return block
+            current = advance(next)
         else
             # Fallthrough
             next = current + 1
-            current = resolve_dest(next <= nblocks ? next : nothing,
-                                    region_blocks, loop_ctx, block)
+            current = advance(next <= nblocks ? next : nothing)
         end
     end
 
     # Region ended — set terminator if not already set
     if block.terminator === nothing && merge_phis !== nothing
-        block.terminator = make_exit_yield(ir, merge_phis, last_block, block, ctx)
+        set_exit_yield!(block, ir, ctx, merge_phis, last_block, exit_dest, loop_ctx)
     end
 
     return block
@@ -333,8 +343,68 @@ function make_empty_branch_block(dest::Int, from::Int,
     # Merge phis? Use reachability from dest to find the right phi edge value.
     if merge_phis !== nothing && !isempty(merge_phis)
         pred = find_exit_predecessor(merge_phis, Set{Int}([dest]), from, ir)
-        b.terminator = make_yield_for_edge(ir, merge_phis, pred, b, ctx)
+        # If `pred` lies past `dest` (the BFS walked beyond `dest` to find a phi
+        # predecessor), the yield value is defined inside `dest`'s subtree and is
+        # not visible in the empty block. Inline-structurize that subtree with
+        # fresh SSA indices so the value is materialized locally. This handles
+        # short-circuit `&&`/`||` patterns where the merge tail is reached from
+        # multiple sibling regions.
+        #
+        # `pred != from` skips duplication when the merge phi has a direct edge
+        # from the branch source itself: the empty block IS that edge, so
+        # yielding the from-edge value directly is correct.
+        if pred != dest && pred != from && dominates(ctx.domtree, dest, pred)
+            tail_duplicate_branch!(b, dest, merge_phis, loop_ctx, ir, ctx)
+        else
+            b.terminator = make_yield_for_edge(ir, merge_phis, pred, b, ctx)
+        end
     end
+    return b
+end
+
+"""
+Inline-structurize `dest`'s dominator subtree into `b` with fresh SSA indices.
+
+Used by `make_empty_branch_block` when a branch must yield a value defined in a
+block past `dest` (the short-circuit `&&`/`||` pattern, where the merge tail is
+shared between sibling regions). The dominator subtree is closed under
+predecessors, so we can structurize it as a self-contained region; cloning with
+fresh indices avoids violating SSA uniqueness when the same tail also appears
+in a sibling branch.
+"""
+function tail_duplicate_branch!(b::Block, dest::Int,
+                                 merge_phis::Vector{MergePhiInfo},
+                                 loop_ctx::Union{Nothing, LoopCtx},
+                                 ir::IRCode, ctx::StructurizeCtx)
+    nblocks = length(ir.cfg.blocks)
+    full_region = Set{Int}(1:nblocks)
+    subtree = Set{Int}()
+    collect_dominated!(subtree, ctx.domtree, dest, full_region)
+
+    saved_remap = copy(ctx.ssa_remap)
+    for bb_idx in subtree
+        bb = ir.cfg.blocks[bb_idx]
+        for si in first(bb.stmts):last(bb.stmts)
+            stmt = ir.stmts.stmt[si]
+            (stmt isa GotoNode || stmt isa GotoIfNot ||
+             stmt isa ReturnNode) && continue
+            haskey(ctx.ssa_remap, si) && continue
+            fresh = alloc_ssa!(ctx)
+            ctx.ssa_remap[si] = fresh
+            anchor_line!(ctx, fresh, si)
+        end
+    end
+
+    sub_block = structurize_region!(ctx, dest, subtree;
+                                     merge_phis=merge_phis,
+                                     loop_ctx=loop_ctx)
+
+    ctx.ssa_remap = saved_remap
+
+    for (idx, entry) in sub_block.body
+        push!(b.body, (idx, entry.stmt, entry.typ))
+    end
+    b.terminator = sub_block.terminator
     return b
 end
 
@@ -406,12 +476,25 @@ function make_yield_for_edge(ir::IRCode, merge_phis::Vector{MergePhiInfo},
     return YieldOp(yield_values)
 end
 
-"""Create a YieldOp for exiting a region at `last_block`."""
-function make_exit_yield(ir::IRCode, merge_phis::Vector{MergePhiInfo},
-                          last_block::Int, blk::Block, ctx::StructurizeCtx)
-    # Reuse find_exit_predecessor's BFS to find the right phi edge
+"""
+Set a region's exit terminator on `blk`. Mirrors `make_empty_branch_block`'s
+short-circuit handling: when the resolved phi predecessor lies past
+`last_block` and we know the out-of-region successor `exit_dest` that caused
+the walker to leave, inline-structurize `exit_dest`'s dominator subtree so the
+yield value is materialized locally. Otherwise fall back to a direct
+`make_yield_for_edge`.
+"""
+function set_exit_yield!(blk::Block, ir::IRCode, ctx::StructurizeCtx,
+                          merge_phis::Vector{MergePhiInfo}, last_block::Int,
+                          exit_dest::Union{Nothing, Int}, loop_ctx::Union{Nothing, LoopCtx})
     pred = find_exit_predecessor(merge_phis, Set{Int}([last_block]), last_block, ir)
-    return make_yield_for_edge(ir, merge_phis, pred, blk, ctx)
+    if pred != last_block && exit_dest !== nothing &&
+       dominates(ctx.domtree, exit_dest, pred)
+        tail_duplicate_branch!(blk, exit_dest, merge_phis, loop_ctx, ir, ctx)
+    else
+        blk.terminator = make_yield_for_edge(ir, merge_phis, pred, blk, ctx)
+    end
+    return blk.terminator
 end
 
 """
