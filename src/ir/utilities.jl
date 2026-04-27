@@ -921,21 +921,27 @@ resolve_call(block::Block, inst::Instruction) = resolve_call(block, inst.stmt)
     resolve_callee(block::Block, ref) -> resolved_func or nothing
 
 Resolve a callee reference to a concrete function value. Uses `singleton_type`
-on the inferred type (mirroring Julia's compiler) for SSAValue and other refs
-with singleton types. Falls back to evaluating GlobalRef and literal values
-directly — necessary for non-singleton types like `Core.IntrinsicFunction`
-where all intrinsics share one type and `singleton_type` returns `nothing`.
+on the inferred type (mirroring Julia's compiler) for symbolic refs (SSAValue,
+Argument, BlockArgument, SlotNumber). Falls back to evaluating GlobalRef and
+literal values directly — necessary for non-singleton types like
+`Core.IntrinsicFunction` where all intrinsics share one type and
+`singleton_type` returns `nothing`. Julia's inliner sometimes substitutes a
+`GlobalRef(Core.Intrinsics, :sub_float)` callee with the literal
+`IntrinsicFunction` value (e.g. when inlining cross-module wrappers like
+`BFloat16s.:-`), so non-symbolic refs are returned as-is.
 """
 function resolve_callee(block::Block, @nospecialize(ref))
-    T = value_type(block, ref)
-    T === nothing && return nothing
-    resolved = Core.Compiler.singleton_type(T)
-    resolved !== nothing && return resolved
-    # Fallback: evaluate GlobalRef directly (needed for Core.IntrinsicFunction
-    # and other non-singleton types where the value can't be recovered from type alone).
+    if ref isa SSAValue || ref isa Argument || ref isa BlockArgument || ref isa SlotNumber
+        T = value_type(block, ref)
+        T === nothing && return nothing
+        return Core.Compiler.singleton_type(T)
+    end
     # GlobalRefs in optimized IR are guaranteed valid — inference rejects undefined bindings.
     ref isa GlobalRef && return getfield(ref.mod, ref.name)
-    return nothing
+    ref isa QuoteNode && return ref.value
+    # Literal callable embedded directly as args[1] (e.g. an IntrinsicFunction
+    # value substituted by Julia's inliner): the ref *is* the function.
+    return ref
 end
 
 """

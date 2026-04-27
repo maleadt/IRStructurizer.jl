@@ -1106,6 +1106,16 @@ end  # loop carries
         @test resolve_callee(block, SSAValue(inst)) === singleton
         break
     end
+
+    # Literal IntrinsicFunction in callee position. Julia's inliner can substitute
+    # `GlobalRef(Core.Intrinsics, :sub_float)` with the bare `IntrinsicFunction`
+    # value (e.g., when inlining cross-module wrappers), so resolve_callee must
+    # accept callable literals — `IntrinsicFunction` is non-singleton (all
+    # intrinsics share the type) and not a `GlobalRef`.
+    expr_intr = Expr(:call, Core.Intrinsics.sub_float, SSAValue(1), SSAValue(2))
+    result_intr = resolve_call(block, expr_intr)
+    @test result_intr !== nothing
+    @test first(result_intr) === Core.Intrinsics.sub_float
 end
 
 @testset "iscall / callee / callargs" begin
