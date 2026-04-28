@@ -80,15 +80,15 @@ struct Instruction
 end
 
 """Get the Julia type of the instruction result."""
-value_type(i::Instruction) = (i.block::Block).body[i.ssa_idx].type
+value_type(i::Instruction) = i[:type]
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
-stmt(i::Instruction) = (i.block::Block).body[i.ssa_idx].stmt
+stmt(i::Instruction) = i[:stmt]
 
 """Get the per-statement IR flag bitmask (e.g. `IR_FLAG_EFFECT_FREE`).
 Carried through from `IRCode.stmts.flag` at structurization; 0 for stmts
 synthesized by the structurizer or by downstream passes."""
-flag(i::Instruction) = (i.block::Block).body[i.ssa_idx].flag
+flag(i::Instruction) = i[:flag]
 
 """Get the block containing this instruction."""
 block(i::Instruction) = i.block
@@ -101,7 +101,7 @@ Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)
 
 function Base.show(io::IO, i::Instruction)
     print(io, "Instruction(%$(i.ssa_idx)")
-    s = stmt(i)
+    s = i[:stmt]
     if s isa ControlFlowOp
         print(io, " = ", typeof(s))
     elseif s isa Expr

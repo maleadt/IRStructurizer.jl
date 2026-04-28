@@ -150,10 +150,12 @@ Read a field of the instruction's live entry in the containing block.
 function Base.getindex(inst::Instruction, fld::Symbol)
     fld === :ssa_idx && return inst.ssa_idx
     fld === :block   && return inst.block
-    entry = (inst.block::Block).body[inst.ssa_idx]
-    fld === :stmt && return entry.stmt
-    fld === :type && return entry.type
-    fld === :flag && return entry.flag
+    m = (inst.block::Block).body
+    i = get(m.pos_by_idx, inst.ssa_idx, 0)
+    i == 0 && throw(KeyError(inst.ssa_idx))
+    fld === :stmt && return m.stmts[i]
+    fld === :type && return m.types[i]
+    fld === :flag && return m.flags[i]
     throw(ArgumentError("Instruction has no field $fld; expected one of (:stmt, :type, :flag, :ssa_idx, :block)"))
 end
 
