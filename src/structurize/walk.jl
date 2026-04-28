@@ -145,7 +145,7 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
          stmt isa GotoIfNot || stmt isa ReturnNode) && continue
         idx = get(remap, si, si)
         stmt = remap_stmt(stmt, remap)
-        push!(block, idx, stmt, ir.stmts.type[si])
+        push!(block, idx, stmt, ir.stmts.type[si], ir.stmts.flag[si])
         idx != si && anchor_line!(ctx, idx, si)
     end
 end
@@ -402,7 +402,7 @@ function tail_duplicate_branch!(b::Block, dest::Int,
     ctx.ssa_remap = saved_remap
 
     for (idx, entry) in sub_block.body
-        push!(b.body, (idx, entry.stmt, entry.typ))
+        push!(b.body, (idx, entry.stmt, entry.typ, entry.flag))
     end
     b.terminator = sub_block.terminator
     return b

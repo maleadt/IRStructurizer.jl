@@ -285,7 +285,7 @@ end
 
 function merge_block_into!(dst::Block, src::Block)
     for (idx, entry) in src.body
-        push!(dst.body, (idx, entry.stmt, entry.typ))
+        push!(dst.body, (idx, entry.stmt, entry.typ, entry.flag))
     end
     if src.terminator !== nothing && dst.terminator === nothing
         dst.terminator = src.terminator

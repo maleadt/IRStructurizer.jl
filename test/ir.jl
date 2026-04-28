@@ -14,10 +14,29 @@
     @test !isempty(insts)
     @test all(i -> i isa Instruction, insts)
 
-    # Each Instruction bundles ssa_idx, stmt, typ
+    # Each Instruction bundles ssa_idx, stmt, typ, flag
     inst = first(insts)
     @test value_type(inst) isa Type
     @test SSAValue(inst) isa SSAValue
+    @test inst.flag isa UInt32
+end
+
+@testset "per-stmt flag carried through from IRCode" begin
+    # `Base.add_int(x, 1)` is pure: inference + the inliner mark its
+    # statement with `IR_FLAG_EFFECT_FREE`. The structurizer reads
+    # `ir.stmts.flag[i]` at ingestion, so that bit must be observable
+    # on the resulting Instruction.
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+    found_pure = false
+    for inst in instructions(sci.entry)
+        s = stmt(inst)
+        if s isa Expr && s.head === :call
+            (inst.flag & Core.Compiler.IR_FLAG_EFFECT_FREE) != 0 && (found_pure = true; break)
+        end
+    end
+    @test found_pure
 end
 
 @testset "arguments(block)" begin
@@ -306,7 +325,7 @@ end
         x + 1
     end |> only
 
-    bad_ref = Instruction(999999, nothing, Nothing, Block())
+    bad_ref = Instruction(999999, nothing, Nothing, UInt32(0), Block())
     @test_throws KeyError insert_before!(sci.entry, bad_ref, Expr(:call, :x), Int)
 end
 
@@ -362,7 +381,7 @@ end
     @test found === sci.entry
 
     # Non-existent instruction returns nothing
-    @test findblock(sci, Instruction(999999, nothing, Nothing, Block())) === nothing
+    @test findblock(sci, Instruction(999999, nothing, Nothing, UInt32(0), Block())) === nothing
 end
 
 @testset "reachable_terminators(block)" begin
@@ -1071,7 +1090,7 @@ end  # loop carries
     @test resolve_call(block, Expr(:new, :Foo)) === nothing
 
     # Instruction overload
-    inst = Instruction(1, expr_call, Int, Block())
+    inst = Instruction(1, expr_call, Int, UInt32(0), Block())
     result3 = resolve_call(block, inst)
     @test result3 !== nothing
     @test first(result3) === Base.:+
@@ -1137,7 +1156,7 @@ end
     @test !iscall(Expr(:new, :Foo))
 
     # Instruction overloads
-    inst = Instruction(1, expr_call, Int, Block())
+    inst = Instruction(1, expr_call, Int, UInt32(0), Block())
     @test iscall(inst)
     @test callee(inst) == GlobalRef(Base, :+)
     @test length(callargs(inst)) == 2

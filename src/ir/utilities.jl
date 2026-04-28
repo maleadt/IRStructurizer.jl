@@ -49,42 +49,47 @@ function Base.delete!(block::Block, inst::Instruction)
 end
 
 """
-    push!(block::Block, stmt, typ) -> Instruction
+    push!(block::Block, stmt, typ; flag=0) -> Instruction
 
 Append a new instruction to the block, auto-allocating an SSA index.
-Requires `block.parent` to be set (see `_set_parent!`).
+Requires `block.parent` to be set (see `_set_parent!`). Optional `flag` is
+the per-statement `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`);
+keyword-only to avoid ambiguity with the explicit-idx `push!(block, idx, stmt, typ)`.
 """
-function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ))
+function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ);
+                    flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    push!(block.body, (idx, stmt, typ))
+    push!(block.body, (idx, stmt, typ, flag))
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, block)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
 """
-    pushfirst!(block::Block, stmt, typ) -> Instruction
+    pushfirst!(block::Block, stmt, typ; flag=0) -> Instruction
 
 Prepend a new instruction at the beginning of the block, auto-allocating an SSA index.
 """
-function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ))
+function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ);
+                         flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     pushfirst!(block.body.ssa_idxes, idx)
     pushfirst!(block.body.stmts, stmt)
     pushfirst!(block.body.types, typ)
+    pushfirst!(block.body.flags, flag)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, block)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
 """
@@ -154,81 +159,89 @@ function new_block_arg!(block::Block, @nospecialize(typ))
 end
 
 """
-    insert_before!(block::Block, ref::Instruction, stmt, typ) -> Instruction
+    insert_before!(block::Block, ref::Instruction, stmt, typ; flag=0) -> Instruction
 
 Insert a new instruction before `ref`, auto-allocating an SSA index.
 """
-function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ))
+function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ);
+                        flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Instruction(idx, stmt, typ, block)
+    insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, typ, flag)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
-function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ)
+function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ,
+                            flag::UInt32=UInt32(0))
     pos = findfirst(==(before_idx), m.ssa_idxes)
     pos === nothing && throw(KeyError(before_idx))
     insert!(m.ssa_idxes, pos, new_idx)
     insert!(m.stmts, pos, stmt)
     insert!(m.types, pos, typ)
+    insert!(m.flags, pos, flag)
 end
 
 """
-    insert_after!(block::Block, ref::Instruction, stmt, typ) -> Instruction
+    insert_after!(block::Block, ref::Instruction, stmt, typ; flag=0) -> Instruction
 
 Insert a new instruction after `ref`, auto-allocating an SSA index.
 """
-function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ))
+function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ);
+                       flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, typ)
-    return Instruction(idx, stmt, typ, block)
+    insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, typ, flag)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
-function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ)
+function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ,
+                           flag::UInt32=UInt32(0))
     pos = findfirst(==(after_idx), m.ssa_idxes)
     pos === nothing && throw(KeyError(after_idx))
     insert!(m.ssa_idxes, pos + 1, new_idx)
     insert!(m.stmts, pos + 1, stmt)
     insert!(m.types, pos + 1, typ)
+    insert!(m.flags, pos + 1, flag)
 end
 
 """
-    insert_before!(block::Block, ref::SSAValue, stmt, typ) -> Instruction
+    insert_before!(block::Block, ref::SSAValue, stmt, typ; flag=0) -> Instruction
 
 Insert a new instruction before the instruction at SSA index `ref.id`.
 """
-function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ))
+function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ);
+                        flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_before_idx!(block.body, ref.id, idx, stmt, typ)
+    insert_before_idx!(block.body, ref.id, idx, stmt, typ, flag)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, block)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
 """
-    insert_after!(block::Block, ref::SSAValue, stmt, typ) -> Instruction
+    insert_after!(block::Block, ref::SSAValue, stmt, typ; flag=0) -> Instruction
 
 Insert a new instruction after the instruction at SSA index `ref.id`.
 """
-function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ))
+function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ);
+                       flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_after_idx!(block.body, ref.id, idx, stmt, typ)
+    insert_after_idx!(block.body, ref.id, idx, stmt, typ, flag)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, block)
+    return Instruction(idx, stmt, typ, flag, block)
 end
 
 
