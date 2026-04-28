@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, block,
+export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, flag, block,
        insert_before!, insert_after!, terminator, terminator!, operands,
        source_location
 
@@ -57,36 +57,38 @@ const IRValue = Any
 """
     Instruction
 
-A view over an SSAMap entry, bundling an SSA index with its statement, type,
-and containing block. Yielded by `instructions(block)` and usable as a key
-in `UseIndex`.
+A handle into an SSAMap entry: an SSA index paired with the containing
+`Block`. Field reads/writes go through the live `Block.body` entry, so a
+handle held across mutations always sees the current `(stmt, type, flag)`.
 
-Analogous to MLIR's `Operation` which knows its parent `Block` via `getBlock()`.
+Yielded by `instructions(block)` and usable as a key in `UseIndex`.
+
+Use the Symbol-keyed accessors (`inst[:stmt]`, `inst[:type]`, `inst[:flag]`)
+for reads and writes; `value_type(inst)`, `stmt(inst)`, `flag(inst)`,
+`block(inst)` are convenience aliases.
+
+Analogous to `Core.Compiler.Instruction` in `Compiler/src/ssair/ir.jl`,
+which is also a `(storage, key)` handle dispatching to parallel field
+vectors via `node[:stmt]` etc. — the difference being that the storage
+here is keyed by SSA index (preserved across structurization) rather
+than by dense position. Becomes stale on `delete!` of the underlying
+entry; identity (`==`, `hash`) is by `ssa_idx` only.
 """
 struct Instruction
     ssa_idx::Int
-    stmt::Any
-    type::Any
-    flag::UInt32  # IR_FLAG_* bitmask from Julia inference; 0 (IR_FLAG_NULL) if synthesized
     block::Any  # ::Block — untyped to avoid forward reference
 end
 
-# Convenience: construct without an explicit flag (defaults to IR_FLAG_NULL).
-# Matches the pre-`flag` constructor signature for callers that don't yet
-# carry per-stmt flags through.
-Instruction(ssa_idx::Int, @nospecialize(stmt), @nospecialize(type), @nospecialize(block)) =
-    Instruction(ssa_idx, stmt, type, UInt32(0), block)
-
 """Get the Julia type of the instruction result."""
-value_type(i::Instruction) = i.type
+value_type(i::Instruction) = (i.block::Block).body[i.ssa_idx].type
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
-stmt(i::Instruction) = i.stmt
+stmt(i::Instruction) = (i.block::Block).body[i.ssa_idx].stmt
 
 """Get the per-statement IR flag bitmask (e.g. `IR_FLAG_EFFECT_FREE`).
 Carried through from `IRCode.stmts.flag` at structurization; 0 for stmts
 synthesized by the structurizer or by downstream passes."""
-flag(i::Instruction) = i.flag
+flag(i::Instruction) = (i.block::Block).body[i.ssa_idx].flag
 
 """Get the block containing this instruction."""
 block(i::Instruction) = i.block
@@ -99,10 +101,11 @@ Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)
 
 function Base.show(io::IO, i::Instruction)
     print(io, "Instruction(%$(i.ssa_idx)")
-    if i.stmt isa ControlFlowOp
-        print(io, " = ", typeof(i.stmt))
-    elseif i.stmt isa Expr
-        print(io, " = ", i.stmt.head, "(...)")
+    s = stmt(i)
+    if s isa ControlFlowOp
+        print(io, " = ", typeof(s))
+    elseif s isa Expr
+        print(io, " = ", s.head, "(...)")
     end
     print(io, ")")
 end
@@ -394,9 +397,7 @@ Base.eltype(::Type{InstructionIterator}) = Instruction
 function Base.iterate(it::InstructionIterator, state::Int=1)
     m = it.block.body
     state > length(m.ssa_idxes) && return nothing
-    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state],
-                       m.flags[state], it.block)
-    return inst, state + 1
+    return Instruction(m.ssa_idxes[state], it.block), state + 1
 end
 
 """

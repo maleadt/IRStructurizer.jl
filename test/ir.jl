@@ -14,11 +14,12 @@
     @test !isempty(insts)
     @test all(i -> i isa Instruction, insts)
 
-    # Each Instruction bundles ssa_idx, stmt, type, flag
+    # Each Instruction is a handle exposing ssa_idx, stmt, type, flag
     inst = first(insts)
     @test value_type(inst) isa Type
     @test SSAValue(inst) isa SSAValue
-    @test inst.flag isa UInt32
+    @test flag(inst) isa UInt32
+    @test inst[:flag] === flag(inst)
 end
 
 @testset "per-stmt flag carried through from IRCode" begin
@@ -33,10 +34,32 @@ end
     for inst in instructions(sci.entry)
         s = stmt(inst)
         if s isa Expr && s.head === :call
-            (inst.flag & Core.Compiler.IR_FLAG_EFFECT_FREE) != 0 && (found_pure = true; break)
+            (flag(inst) & Core.Compiler.IR_FLAG_EFFECT_FREE) != 0 && (found_pure = true; break)
         end
     end
     @test found_pure
+end
+
+@testset "Instruction is a live handle" begin
+    # Regression: an Instruction held across a write to the underlying
+    # entry must reflect the latest stmt/type/flag. Pre-migration the
+    # Instruction stored snapshot copies — `inst[:type] = T; value_type(inst)`
+    # would round-trip but `inst.type` (direct field) wouldn't.
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+    inst = first(instructions(sci.entry))
+
+    inst[:type] = Float64
+    @test value_type(inst) === Float64
+    @test inst[:type] === Float64
+
+    inst[:flag] = UInt32(0)
+    @test flag(inst) === UInt32(0)
+
+    # A second handle to the same SSA index sees the same live entry.
+    other = sci.entry[inst.ssa_idx]
+    @test value_type(other) === Float64
 end
 
 @testset "arguments(block)" begin
@@ -355,7 +378,7 @@ end
         x + 1
     end |> only
 
-    bad_ref = Instruction(999999, nothing, Nothing, UInt32(0), Block())
+    bad_ref = Instruction(999999, Block())
     @test_throws KeyError insert_before!(sci.entry, bad_ref, Expr(:call, :x), Int)
 end
 
@@ -411,7 +434,7 @@ end
     @test found === sci.entry
 
     # Non-existent instruction returns nothing
-    @test findblock(sci, Instruction(999999, nothing, Nothing, UInt32(0), Block())) === nothing
+    @test findblock(sci, Instruction(999999, Block())) === nothing
 end
 
 @testset "reachable_terminators(block)" begin

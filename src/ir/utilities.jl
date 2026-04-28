@@ -76,7 +76,7 @@ function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(type);
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 """
@@ -104,16 +104,15 @@ function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(type);
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 #=============================================================================
  Statement access — Symbol-keyed on Instruction, NamedTuple-keyed on Block
 
- Modeled on Core.Compiler.Instruction (`Compiler/src/ssair/ir.jl`). Reads and
- writes go through the live SSAMap entry, so `inst[:type] = T; inst[:type]`
- round-trips even though the snapshot fields on `Instruction` are stale —
- the upcoming handle migration removes that wart entirely.
+ Modeled on Core.Compiler.Instruction (`Compiler/src/ssair/ir.jl`): each
+ `Instruction` is a thin handle, and reads/writes resolve to the live
+ SSAMap entry on every access.
 
  When swapping a stmt for one with a different opcode, the old `flag` bits
  describe the OLD op and may be stale for the new one. Pass `flag=IR_FLAG_NULL`
@@ -129,8 +128,8 @@ Look up the instruction at the given SSA index, returning an `Instruction`
 handle. Throws `KeyError` if absent; pair with `haskey(block, ssa_idx)`.
 """
 function Base.getindex(block::Block, ssa_idx::Int)
-    entry = block.body[ssa_idx]
-    return Instruction(ssa_idx, entry.stmt, entry.type, entry.flag, block)
+    haskey(block.body, ssa_idx) || throw(KeyError(ssa_idx))
+    return Instruction(ssa_idx, block)
 end
 
 """
@@ -246,7 +245,7 @@ function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @no
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, type, flag)
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, type,
@@ -274,7 +273,7 @@ function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nos
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
     insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, type, flag)
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, type,
@@ -307,7 +306,7 @@ function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospe
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 """
@@ -326,7 +325,7 @@ function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospec
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, type, flag, block)
+    return Instruction(idx, block)
 end
 
 
@@ -1257,59 +1256,55 @@ end
 =============================================================================#
 
 """
-    move_before!(inst::Instruction, target::Instruction)
+    move_before!(inst::Instruction, target::Instruction) -> Instruction
 
 Move `inst` from its current block to just before `target` in `target`'s block.
-The instruction retains its SSA index. Sub-block parents are updated if the
-instruction is a `ControlFlowOp`.
+The instruction retains its SSA index, statement, type, and flags. Sub-block
+parents are updated if the instruction is a `ControlFlowOp`. Returns a fresh
+handle pointing into the destination block.
 
 Analogous to MLIR's `Operation::moveBefore`.
 """
 function move_before!(inst::Instruction, target::Instruction)
     src = inst.block::Block
     dst = target.block::Block
-    s = inst[:stmt]; t = inst[:type]
+    entry = src.body[inst.ssa_idx]
 
-    # Remove from source
     delete!(src.body, inst.ssa_idx)
+    insert_before_idx!(dst.body, target.ssa_idx, inst.ssa_idx,
+                       entry.stmt, entry.type, entry.flag)
 
-    # Insert before target in destination
-    insert_before_idx!(dst.body, target.ssa_idx, inst.ssa_idx, s, t)
-
-    # Update sub-block parents
-    if s isa ControlFlowOp
-        for b in blocks(s)
+    if entry.stmt isa ControlFlowOp
+        for b in blocks(entry.stmt)
             b.parent = dst
         end
     end
-    return inst
+    return Instruction(inst.ssa_idx, dst)
 end
 
 """
-    move_after!(inst::Instruction, target::Instruction)
+    move_after!(inst::Instruction, target::Instruction) -> Instruction
 
 Move `inst` from its current block to just after `target` in `target`'s block.
-The instruction retains its SSA index. Sub-block parents are updated if the
-instruction is a `ControlFlowOp`.
+The instruction retains its SSA index, statement, type, and flags. Sub-block
+parents are updated if the instruction is a `ControlFlowOp`. Returns a fresh
+handle pointing into the destination block.
 
 Analogous to MLIR's `Operation::moveAfter`.
 """
 function move_after!(inst::Instruction, target::Instruction)
     src = inst.block::Block
     dst = target.block::Block
-    s = inst[:stmt]; t = inst[:type]
+    entry = src.body[inst.ssa_idx]
 
-    # Remove from source
     delete!(src.body, inst.ssa_idx)
+    insert_after_idx!(dst.body, target.ssa_idx, inst.ssa_idx,
+                      entry.stmt, entry.type, entry.flag)
 
-    # Insert after target in destination
-    insert_after_idx!(dst.body, target.ssa_idx, inst.ssa_idx, s, t)
-
-    # Update sub-block parents
-    if s isa ControlFlowOp
-        for b in blocks(s)
+    if entry.stmt isa ControlFlowOp
+        for b in blocks(entry.stmt)
             b.parent = dst
         end
     end
-    return inst
+    return Instruction(inst.ssa_idx, dst)
 end
