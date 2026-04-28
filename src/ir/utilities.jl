@@ -89,10 +89,16 @@ function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(type);
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    pushfirst!(block.body.ssa_idxes, idx)
-    pushfirst!(block.body.stmts, stmt)
-    pushfirst!(block.body.types, type)
-    pushfirst!(block.body.flags, flag)
+    m = block.body
+    pushfirst!(m.ssa_idxes, idx)
+    pushfirst!(m.stmts, stmt)
+    pushfirst!(m.types, type)
+    pushfirst!(m.flags, flag)
+    # All existing positions shift up by one; new entry is at position 1.
+    for j in 2:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
+    m.pos_by_idx[idx] = 1
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
@@ -161,8 +167,8 @@ Write a single field of the instruction's live entry. Other fields are preserved
 """
 function Base.setindex!(inst::Instruction, @nospecialize(val), fld::Symbol)
     m = (inst.block::Block).body
-    i = findfirst(==(inst.ssa_idx), m.ssa_idxes)
-    i === nothing && throw(KeyError(inst.ssa_idx))
+    i = get(m.pos_by_idx, inst.ssa_idx, 0)
+    i == 0 && throw(KeyError(inst.ssa_idx))
     if fld === :stmt
         m.stmts[i] = val
     elseif fld === :type
@@ -245,12 +251,16 @@ end
 
 function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, type,
                             flag::UInt32=UInt32(0))
-    pos = findfirst(==(before_idx), m.ssa_idxes)
-    pos === nothing && throw(KeyError(before_idx))
+    pos = get(m.pos_by_idx, before_idx, 0)
+    pos == 0 && throw(KeyError(before_idx))
     insert!(m.ssa_idxes, pos, new_idx)
     insert!(m.stmts, pos, stmt)
     insert!(m.types, pos, type)
     insert!(m.flags, pos, flag)
+    # Positions ≥ pos have shifted up by one; new entry sits at `pos`.
+    for j in pos:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
 end
 
 """
@@ -269,12 +279,16 @@ end
 
 function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, type,
                            flag::UInt32=UInt32(0))
-    pos = findfirst(==(after_idx), m.ssa_idxes)
-    pos === nothing && throw(KeyError(after_idx))
+    pos = get(m.pos_by_idx, after_idx, 0)
+    pos == 0 && throw(KeyError(after_idx))
     insert!(m.ssa_idxes, pos + 1, new_idx)
     insert!(m.stmts, pos + 1, stmt)
     insert!(m.types, pos + 1, type)
     insert!(m.flags, pos + 1, flag)
+    # Positions ≥ pos+1 have shifted up by one; new entry sits at `pos+1`.
+    for j in pos+1:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
 end
 
 """

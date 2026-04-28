@@ -126,17 +126,19 @@ Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, type, flag)` or throws `Ke
 NamedTuple subset of `(stmt, type, flag)` — fields not mentioned are preserved.
 Iteration yields `idx => (; stmt, type, flag)` pairs.
 
-Note: Currently uses linear scan for lookup. If this becomes a bottleneck,
-consider switching to `OrderedDict{Int, NamedTuple}` for O(1) access.
+Storage is parallel `Vector`s (analogous to `Core.Compiler.InstructionStream`
+in `Compiler/src/ssair/ir.jl`), with a side `pos_by_idx::Dict{Int,Int}`
+giving O(1) lookup from SSA index to vector position.
 """
 struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, type::Any, flag::UInt32}}
     ssa_idxes::Vector{Int}
     stmts::Vector{Any}
     types::Vector{Any}
     flags::Vector{UInt32}  # IR_FLAG_* bitmask per stmt; parallel to stmts/types
+    pos_by_idx::Dict{Int, Int}  # ssa_idx → position in the parallel vectors
 end
 
-SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[])
+SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[], Dict{Int,Int}())
 
 # Iteration yields idx => (; stmt, type, flag) pairs
 function Base.iterate(m::SSAMap, state::Int=1)
@@ -147,18 +149,18 @@ function Base.iterate(m::SSAMap, state::Int=1)
 end
 
 Base.length(m::SSAMap) = length(m.ssa_idxes)
-Base.haskey(m::SSAMap, ssa_idx::Int) = findfirst(==(ssa_idx), m.ssa_idxes) !== nothing
+Base.haskey(m::SSAMap, ssa_idx::Int) = haskey(m.pos_by_idx, ssa_idx)
 
 # Lookup by SSA index
 function Base.getindex(m::SSAMap, ssa_idx::Int)
-    i = findfirst(==(ssa_idx), m.ssa_idxes)
-    i === nothing && throw(KeyError(ssa_idx))
+    i = get(m.pos_by_idx, ssa_idx, 0)
+    i == 0 && throw(KeyError(ssa_idx))
     return (; stmt=m.stmts[i], type=m.types[i], flag=m.flags[i])
 end
 
 function Base.get(m::SSAMap, ssa_idx::Int, default)
-    i = findfirst(==(ssa_idx), m.ssa_idxes)
-    i === nothing && return default
+    i = get(m.pos_by_idx, ssa_idx, 0)
+    i == 0 && return default
     return (; stmt=m.stmts[i], type=m.types[i], flag=m.flags[i])
 end
 
@@ -176,6 +178,7 @@ function Base.push!(m::SSAMap, (idx, stmt, type, flag)::Tuple{Int,Any,Any,UInt32
     push!(m.stmts, stmt)
     push!(m.types, type)
     push!(m.flags, flag)
+    m.pos_by_idx[idx] = length(m.ssa_idxes)
     return nothing
 end
 
@@ -191,8 +194,8 @@ flags(m::SSAMap) = (f for f in m.flags)
 function Base.setindex!(m::SSAMap, entry::NamedTuple{names}, ssa_idx::Int) where {names}
     names ⊆ (:stmt, :type, :flag) ||
         throw(ArgumentError("SSAMap entry keys must be a subset of (:stmt, :type, :flag), got $names"))
-    i = findfirst(==(ssa_idx), m.ssa_idxes)
-    i === nothing && throw(KeyError(ssa_idx))
+    i = get(m.pos_by_idx, ssa_idx, 0)
+    i == 0 && throw(KeyError(ssa_idx))
     haskey(entry, :stmt) && (m.stmts[i] = entry.stmt)
     haskey(entry, :type) && (m.types[i] = entry.type)
     haskey(entry, :flag) && (m.flags[i] = entry.flag)
@@ -201,12 +204,17 @@ end
 
 # Mutation: delete! for removing a statement
 function Base.delete!(m::SSAMap, ssa_idx::Int)
-    i = findfirst(==(ssa_idx), m.ssa_idxes)
-    i === nothing && throw(KeyError(ssa_idx))
+    i = get(m.pos_by_idx, ssa_idx, 0)
+    i == 0 && throw(KeyError(ssa_idx))
     deleteat!(m.ssa_idxes, i)
     deleteat!(m.stmts, i)
     deleteat!(m.types, i)
     deleteat!(m.flags, i)
+    delete!(m.pos_by_idx, ssa_idx)
+    # Positions after `i` have shifted down by one.
+    for j in i:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
     return m
 end
 
