@@ -48,8 +48,10 @@ Iterate over instructions in a block as `Inst` objects. Each `Inst` bundles an S
 
 ```julia
 for inst in instructions(block)
-    stmt(inst)       # underlying statement (Expr, ControlFlowOp, etc.)
-    value_type(inst) # Julia type of the instruction result
+    inst[:stmt]      # underlying statement (Expr, ControlFlowOp, etc.)
+    inst[:type]      # Julia type of the instruction result (or value_type(inst))
+    inst[:flag]      # IR_FLAG_* bitmask (see Compiler/src/optimize.jl)
+    inst.block       # containing block
 end
 ```
 
@@ -142,8 +144,8 @@ Pre-built index for O(1) definition lookup. Analogous to `uses(block)` which ret
 idx = defs(sci)
 inst = def(idx, SSAValue(3))
 if inst !== nothing
-    stmt(inst)        # the statement
-    block(inst)       # the containing block
+    inst[:stmt]       # the statement
+    inst.block        # the containing block
 end
 ```
 
@@ -179,11 +181,17 @@ Check if a value is defined in this block. Returns `true` for `SSAValue`s in the
 
 Check whether a value is defined outside a block (and all its descendants), or outside a loop operation's regions. The loop-op overloads handle values like `ForOp.iv_arg` that aren't in the body's block args. Analogous to MLIR's `LoopLikeOpInterface::isDefinedOutsideOfLoop`.
 
-#### `update_type!(block, inst, new_type)`
+#### `block[ssa_idx]` → `Instruction` / `block[ssa_idx] = (...)`
 
-Change the type annotation of an existing instruction.
+Access or mutate the entry at an SSA index. `block[idx]` returns the `Instruction` handle (throws `KeyError` if absent — pair with `haskey(block, idx)`). `block[idx] = nt` accepts any NamedTuple subset of `(stmt, type, flag)`; fields not mentioned are preserved. So `block[idx] = (type=Float64,)` overwrites only the type, keeping `stmt` and `flag`.
 
-#### `new_block_arg!(block, typ)` → `BlockArg`
+#### `inst[:stmt]` / `inst[:type]` / `inst[:flag]` (Symbol-keyed access)
+
+Read or write a single field of an instruction's live entry. Modeled on `Core.Compiler.Instruction` (`Compiler/src/ssair/ir.jl`). Reads and writes go through the block's storage, so `inst[:type] = T; inst[:type]` round-trips. `inst[:ssa_idx]` and `inst[:block]` are also exposed.
+
+When swapping `:stmt` for one with a different opcode, the old `flag` bits describe the OLD op and may be stale for the new one. Pass `inst[:flag] = IR_FLAG_NULL` (or `block[idx] = (stmt=…, flag=IR_FLAG_NULL)` for an atomic write), mirroring LLVM's "fresh instruction, then opt-in `copyIRFlags`" pattern.
+
+#### `new_block_arg!(block, type)` → `BlockArg`
 
 Add a new `BlockArg` to a block.
 

@@ -66,10 +66,10 @@ function apply_substitutions!(block::Block, subs::Substitutions, ctx)
     for (idx, entry) in block.body
         if entry.stmt isa ControlFlowOp
             apply_substitutions!(entry.stmt, subs, ctx)
-            push!(new_body, (idx, entry.stmt, entry.typ, entry.flag))
+            push!(new_body, (idx, entry.stmt, entry.type, entry.flag))
         else
             new_expr = substitute_ssa(entry.stmt, subs)
-            push!(new_body, (idx, new_expr, entry.typ, entry.flag))
+            push!(new_body, (idx, new_expr, entry.type, entry.flag))
         end
     end
     block.body = new_body

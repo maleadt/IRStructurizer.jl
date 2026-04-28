@@ -156,7 +156,7 @@ Lower a structured IR Block's body into flat BBs. Returns the last BB used
 """
 function lower_block_body!(ctx::UnstructurizeCtx, bb::Int, block::Block)
     for (idx, entry) in block.body
-        stmt, typ = entry.stmt, entry.typ
+        stmt, typ = entry.stmt, entry.type
         if stmt isa IfOp
             bb = lower_ifop!(ctx, bb, idx, stmt, typ)
         elseif stmt isa ForOp

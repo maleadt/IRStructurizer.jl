@@ -381,9 +381,9 @@ function print_block_body(p::IRPrinter, block::Block; is_last_in_parent::Bool=fa
     items = []
     for (i, (idx, entry)) in enumerate(block.body)
         if entry.stmt isa ControlFlowOp
-            push!(items, (:nested, idx, entry.stmt, entry.typ))
+            push!(items, (:nested, idx, entry.stmt, entry.type))
         else
-            push!(items, (:expr, idx, entry.stmt, entry.typ))
+            push!(items, (:expr, idx, entry.stmt, entry.type))
         end
     end
     if block.terminator !== nothing

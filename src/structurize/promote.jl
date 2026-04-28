@@ -31,7 +31,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             result, removed, redirect = try_promote_for_from_loop(stmt, idx, block, new_body, ctx)
             if result isa ForOp
                 for_promotions[idx] = (removed, result, redirect)
-                carry_types = Any[t for (i, t) in enumerate(entry.typ.parameters) if i ∉ removed]
+                carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed]
                 push!(new_body, (idx, result, Tuple{carry_types...}, entry.flag))
             else
                 # Fall back to existing path: LoopOp → WhileOp → ForOp
@@ -40,13 +40,13 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     result2, iv_pos = try_promote_for(promoted, idx, block, new_body, ctx)
                     if result2 isa ForOp && iv_pos > 0
                         for_promotions[idx] = ([iv_pos], result2, Dict{Int,Int}())
-                        carry_types = Any[t for (i, t) in enumerate(entry.typ.parameters) if i != iv_pos]
+                        carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i != iv_pos]
                         push!(new_body, (idx, result2, Tuple{carry_types...}, entry.flag))
                     else
-                        push!(new_body, (idx, result2, entry.typ, entry.flag))
+                        push!(new_body, (idx, result2, entry.type, entry.flag))
                     end
                 else
-                    push!(new_body, (idx, stmt, entry.typ, entry.flag))
+                    push!(new_body, (idx, stmt, entry.type, entry.flag))
                 end
             end
         elseif stmt isa Expr && stmt.head === :call && stmt.args[1] === Core.getfield &&
@@ -61,22 +61,22 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     # Duplicate carry → redirect to surviving carry's adjusted index
                     adjusted = target_pos - count(p -> p < target_pos, removed)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
-                    push!(new_body, (idx, new_gf, entry.typ, entry.flag))
+                    push!(new_body, (idx, new_gf, entry.type, entry.flag))
                 else
-                    push!(new_body, (idx, for_op.upper, entry.typ, entry.flag))
+                    push!(new_body, (idx, for_op.upper, entry.type, entry.flag))
                 end
             else
                 adjusted = field_idx - count(p -> p < field_idx, removed)
                 new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
-                push!(new_body, (idx, new_gf, entry.typ, entry.flag))
+                push!(new_body, (idx, new_gf, entry.type, entry.flag))
             end
         elseif stmt isa ControlFlowOp
             for b in blocks(stmt)
                 promote_loops!(b, ctx)
             end
-            push!(new_body, (idx, stmt, entry.typ, entry.flag))
+            push!(new_body, (idx, stmt, entry.type, entry.flag))
         else
-            push!(new_body, (idx, stmt, entry.typ, entry.flag))
+            push!(new_body, (idx, stmt, entry.type, entry.flag))
         end
     end
     block.body = new_body
@@ -192,13 +192,13 @@ function simplify_loop_exit(body::Block)
     # Build merged IfOp: inner condition true → done → break, false → continue
     merged_then = Block()
     for (sidx, sentry) in done_body_region.body
-        push!(merged_then.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(merged_then.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     merged_then.terminator = BreakOp(break_values)
 
     merged_else = Block()
     for (sidx, sentry) in cont_body_region.body
-        push!(merged_else.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(merged_else.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     merged_else.terminator = ContinueOp(cont_values)
 
@@ -211,7 +211,7 @@ function simplify_loop_exit(body::Block)
     end
     for (sidx, sentry) in body.body
         sidx == inner_result.id && break
-        push!(result.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(result.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     push!(result.body, (outer_idx, merged_if, Tuple{}))
     return result
@@ -427,11 +427,11 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     last_idx = body.body.ssa_idxes[end]
     for (sidx, sentry) in body.body
         sidx == last_idx && break
-        push!(for_body.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     for (sidx, sentry) in cont_region.body
         step_ssa !== nothing && sidx == step_ssa && continue  # skip IV increment
-        push!(for_body.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
     # ContinueOp with non-IV, non-shadow values
@@ -506,7 +506,7 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     before = Block()
     for (i, (sidx, sentry)) in enumerate(body.body)
         sidx == last_idx && break
-        push!(before.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(before.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     for arg in body.args
         push!(before.args, arg)
@@ -525,7 +525,7 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
         arg_remap[arg.id] = after_arg
     end
     for (sidx, sentry) in stay_region.body
-        push!(after.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(after.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     after.terminator = YieldOp(copy(continue_op.values))
 
@@ -667,7 +667,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         if carried_val isa SSAValue && sidx == carried_val.id
             continue
         end
-        push!(for_body.body, (sidx, sentry.stmt, sentry.typ, sentry.flag))
+        push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
     # ContinueOp with non-IV carried values
@@ -703,7 +703,7 @@ function remap_block_args!(block::Block, remap::Dict{Int, BlockArgument})
     new_body = SSAMap()
     for (idx, entry) in block.body
         new_stmt = remap_value(entry.stmt, remap)
-        push!(new_body, (idx, new_stmt, entry.typ, entry.flag))
+        push!(new_body, (idx, new_stmt, entry.type, entry.flag))
     end
     block.body = new_body
     if block.terminator !== nothing

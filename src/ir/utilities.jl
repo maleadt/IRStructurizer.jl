@@ -1,7 +1,9 @@
 # Utilities for structured IR
 #
 # Block mutation: parent, root, push!, pushfirst!, insert_before!, insert_after!,
-#                 delete!, update_type!, new_block_arg!
+#                 delete!, new_block_arg!
+# Statement mutation: block[ssa_idx] = (; stmt, type, flag)  — partial NamedTuple
+#                     inst[:stmt] = …, inst[:type] = …, inst[:flag] = …
 # Block traversal: eachblock, findblock
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
@@ -16,7 +18,7 @@
 
 public root, parent, walk_uses!, IndexedUseRef
 export insert_before!, insert_after!, eachblock, findblock,
-       update_type!, new_block_arg!,
+       new_block_arg!,
        resolve_call, iscall, callee, callargs,
        reachable_terminators, walk, after_arg,
        def, defs,
@@ -48,60 +50,136 @@ function Base.delete!(block::Block, inst::Instruction)
     return block
 end
 
+"""Delete an instruction from a block by SSA index. Throws `KeyError` if absent;
+pair with `haskey(block, ssa_idx)` for the idempotent erase pattern."""
+Base.delete!(block::Block, ssa_idx::Int) = (delete!(block.body, ssa_idx); block)
+
+"""Whether `block` contains an instruction with the given SSA index."""
+Base.haskey(block::Block, ssa_idx::Int) = haskey(block.body, ssa_idx)
+
 """
-    push!(block::Block, stmt, typ; flag=0) -> Instruction
+    push!(block::Block, stmt, type; flag=0) -> Instruction
 
 Append a new instruction to the block, auto-allocating an SSA index.
 Requires `block.parent` to be set (see `_set_parent!`). Optional `flag` is
 the per-statement `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`);
-keyword-only to avoid ambiguity with the explicit-idx `push!(block, idx, stmt, typ)`.
+keyword-only to avoid ambiguity with the explicit-idx `push!(block, idx, stmt, type)`.
 """
-function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(typ);
+function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(type);
                     flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    push!(block.body, (idx, stmt, typ, flag))
+    push!(block.body, (idx, stmt, type, flag))
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, flag, block)
+    return Instruction(idx, block)
 end
 
 """
-    pushfirst!(block::Block, stmt, typ; flag=0) -> Instruction
+    pushfirst!(block::Block, stmt, type; flag=0) -> Instruction
 
 Prepend a new instruction at the beginning of the block, auto-allocating an SSA index.
 """
-function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(typ);
+function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(type);
                          flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    pushfirst!(block.body.ssa_idxes, idx)
-    pushfirst!(block.body.stmts, stmt)
-    pushfirst!(block.body.types, typ)
-    pushfirst!(block.body.flags, flag)
+    m = block.body
+    pushfirst!(m.ssa_idxes, idx)
+    pushfirst!(m.stmts, stmt)
+    pushfirst!(m.types, type)
+    pushfirst!(m.flags, flag)
+    # All existing positions shift up by one; new entry is at position 1.
+    for j in 2:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
+    m.pos_by_idx[idx] = 1
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, flag, block)
+    return Instruction(idx, block)
+end
+
+#=============================================================================
+ Statement access — Symbol-keyed on Instruction, NamedTuple-keyed on Block
+
+ Modeled on Core.Compiler.Instruction (`Compiler/src/ssair/ir.jl`): each
+ `Instruction` is a thin handle, and reads/writes resolve to the live
+ SSAMap entry on every access.
+
+ When swapping a stmt for one with a different opcode, the old `flag` bits
+ describe the OLD op and may be stale for the new one. Pass `flag=IR_FLAG_NULL`
+ to clear, mirroring LLVM's "fresh instruction, then opt-in `copyIRFlags`"
+ pattern (see `Instruction.h:copyIRFlags`). Same-opcode rewrites (only
+ operands change) keep the flag.
+=============================================================================#
+
+"""
+    block[ssa_idx] -> Instruction
+
+Look up the instruction at the given SSA index, returning an `Instruction`
+handle. Throws `KeyError` if absent; pair with `haskey(block, ssa_idx)`.
+"""
+function Base.getindex(block::Block, ssa_idx::Int)
+    haskey(block.body, ssa_idx) || throw(KeyError(ssa_idx))
+    return Instruction(ssa_idx, block)
 end
 
 """
-    update_type!(block::Block, inst::Instruction, new_type)
+    block[ssa_idx] = (; stmt=…, type=…, flag=…)
 
-Update the type annotation for an existing instruction.
+Update one or more fields of the entry at `ssa_idx`. Any subset of
+`(:stmt, :type, :flag)` is accepted; fields not mentioned are preserved.
 """
-function update_type!(block::Block, inst::Instruction, @nospecialize(new_type))
-    pos = findfirst(==(inst.ssa_idx), block.body.ssa_idxes)
-    pos === nothing && throw(KeyError(inst.ssa_idx))
-    block.body.types[pos] = new_type
-    return nothing
+Base.setindex!(block::Block, entry::NamedTuple, ssa_idx::Int) =
+    (block.body[ssa_idx] = entry; block)
+
+"""
+    inst[:stmt] | inst[:type] | inst[:flag]
+    inst[:ssa_idx] | inst[:block]
+
+Read a field of the instruction's live entry in the containing block.
+"""
+function Base.getindex(inst::Instruction, fld::Symbol)
+    fld === :ssa_idx && return inst.ssa_idx
+    fld === :block   && return inst.block
+    m = inst.block.body
+    i = get(m.pos_by_idx, inst.ssa_idx, 0)
+    i == 0 && throw(KeyError(inst.ssa_idx))
+    fld === :stmt && return m.stmts[i]
+    fld === :type && return m.types[i]
+    fld === :flag && return m.flags[i]
+    throw(ArgumentError("Instruction has no field $fld; expected one of (:stmt, :type, :flag, :ssa_idx, :block)"))
+end
+
+"""
+    inst[:stmt] = newstmt
+    inst[:type] = T
+    inst[:flag] = f
+
+Write a single field of the instruction's live entry. Other fields are preserved.
+"""
+function Base.setindex!(inst::Instruction, @nospecialize(val), fld::Symbol)
+    m = inst.block.body
+    i = get(m.pos_by_idx, inst.ssa_idx, 0)
+    i == 0 && throw(KeyError(inst.ssa_idx))
+    if fld === :stmt
+        m.stmts[i] = val
+    elseif fld === :type
+        m.types[i] = val
+    elseif fld === :flag
+        m.flags[i] = val
+    else
+        throw(ArgumentError("Instruction setindex! field must be one of (:stmt, :type, :flag), got :$fld"))
+    end
+    return val
 end
 
 """
@@ -118,11 +196,11 @@ Returns `nothing` only for an `SSAValue` or `Argument` whose type cannot be foun
 function value_type(block::Block, @nospecialize(val))
     if val isa SSAValue
         entry = get(block.body, val.id, nothing)
-        entry !== nothing && return entry.typ
+        entry !== nothing && return entry.type
         p = block.parent
         while p isa Block
             entry = get(p.body, val.id, nothing)
-            entry !== nothing && return entry.typ
+            entry !== nothing && return entry.type
             p = p.parent
         end
         return nothing
@@ -146,102 +224,110 @@ function value_type(block::Block, @nospecialize(val))
 end
 
 """
-    new_block_arg!(block::Block, typ) -> BlockArgument
+    new_block_arg!(block::Block, type) -> BlockArgument
 
 Add a new BlockArgument to a block, allocating a fresh ID from the root StructuredIRCode.
 """
-function new_block_arg!(block::Block, @nospecialize(typ))
+function new_block_arg!(block::Block, @nospecialize(type))
     sci = root(block)
     sci.max_arg_idx += 1
-    arg = BlockArgument(sci.max_arg_idx, typ)
+    arg = BlockArgument(sci.max_arg_idx, type)
     push!(block.args, arg)
     return arg
 end
 
 """
-    insert_before!(block::Block, ref::Instruction, stmt, typ; flag=0) -> Instruction
+    insert_before!(block::Block, ref::Instruction, stmt, type; flag=0) -> Instruction
 
 Insert a new instruction before `ref`, auto-allocating an SSA index.
 """
-function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ);
+function insert_before!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(type);
                         flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, typ, flag)
-    return Instruction(idx, stmt, typ, flag, block)
+    insert_before_idx!(block.body, ref.ssa_idx, idx, stmt, type, flag)
+    return Instruction(idx, block)
 end
 
-function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, typ,
+function insert_before_idx!(m::SSAMap, before_idx::Int, new_idx::Int, stmt, type,
                             flag::UInt32=UInt32(0))
-    pos = findfirst(==(before_idx), m.ssa_idxes)
-    pos === nothing && throw(KeyError(before_idx))
+    pos = get(m.pos_by_idx, before_idx, 0)
+    pos == 0 && throw(KeyError(before_idx))
     insert!(m.ssa_idxes, pos, new_idx)
     insert!(m.stmts, pos, stmt)
-    insert!(m.types, pos, typ)
+    insert!(m.types, pos, type)
     insert!(m.flags, pos, flag)
+    # Positions ≥ pos have shifted up by one; new entry sits at `pos`.
+    for j in pos:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
 end
 
 """
-    insert_after!(block::Block, ref::Instruction, stmt, typ; flag=0) -> Instruction
+    insert_after!(block::Block, ref::Instruction, stmt, type; flag=0) -> Instruction
 
 Insert a new instruction after `ref`, auto-allocating an SSA index.
 """
-function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(typ);
+function insert_after!(block::Block, ref::Instruction, @nospecialize(stmt), @nospecialize(type);
                        flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, typ, flag)
-    return Instruction(idx, stmt, typ, flag, block)
+    insert_after_idx!(block.body, ref.ssa_idx, idx, stmt, type, flag)
+    return Instruction(idx, block)
 end
 
-function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, typ,
+function insert_after_idx!(m::SSAMap, after_idx::Int, new_idx::Int, stmt, type,
                            flag::UInt32=UInt32(0))
-    pos = findfirst(==(after_idx), m.ssa_idxes)
-    pos === nothing && throw(KeyError(after_idx))
+    pos = get(m.pos_by_idx, after_idx, 0)
+    pos == 0 && throw(KeyError(after_idx))
     insert!(m.ssa_idxes, pos + 1, new_idx)
     insert!(m.stmts, pos + 1, stmt)
-    insert!(m.types, pos + 1, typ)
+    insert!(m.types, pos + 1, type)
     insert!(m.flags, pos + 1, flag)
+    # Positions ≥ pos+1 have shifted up by one; new entry sits at `pos+1`.
+    for j in pos+1:length(m.ssa_idxes)
+        m.pos_by_idx[m.ssa_idxes[j]] = j
+    end
 end
 
 """
-    insert_before!(block::Block, ref::SSAValue, stmt, typ; flag=0) -> Instruction
+    insert_before!(block::Block, ref::SSAValue, stmt, type; flag=0) -> Instruction
 
 Insert a new instruction before the instruction at SSA index `ref.id`.
 """
-function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ);
+function insert_before!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(type);
                         flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_before_idx!(block.body, ref.id, idx, stmt, typ, flag)
+    insert_before_idx!(block.body, ref.id, idx, stmt, type, flag)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, flag, block)
+    return Instruction(idx, block)
 end
 
 """
-    insert_after!(block::Block, ref::SSAValue, stmt, typ; flag=0) -> Instruction
+    insert_after!(block::Block, ref::SSAValue, stmt, type; flag=0) -> Instruction
 
 Insert a new instruction after the instruction at SSA index `ref.id`.
 """
-function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(typ);
+function insert_after!(block::Block, ref::SSAValue, @nospecialize(stmt), @nospecialize(type);
                        flag::UInt32=UInt32(0))
     sci = root(block)
     sci.max_ssa_idx += 1
     idx = sci.max_ssa_idx
-    insert_after_idx!(block.body, ref.id, idx, stmt, typ, flag)
+    insert_after_idx!(block.body, ref.id, idx, stmt, type, flag)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
             b.parent = block
         end
     end
-    return Instruction(idx, stmt, typ, flag, block)
+    return Instruction(idx, block)
 end
 
 
@@ -519,7 +605,7 @@ function users(block::Block, @nospecialize(val))
     for b in eachblock(block)
         for inst in instructions(b)
             inst.ssa_idx in seen && continue
-            _references(inst.stmt, target) || continue
+            _references(inst[:stmt], target) || continue
             push!(seen, inst.ssa_idx)
             push!(result, inst)
         end
@@ -870,8 +956,9 @@ function _walk_pre!(f, block::Block)
     for inst in instructions(block)
         result = f(inst, block)
         result === :interrupt && return :interrupt
-        if stmt(inst) isa ControlFlowOp && result !== :skip
-            for b in blocks(stmt(inst))
+        s = inst[:stmt]
+        if s isa ControlFlowOp && result !== :skip
+            for b in blocks(s)
                 _walk_pre!(f, b) === :interrupt && return :interrupt
             end
         end
@@ -881,8 +968,9 @@ end
 
 function _walk_post!(f, block::Block)
     for inst in instructions(block)
-        if stmt(inst) isa ControlFlowOp
-            for b in blocks(stmt(inst))
+        s = inst[:stmt]
+        if s isa ControlFlowOp
+            for b in blocks(s)
                 _walk_post!(f, b) === :interrupt && return :interrupt
             end
         end
@@ -928,7 +1016,7 @@ function resolve_call(block::Block, @nospecialize(stmt))
     return (resolved, operands)
 end
 
-resolve_call(block::Block, inst::Instruction) = resolve_call(block, inst.stmt)
+resolve_call(block::Block, inst::Instruction) = resolve_call(block, inst[:stmt])
 
 """
     resolve_callee(block::Block, ref) -> resolved_func or nothing
@@ -969,7 +1057,7 @@ iscall(@nospecialize(stmt)) = stmt isa Expr && (stmt.head === :call || stmt.head
 
 Convenience overload: checks the underlying statement.
 """
-iscall(inst::Instruction) = iscall(inst.stmt)
+iscall(inst::Instruction) = iscall(inst[:stmt])
 
 """
     callee(stmt::Expr) -> Any
@@ -992,7 +1080,7 @@ end
 
 Convenience overload: extracts callee from the underlying statement.
 """
-callee(inst::Instruction) = callee(inst.stmt::Expr)
+callee(inst::Instruction) = callee(inst[:stmt]::Expr)
 
 """
     callargs(stmt::Expr) -> SubArray
@@ -1014,7 +1102,7 @@ end
 
 Convenience overload: extracts call arguments from the underlying statement.
 """
-callargs(inst::Instruction) = callargs(inst.stmt::Expr)
+callargs(inst::Instruction) = callargs(inst[:stmt]::Expr)
 
 
 #=============================================================================
@@ -1031,7 +1119,7 @@ Returns `Any[]` for unknown statement types.
 
 Extend via `operands(::Block, s::MyType)` for domain-specific IR nodes.
 """
-operands(block::Block, inst::Instruction) = operands(block, inst.stmt)
+operands(block::Block, inst::Instruction) = operands(block, inst[:stmt])
 
 operands(::Block, s::PiNode) = Any[s.val]
 operands(::Block, s::ControlFlowOp) = operands(s)
@@ -1172,57 +1260,55 @@ end
 =============================================================================#
 
 """
-    move_before!(inst::Instruction, target::Instruction)
+    move_before!(inst::Instruction, target::Instruction) -> Instruction
 
 Move `inst` from its current block to just before `target` in `target`'s block.
-The instruction retains its SSA index. Sub-block parents are updated if the
-instruction is a `ControlFlowOp`.
+The instruction retains its SSA index, statement, type, and flags. Sub-block
+parents are updated if the instruction is a `ControlFlowOp`. Returns a fresh
+handle pointing into the destination block.
 
 Analogous to MLIR's `Operation::moveBefore`.
 """
 function move_before!(inst::Instruction, target::Instruction)
-    src = inst.block::Block
-    dst = target.block::Block
+    src = inst.block
+    dst = target.block
+    entry = src.body[inst.ssa_idx]
 
-    # Remove from source
     delete!(src.body, inst.ssa_idx)
+    insert_before_idx!(dst.body, target.ssa_idx, inst.ssa_idx,
+                       entry.stmt, entry.type, entry.flag)
 
-    # Insert before target in destination
-    insert_before_idx!(dst.body, target.ssa_idx, inst.ssa_idx, inst.stmt, inst.typ)
-
-    # Update sub-block parents
-    if inst.stmt isa ControlFlowOp
-        for b in blocks(inst.stmt)
+    if entry.stmt isa ControlFlowOp
+        for b in blocks(entry.stmt)
             b.parent = dst
         end
     end
-    return inst
+    return Instruction(inst.ssa_idx, dst)
 end
 
 """
-    move_after!(inst::Instruction, target::Instruction)
+    move_after!(inst::Instruction, target::Instruction) -> Instruction
 
 Move `inst` from its current block to just after `target` in `target`'s block.
-The instruction retains its SSA index. Sub-block parents are updated if the
-instruction is a `ControlFlowOp`.
+The instruction retains its SSA index, statement, type, and flags. Sub-block
+parents are updated if the instruction is a `ControlFlowOp`. Returns a fresh
+handle pointing into the destination block.
 
 Analogous to MLIR's `Operation::moveAfter`.
 """
 function move_after!(inst::Instruction, target::Instruction)
-    src = inst.block::Block
-    dst = target.block::Block
+    src = inst.block
+    dst = target.block
+    entry = src.body[inst.ssa_idx]
 
-    # Remove from source
     delete!(src.body, inst.ssa_idx)
+    insert_after_idx!(dst.body, target.ssa_idx, inst.ssa_idx,
+                      entry.stmt, entry.type, entry.flag)
 
-    # Insert after target in destination
-    insert_after_idx!(dst.body, target.ssa_idx, inst.ssa_idx, inst.stmt, inst.typ)
-
-    # Update sub-block parents
-    if inst.stmt isa ControlFlowOp
-        for b in blocks(inst.stmt)
+    if entry.stmt isa ControlFlowOp
+        for b in blocks(entry.stmt)
             b.parent = dst
         end
     end
-    return inst
+    return Instruction(inst.ssa_idx, dst)
 end

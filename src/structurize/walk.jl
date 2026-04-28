@@ -402,7 +402,7 @@ function tail_duplicate_branch!(b::Block, dest::Int,
     ctx.ssa_remap = saved_remap
 
     for (idx, entry) in sub_block.body
-        push!(b.body, (idx, entry.stmt, entry.typ, entry.flag))
+        push!(b.body, (idx, entry.stmt, entry.type, entry.flag))
     end
     b.terminator = sub_block.terminator
     return b

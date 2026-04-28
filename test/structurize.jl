@@ -591,7 +591,7 @@ end
 
     # Float64 type should be preserved in entry block types
     @test !isempty(sci.entry.body)
-    @test any(((_, entry),) -> entry.typ isa Type && entry.typ <: AbstractFloat, sci.entry.body)
+    @test any(p -> last(p).type isa Type && last(p).type <: AbstractFloat, sci.entry.body)
     @test @roundtrip (x -> x + 1.0)(3.14)
 end
 
@@ -650,7 +650,7 @@ end
     @test length(matches) == 1
     (_, entry) = only(matches)
     # Check that the result type is Tuple{} (no results), not Int
-    @test entry.typ === Tuple{}
+    @test entry.type === Tuple{}
 end
 
 @testset "while loop ConditionOp uses BlockArgs not SSAValues" begin
