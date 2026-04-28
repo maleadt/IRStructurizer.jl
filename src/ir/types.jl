@@ -51,57 +51,6 @@ Base.show(io::IO, u::Undef) = print(io, "undef::$(u.type)")
 const IRValue = Any
 
 #=============================================================================
- Instruction - convenience view over an SSAMap entry
-=============================================================================#
-
-"""
-    Instruction
-
-A handle into an SSAMap entry: an SSA index paired with the containing
-`Block`. Field reads/writes go through the live `Block.body` entry, so a
-handle held across mutations always sees the current `(stmt, type, flag)`.
-
-Yielded by `instructions(block)` and usable as a key in `UseIndex`.
-
-Field access is Symbol-keyed: `inst[:stmt]`, `inst[:type]`, `inst[:flag]`
-read the live entry; `inst[:stmt] = …` etc. write back. The containing
-block is `inst.block`; the SSA index is `inst.ssa_idx`. The polymorphic
-`value_type(inst)` is a convenience for `inst[:type]` and also accepts
-non-Instruction values (`SSAValue`, `BlockArgument`, …).
-
-Analogous to `Core.Compiler.Instruction` in `Compiler/src/ssair/ir.jl`,
-which is also a `(storage, key)` handle dispatching to parallel field
-vectors via `node[:stmt]` etc. — the difference being that the storage
-here is keyed by SSA index (preserved across structurization) rather
-than by dense position. Becomes stale on `delete!` of the underlying
-entry; identity (`==`, `hash`) is by `ssa_idx` only.
-"""
-struct Instruction
-    ssa_idx::Int
-    block::Any  # ::Block — untyped to avoid forward reference
-end
-
-"""Get the Julia type of the instruction result."""
-value_type(i::Instruction) = i[:type]
-
-"""Convert to SSAValue for use in operand positions."""
-Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)
-
-Base.:(==)(a::Instruction, b::Instruction) = a.ssa_idx == b.ssa_idx
-Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)
-
-function Base.show(io::IO, i::Instruction)
-    print(io, "Instruction(%$(i.ssa_idx)")
-    s = i[:stmt]
-    if s isa ControlFlowOp
-        print(io, " = ", typeof(s))
-    elseif s isa Expr
-        print(io, " = ", s.head, "(...)")
-    end
-    print(io, ")")
-end
-
-#=============================================================================
  SSAMap - ordered map from SSA index to (stmt, type)
 =============================================================================#
 
@@ -362,6 +311,60 @@ Base.iterate(block::Block) = iterate(block.body)
 Base.iterate(block::Block, state) = iterate(block.body, state)
 Base.length(block::Block) = length(block.body)
 Base.eltype(::Type{Block}) = eltype(SSAMap)
+
+#=============================================================================
+ Instruction - handle into an SSAMap entry
+=============================================================================#
+
+"""
+    Instruction
+
+A handle into an SSAMap entry: an SSA index paired with the containing
+`Block`. Field reads/writes go through the live `Block.body` entry, so a
+handle held across mutations always sees the current `(stmt, type, flag)`.
+
+Yielded by `instructions(block)` and usable as a key in `UseIndex`.
+
+Field access is Symbol-keyed: `inst[:stmt]`, `inst[:type]`, `inst[:flag]`
+read the live entry; `inst[:stmt] = …` etc. write back. The containing
+block is `inst.block`; the SSA index is `inst.ssa_idx`. The polymorphic
+`value_type(inst)` is a convenience for `inst[:type]` and also accepts
+non-Instruction values (`SSAValue`, `BlockArgument`, …).
+
+Analogous to `Core.Compiler.Instruction` in `Compiler/src/ssair/ir.jl`,
+which is also a `(storage, key)` handle dispatching to parallel field
+vectors via `node[:stmt]` etc. — the difference being that the storage
+here is keyed by SSA index (preserved across structurization) rather
+than by dense position. Becomes stale on `delete!` of the underlying
+entry; identity (`==`, `hash`) is by `ssa_idx` only — sound because SSA
+indices are globally unique within a `StructuredIRCode` and never reused
+after `delete!` (allocated via `max_ssa_idx`, enforced by
+`validate_ssa_uniqueness`).
+"""
+struct Instruction
+    ssa_idx::Int
+    block::Block
+end
+
+"""Get the Julia type of the instruction result."""
+value_type(i::Instruction) = i[:type]
+
+"""Convert to SSAValue for use in operand positions."""
+Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)
+
+Base.:(==)(a::Instruction, b::Instruction) = a.ssa_idx == b.ssa_idx
+Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)
+
+function Base.show(io::IO, i::Instruction)
+    print(io, "Instruction(%$(i.ssa_idx)")
+    s = i[:stmt]
+    if s isa ControlFlowOp
+        print(io, " = ", typeof(s))
+    elseif s isa Expr
+        print(io, " = ", s.head, "(...)")
+    end
+    print(io, ")")
+end
 
 #=============================================================================
  Block accessors (LLVM.jl-style)

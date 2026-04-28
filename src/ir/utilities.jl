@@ -150,7 +150,7 @@ Read a field of the instruction's live entry in the containing block.
 function Base.getindex(inst::Instruction, fld::Symbol)
     fld === :ssa_idx && return inst.ssa_idx
     fld === :block   && return inst.block
-    m = (inst.block::Block).body
+    m = inst.block.body
     i = get(m.pos_by_idx, inst.ssa_idx, 0)
     i == 0 && throw(KeyError(inst.ssa_idx))
     fld === :stmt && return m.stmts[i]
@@ -167,7 +167,7 @@ end
 Write a single field of the instruction's live entry. Other fields are preserved.
 """
 function Base.setindex!(inst::Instruction, @nospecialize(val), fld::Symbol)
-    m = (inst.block::Block).body
+    m = inst.block.body
     i = get(m.pos_by_idx, inst.ssa_idx, 0)
     i == 0 && throw(KeyError(inst.ssa_idx))
     if fld === :stmt
@@ -1270,8 +1270,8 @@ handle pointing into the destination block.
 Analogous to MLIR's `Operation::moveBefore`.
 """
 function move_before!(inst::Instruction, target::Instruction)
-    src = inst.block::Block
-    dst = target.block::Block
+    src = inst.block
+    dst = target.block
     entry = src.body[inst.ssa_idx]
 
     delete!(src.body, inst.ssa_idx)
@@ -1297,8 +1297,8 @@ handle pointing into the destination block.
 Analogous to MLIR's `Operation::moveAfter`.
 """
 function move_after!(inst::Instruction, target::Instruction)
-    src = inst.block::Block
-    dst = target.block::Block
+    src = inst.block
+    dst = target.block
     entry = src.body[inst.ssa_idx]
 
     delete!(src.body, inst.ssa_idx)
