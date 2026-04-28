@@ -106,7 +106,7 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
     for (idx, entry) in block.body
         stmt = entry.stmt
         if stmt isa IfOp
-            validate_if_terminators!(errors, sci, stmt, idx, entry.typ)
+            validate_if_terminators!(errors, sci, stmt, idx, entry.type)
         elseif stmt isa ForOp
             validate_for_terminators!(errors, sci, stmt, idx)
         elseif stmt isa WhileOp
@@ -460,7 +460,7 @@ resolve_type(sci::StructuredIRCode, value) = typeof(value)
 function resolve_type(sci::StructuredIRCode, value::SSAValue)
     for block in eachblock(sci)
         entry = get(block.body, value.id, nothing)
-        entry !== nothing && return entry.typ
+        entry !== nothing && return entry.type
     end
     return nothing
 end

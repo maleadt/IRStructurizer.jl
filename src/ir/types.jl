@@ -66,7 +66,7 @@ Analogous to MLIR's `Operation` which knows its parent `Block` via `getBlock()`.
 struct Instruction
     ssa_idx::Int
     stmt::Any
-    typ::Any
+    type::Any
     flag::UInt32  # IR_FLAG_* bitmask from Julia inference; 0 (IR_FLAG_NULL) if synthesized
     block::Any  # ::Block — untyped to avoid forward reference
 end
@@ -74,11 +74,11 @@ end
 # Convenience: construct without an explicit flag (defaults to IR_FLAG_NULL).
 # Matches the pre-`flag` constructor signature for callers that don't yet
 # carry per-stmt flags through.
-Instruction(ssa_idx::Int, @nospecialize(stmt), @nospecialize(typ), @nospecialize(block)) =
-    Instruction(ssa_idx, stmt, typ, UInt32(0), block)
+Instruction(ssa_idx::Int, @nospecialize(stmt), @nospecialize(type), @nospecialize(block)) =
+    Instruction(ssa_idx, stmt, type, UInt32(0), block)
 
 """Get the Julia type of the instruction result."""
-value_type(i::Instruction) = i.typ
+value_type(i::Instruction) = i.type
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
 stmt(i::Instruction) = i.stmt
@@ -112,23 +112,24 @@ end
 =============================================================================#
 
 """
-    SSAMap <: AbstractDict{Int, NamedTuple{(:stmt, :typ, :flag)}}
+    SSAMap <: AbstractDict{Int, NamedTuple{(:stmt, :type, :flag)}}
 
-An ordered map from SSA indices to `(; stmt, typ, flag)` entries.
+An ordered map from SSA indices to `(; stmt, type, flag)` entries.
 Used to store block body contents with their original Julia SSA indices.
 
 `flag` is the per-statement `IR_FLAG_*` bitmask carried over from
 `IRCode.stmts.flag` at structurization (see `Compiler/src/optimize.jl`),
 or `0` (`IR_FLAG_NULL`) for statements synthesized after structurization.
 
-Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, typ, flag)` or throws `KeyError`,
-`get(m, ssa_idx, default)` returns `default` if missing.
-Iteration yields `idx => (; stmt, typ, flag)` pairs.
+Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, type, flag)` or throws `KeyError`,
+`get(m, ssa_idx, default)` returns `default` if missing. `setindex!` accepts any
+NamedTuple subset of `(stmt, type, flag)` — fields not mentioned are preserved.
+Iteration yields `idx => (; stmt, type, flag)` pairs.
 
 Note: Currently uses linear scan for lookup. If this becomes a bottleneck,
 consider switching to `OrderedDict{Int, NamedTuple}` for O(1) access.
 """
-struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, typ::Any, flag::UInt32}}
+struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, type::Any, flag::UInt32}}
     ssa_idxes::Vector{Int}
     stmts::Vector{Any}
     types::Vector{Any}
@@ -137,11 +138,11 @@ end
 
 SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[])
 
-# Iteration yields idx => (; stmt, typ, flag) pairs
+# Iteration yields idx => (; stmt, type, flag) pairs
 function Base.iterate(m::SSAMap, state::Int=1)
     state > length(m.ssa_idxes) && return nothing
     idx = m.ssa_idxes[state]
-    entry = (; stmt=m.stmts[state], typ=m.types[state], flag=m.flags[state])
+    entry = (; stmt=m.stmts[state], type=m.types[state], flag=m.flags[state])
     return Pair(idx, entry), state + 1
 end
 
@@ -152,13 +153,13 @@ Base.haskey(m::SSAMap, ssa_idx::Int) = findfirst(==(ssa_idx), m.ssa_idxes) !== n
 function Base.getindex(m::SSAMap, ssa_idx::Int)
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && throw(KeyError(ssa_idx))
-    return (; stmt=m.stmts[i], typ=m.types[i], flag=m.flags[i])
+    return (; stmt=m.stmts[i], type=m.types[i], flag=m.flags[i])
 end
 
 function Base.get(m::SSAMap, ssa_idx::Int, default)
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && return default
-    return (; stmt=m.stmts[i], typ=m.types[i], flag=m.flags[i])
+    return (; stmt=m.stmts[i], type=m.types[i], flag=m.flags[i])
 end
 
 # Push raw tuple. The 3-tuple form defaults the flag to IR_FLAG_NULL (0) — used
@@ -166,14 +167,14 @@ end
 # The 4-tuple form takes an explicit flag and is used by the IRCode ingestion
 # site (and by structurizer-internal sites that *relocate* an existing stmt and
 # want to preserve its flag).
-function Base.push!(m::SSAMap, (idx, stmt, typ)::Tuple{Int,Any,Any})
-    push!(m, (idx, stmt, typ, UInt32(0)))
+function Base.push!(m::SSAMap, (idx, stmt, type)::Tuple{Int,Any,Any})
+    push!(m, (idx, stmt, type, UInt32(0)))
 end
 
-function Base.push!(m::SSAMap, (idx, stmt, typ, flag)::Tuple{Int,Any,Any,UInt32})
+function Base.push!(m::SSAMap, (idx, stmt, type, flag)::Tuple{Int,Any,Any,UInt32})
     push!(m.ssa_idxes, idx)
     push!(m.stmts, stmt)
-    push!(m.types, typ)
+    push!(m.types, type)
     push!(m.flags, flag)
     return nothing
 end
@@ -184,22 +185,17 @@ statements(m::SSAMap) = (stmt for stmt in m.stmts)
 types(m::SSAMap) = (typ for typ in m.types)
 flags(m::SSAMap) = (f for f in m.flags)
 
-# Mutation: setindex! for replacing a statement in-place. Two-field form
-# preserves the existing flag; three-field form overwrites it.
-function Base.setindex!(m::SSAMap, entry::NamedTuple{(:stmt, :typ)}, ssa_idx::Int)
+# Mutation: setindex! accepts any NamedTuple subset of (stmt, type, flag).
+# Fields not mentioned are preserved — `m[idx] = (type=Float64,)` overwrites
+# only the type, keeping stmt and flag.
+function Base.setindex!(m::SSAMap, entry::NamedTuple{names}, ssa_idx::Int) where {names}
+    names ⊆ (:stmt, :type, :flag) ||
+        throw(ArgumentError("SSAMap entry keys must be a subset of (:stmt, :type, :flag), got $names"))
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && throw(KeyError(ssa_idx))
-    m.stmts[i] = entry.stmt
-    m.types[i] = entry.typ
-    return entry
-end
-
-function Base.setindex!(m::SSAMap, entry::NamedTuple{(:stmt, :typ, :flag)}, ssa_idx::Int)
-    i = findfirst(==(ssa_idx), m.ssa_idxes)
-    i === nothing && throw(KeyError(ssa_idx))
-    m.stmts[i] = entry.stmt
-    m.types[i] = entry.typ
-    m.flags[i] = entry.flag
+    haskey(entry, :stmt) && (m.stmts[i] = entry.stmt)
+    haskey(entry, :type) && (m.types[i] = entry.type)
+    haskey(entry, :flag) && (m.flags[i] = entry.flag)
     return entry
 end
 
@@ -298,7 +294,7 @@ abstract type ControlFlowOp end
     Block
 
 A block of statements with block arguments and a terminator.
-Body is an SSAMap mapping SSA indices to (stmt, type) entries.
+Body is an SSAMap mapping SSA indices to (; stmt, type, flag) entries.
 """
 mutable struct Block
     args::Vector{BlockArgument}
@@ -320,14 +316,14 @@ function Base.empty!(block::Block)
 end
 
 """
-    push!(block::Block, idx::Int, stmt, typ, [flag])
+    push!(block::Block, idx::Int, stmt, type, [flag])
 
 Push a statement or control flow op to a block with its SSA index, type, and
 optional `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`).
 """
-function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(typ),
+function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(type),
                     flag::UInt32=UInt32(0))
-    push!(block.body, (idx, stmt, typ, flag))
+    push!(block.body, (idx, stmt, type, flag))
     # Set parent on sub-blocks when a CF op is inserted (like LLVM's addNodeToList)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
@@ -353,17 +349,17 @@ function Base.show(io::IO, block::Block)
     if !isempty(block.args)
         print(io, "args=", length(block.args), ", ")
     end
-    n_ops = count(((_, item, _),) -> item isa ControlFlowOp, block.body)
+    n_ops = count(p -> last(p).stmt isa ControlFlowOp, block.body)
     n_exprs = length(block.body) - n_ops
     print(io, n_exprs + n_ops, " items")
     print(io, ")")
 end
 
-# Iteration protocol for Block - yields (idx, stmt, typ) triples (legacy)
+# Iteration protocol for Block - delegates to SSAMap, yielding idx => (; stmt, type, flag)
 Base.iterate(block::Block) = iterate(block.body)
 Base.iterate(block::Block, state) = iterate(block.body, state)
 Base.length(block::Block) = length(block.body)
-Base.eltype(::Type{Block}) = Tuple{Int,Any,Any}
+Base.eltype(::Type{Block}) = eltype(SSAMap)
 
 #=============================================================================
  Block accessors (LLVM.jl-style)

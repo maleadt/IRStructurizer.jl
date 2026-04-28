@@ -14,7 +14,7 @@
     @test !isempty(insts)
     @test all(i -> i isa Instruction, insts)
 
-    # Each Instruction bundles ssa_idx, stmt, typ, flag
+    # Each Instruction bundles ssa_idx, stmt, type, flag
     inst = first(insts)
     @test value_type(inst) isa Type
     @test SSAValue(inst) isa SSAValue
@@ -168,7 +168,7 @@ end  # types & accessors
     @test bp < rp < ap
 end
 
-@testset "pushfirst!(block, stmt, typ)" begin
+@testset "pushfirst!(block, stmt, type)" begin
     sci, _ = code_structured(Tuple{Int}) do x::Int
         x + 1
     end |> only
@@ -250,21 +250,51 @@ end
     @test !(42 ∈ sci.entry)
 end
 
-@testset "update_type!(block, inst, new_type)" begin
+@testset "inst[:type] = T (Symbol-keyed setindex!)" begin
     sci, _ = code_structured(Tuple{Int}) do x::Int
         x + 1
     end |> only
 
     inst = first(instructions(sci.entry))
-    old_type = value_type(inst)
-    update_type!(sci.entry, inst, Float64)
+    inst[:type] = Float64
 
-    # Re-read from block to verify
-    updated = first(instructions(sci.entry))
-    @test value_type(updated) == Float64
+    # Live read via Symbol; the mutation round-trips.
+    @test inst[:type] == Float64
+    # Re-fetching from the block agrees.
+    @test first(instructions(sci.entry))[:type] == Float64
 end
 
-@testset "new_block_arg!(block, typ)" begin
+@testset "block[ssa_idx] = (...) — partial NamedTuple updates" begin
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+    inst = first(instructions(sci.entry))
+    idx = inst.ssa_idx
+
+    # block[idx] returns the Instruction handle.
+    @test sci.entry[idx] isa Instruction
+    @test sci.entry[idx].ssa_idx == idx
+
+    # Single-field write via block: only :type changes; stmt and flag preserved.
+    orig_stmt = inst[:stmt]
+    orig_flag = inst[:flag]
+    sci.entry[idx] = (type=Float32,)
+    @test sci.entry[idx][:type] == Float32
+    @test sci.entry[idx][:stmt] === orig_stmt
+    @test sci.entry[idx][:flag] === orig_flag
+
+    # Replace stmt; flag preservation is the caller's choice (no implicit
+    # reset). Pass IR_FLAG_NULL explicitly for the LLVM-style safe default.
+    new_stmt = Expr(:call, +, Core.Argument(2), 2)
+    sci.entry[idx] = (stmt=new_stmt, flag=UInt32(0))
+    @test sci.entry[idx][:stmt] === new_stmt
+    @test sci.entry[idx][:flag] == UInt32(0)
+
+    # Symbol-keyed setindex! errors on unknown fields.
+    @test_throws ArgumentError (inst[:bogus] = 1)
+end
+
+@testset "new_block_arg!(block, type)" begin
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
@@ -1089,8 +1119,10 @@ end  # loop carries
     @test resolve_call(block, 42) === nothing
     @test resolve_call(block, Expr(:new, :Foo)) === nothing
 
-    # Instruction overload
-    inst = Instruction(1, expr_call, Int, UInt32(0), Block())
+    # Instruction overload — synthetic Instruction pointing into a fresh block
+    fake_block = Block()
+    push!(fake_block.body, (1, expr_call, Int, UInt32(0)))
+    inst = fake_block[1]
     result3 = resolve_call(block, inst)
     @test result3 !== nothing
     @test first(result3) === Base.:+
@@ -1155,8 +1187,10 @@ end
     @test !iscall(42)
     @test !iscall(Expr(:new, :Foo))
 
-    # Instruction overloads
-    inst = Instruction(1, expr_call, Int, UInt32(0), Block())
+    # Instruction overloads — synthetic Instruction pointing into a fresh block
+    fake_block = Block()
+    push!(fake_block.body, (1, expr_call, Int, UInt32(0)))
+    inst = fake_block[1]
     @test iscall(inst)
     @test callee(inst) == GlobalRef(Base, :+)
     @test length(callargs(inst)) == 2
