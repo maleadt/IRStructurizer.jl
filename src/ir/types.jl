@@ -67,14 +67,26 @@ struct Instruction
     ssa_idx::Int
     stmt::Any
     typ::Any
+    flag::UInt32  # IR_FLAG_* bitmask from Julia inference; 0 (IR_FLAG_NULL) if synthesized
     block::Any  # ::Block — untyped to avoid forward reference
 end
+
+# Convenience: construct without an explicit flag (defaults to IR_FLAG_NULL).
+# Matches the pre-`flag` constructor signature for callers that don't yet
+# carry per-stmt flags through.
+Instruction(ssa_idx::Int, @nospecialize(stmt), @nospecialize(typ), @nospecialize(block)) =
+    Instruction(ssa_idx, stmt, typ, UInt32(0), block)
 
 """Get the Julia type of the instruction result."""
 value_type(i::Instruction) = i.typ
 
 """Get the underlying statement (Expr, ControlFlowOp, etc.)."""
 stmt(i::Instruction) = i.stmt
+
+"""Get the per-statement IR flag bitmask (e.g. `IR_FLAG_EFFECT_FREE`).
+Carried through from `IRCode.stmts.flag` at structurization; 0 for stmts
+synthesized by the structurizer or by downstream passes."""
+flag(i::Instruction) = i.flag
 
 """Get the block containing this instruction."""
 block(i::Instruction) = i.block
@@ -100,31 +112,36 @@ end
 =============================================================================#
 
 """
-    SSAMap <: AbstractDict{Int, NamedTuple{(:stmt, :typ)}}
+    SSAMap <: AbstractDict{Int, NamedTuple{(:stmt, :typ, :flag)}}
 
-An ordered map from SSA indices to `(; stmt, typ)` entries.
+An ordered map from SSA indices to `(; stmt, typ, flag)` entries.
 Used to store block body contents with their original Julia SSA indices.
 
-Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, typ)` or throws `KeyError`,
+`flag` is the per-statement `IR_FLAG_*` bitmask carried over from
+`IRCode.stmts.flag` at structurization (see `Compiler/src/optimize.jl`),
+or `0` (`IR_FLAG_NULL`) for statements synthesized after structurization.
+
+Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, typ, flag)` or throws `KeyError`,
 `get(m, ssa_idx, default)` returns `default` if missing.
-Iteration yields `idx => (; stmt, typ)` pairs, enabling `filter(p -> p.second.stmt isa Foo, m)`.
+Iteration yields `idx => (; stmt, typ, flag)` pairs.
 
 Note: Currently uses linear scan for lookup. If this becomes a bottleneck,
 consider switching to `OrderedDict{Int, NamedTuple}` for O(1) access.
 """
-struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, typ::Any}}
+struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, typ::Any, flag::UInt32}}
     ssa_idxes::Vector{Int}
     stmts::Vector{Any}
     types::Vector{Any}
+    flags::Vector{UInt32}  # IR_FLAG_* bitmask per stmt; parallel to stmts/types
 end
 
-SSAMap() = SSAMap(Int[], Any[], Any[])
+SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[])
 
-# Iteration yields idx => (; stmt, typ) pairs
+# Iteration yields idx => (; stmt, typ, flag) pairs
 function Base.iterate(m::SSAMap, state::Int=1)
     state > length(m.ssa_idxes) && return nothing
     idx = m.ssa_idxes[state]
-    entry = (; stmt=m.stmts[state], typ=m.types[state])
+    entry = (; stmt=m.stmts[state], typ=m.types[state], flag=m.flags[state])
     return Pair(idx, entry), state + 1
 end
 
@@ -135,20 +152,29 @@ Base.haskey(m::SSAMap, ssa_idx::Int) = findfirst(==(ssa_idx), m.ssa_idxes) !== n
 function Base.getindex(m::SSAMap, ssa_idx::Int)
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && throw(KeyError(ssa_idx))
-    return (; stmt=m.stmts[i], typ=m.types[i])
+    return (; stmt=m.stmts[i], typ=m.types[i], flag=m.flags[i])
 end
 
 function Base.get(m::SSAMap, ssa_idx::Int, default)
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && return default
-    return (; stmt=m.stmts[i], typ=m.types[i])
+    return (; stmt=m.stmts[i], typ=m.types[i], flag=m.flags[i])
 end
 
-# Push raw tuple
+# Push raw tuple. The 3-tuple form defaults the flag to IR_FLAG_NULL (0) — used
+# by passes that synthesize new statements without an inferred flag of origin.
+# The 4-tuple form takes an explicit flag and is used by the IRCode ingestion
+# site (and by structurizer-internal sites that *relocate* an existing stmt and
+# want to preserve its flag).
 function Base.push!(m::SSAMap, (idx, stmt, typ)::Tuple{Int,Any,Any})
+    push!(m, (idx, stmt, typ, UInt32(0)))
+end
+
+function Base.push!(m::SSAMap, (idx, stmt, typ, flag)::Tuple{Int,Any,Any,UInt32})
     push!(m.ssa_idxes, idx)
     push!(m.stmts, stmt)
     push!(m.types, typ)
+    push!(m.flags, flag)
     return nothing
 end
 
@@ -156,13 +182,24 @@ end
 indices(m::SSAMap) = (idx for idx in m.ssa_idxes)
 statements(m::SSAMap) = (stmt for stmt in m.stmts)
 types(m::SSAMap) = (typ for typ in m.types)
+flags(m::SSAMap) = (f for f in m.flags)
 
-# Mutation: setindex! for replacing a statement in-place
+# Mutation: setindex! for replacing a statement in-place. Two-field form
+# preserves the existing flag; three-field form overwrites it.
 function Base.setindex!(m::SSAMap, entry::NamedTuple{(:stmt, :typ)}, ssa_idx::Int)
     i = findfirst(==(ssa_idx), m.ssa_idxes)
     i === nothing && throw(KeyError(ssa_idx))
     m.stmts[i] = entry.stmt
     m.types[i] = entry.typ
+    return entry
+end
+
+function Base.setindex!(m::SSAMap, entry::NamedTuple{(:stmt, :typ, :flag)}, ssa_idx::Int)
+    i = findfirst(==(ssa_idx), m.ssa_idxes)
+    i === nothing && throw(KeyError(ssa_idx))
+    m.stmts[i] = entry.stmt
+    m.types[i] = entry.typ
+    m.flags[i] = entry.flag
     return entry
 end
 
@@ -173,6 +210,7 @@ function Base.delete!(m::SSAMap, ssa_idx::Int)
     deleteat!(m.ssa_idxes, i)
     deleteat!(m.stmts, i)
     deleteat!(m.types, i)
+    deleteat!(m.flags, i)
     return m
 end
 
@@ -282,12 +320,14 @@ function Base.empty!(block::Block)
 end
 
 """
-    push!(block::Block, idx::Int, stmt, typ)
+    push!(block::Block, idx::Int, stmt, typ, [flag])
 
-Push a statement or control flow op to a block with its SSA index and type.
+Push a statement or control flow op to a block with its SSA index, type, and
+optional `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`).
 """
-function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(typ))
-    push!(block.body, (idx, stmt, typ))
+function Base.push!(block::Block, idx::Int, @nospecialize(stmt), @nospecialize(typ),
+                    flag::UInt32=UInt32(0))
+    push!(block.body, (idx, stmt, typ, flag))
     # Set parent on sub-blocks when a CF op is inserted (like LLVM's addNodeToList)
     if stmt isa ControlFlowOp
         for b in blocks(stmt)
@@ -350,7 +390,8 @@ Base.eltype(::Type{InstructionIterator}) = Instruction
 function Base.iterate(it::InstructionIterator, state::Int=1)
     m = it.block.body
     state > length(m.ssa_idxes) && return nothing
-    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state], it.block)
+    inst = Instruction(m.ssa_idxes[state], m.stmts[state], m.types[state],
+                       m.flags[state], it.block)
     return inst, state + 1
 end
 
@@ -608,6 +649,10 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     sptypes = copy(ir.sptypes)
     stmts = ir.stmts.stmt
     types = ir.stmts.type
+    # Per-statement IR_FLAG_* bitmask (see Compiler/src/optimize.jl). Inference
+    # and the inliner populate this with effect-freeness, nothrow, etc.; we
+    # carry it through so SCI passes can consult effects without re-deriving.
+    flags = ir.stmts.flag
     n = length(stmts)
 
     # Capture debug info: negative values = direct reference into table
@@ -633,7 +678,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         if stmt isa ReturnNode
             entry.terminator = stmt
         else
-            push!(entry, i, stmt, types[i])
+            push!(entry, i, stmt, types[i], flags[i])
         end
     end
 
