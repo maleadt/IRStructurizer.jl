@@ -17,9 +17,9 @@
     # Each Instruction is a handle exposing ssa_idx, stmt, type, flag
     inst = first(insts)
     @test value_type(inst) isa Type
+    @test value_type(inst) === inst[:type]
     @test SSAValue(inst) isa SSAValue
-    @test flag(inst) isa UInt32
-    @test inst[:flag] === flag(inst)
+    @test inst[:flag] isa UInt32
 end
 
 @testset "per-stmt flag carried through from IRCode" begin
@@ -32,9 +32,9 @@ end
     end |> only
     found_pure = false
     for inst in instructions(sci.entry)
-        s = stmt(inst)
+        s = inst[:stmt]
         if s isa Expr && s.head === :call
-            (flag(inst) & Core.Compiler.IR_FLAG_EFFECT_FREE) != 0 && (found_pure = true; break)
+            (inst[:flag] & Core.Compiler.IR_FLAG_EFFECT_FREE) != 0 && (found_pure = true; break)
         end
     end
     @test found_pure
@@ -55,7 +55,7 @@ end
     @test inst[:type] === Float64
 
     inst[:flag] = UInt32(0)
-    @test flag(inst) === UInt32(0)
+    @test inst[:flag] === UInt32(0)
 
     # A second handle to the same SSA index sees the same live entry.
     other = sci.entry[inst.ssa_idx]
@@ -78,8 +78,8 @@ end
 
     # ForOp body has arguments (IV + carries)
     for inst in instructions(sci.entry)
-        if stmt(inst) isa ForOp
-            body_args = arguments(stmt(inst).body)
+        if inst[:stmt] isa ForOp
+            body_args = arguments(inst[:stmt].body)
             @test !isempty(body_args)
             @test all(a -> a isa BlockArgument, body_args)
             break
@@ -139,8 +139,8 @@ end
     end |> only
 
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
-            bs = blocks(stmt(inst))
+        if inst[:stmt] isa IfOp
+            bs = blocks(inst[:stmt])
             @test length(bs) == 2
             @test all(b -> b isa Block, bs)
             break
@@ -246,7 +246,7 @@ end
     # Find a loop and check its body
     loop_op = nothing
     for inst in instructions(sci.entry)
-        s = stmt(inst)
+        s = inst[:stmt]
         if s isa ForOp || s isa WhileOp || s isa LoopOp
             loop_op = s
             break
@@ -328,7 +328,7 @@ end
 
     # Find a loop body block with args
     for inst in instructions(sci.entry)
-        op = stmt(inst)
+        op = inst[:stmt]
         op isa ForOp || continue
 
         old_n = length(arguments(op.body))
@@ -396,8 +396,8 @@ end  # block mutation
 
     # Nested block parent is the entry block
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
-            then_blk = stmt(inst).then_region
+        if inst[:stmt] isa IfOp
+            then_blk = inst[:stmt].then_region
             @test parent(then_blk) === sci.entry
             @test IRStructurizer.root(then_blk) === sci
             break
@@ -447,7 +447,7 @@ end
     end |> only
 
     for inst in instructions(sci.entry)
-        op = stmt(inst)
+        op = inst[:stmt]
         if op isa ForOp
             terms = reachable_terminators(op.body)
             @test !isempty(terms)
@@ -544,20 +544,20 @@ end
     @test Set(i.ssa_idx for i in post_insts) == Set(i.ssa_idx for i in pre_insts)
 
     # In preorder, the IfOp should come before instructions inside it
-    ifop_idx = findfirst(i -> stmt(i) isa IfOp, pre_insts)
+    ifop_idx = findfirst(i -> i[:stmt] isa IfOp, pre_insts)
     @test ifop_idx !== nothing
     # Instructionructions after the IfOp in preorder should include nested ones
     @test length(pre_insts) > ifop_idx
 
     # In postorder, the IfOp should come after instructions inside it
-    ifop_idx_post = findfirst(i -> stmt(i) isa IfOp, post_insts)
+    ifop_idx_post = findfirst(i -> i[:stmt] isa IfOp, post_insts)
     @test ifop_idx_post > 1  # nested instructions come first
 
     # Skip: don't recurse into IfOp
     skip_insts = Instruction[]
     walk(sci) do inst, block
         push!(skip_insts, inst)
-        stmt(inst) isa IfOp && return :skip
+        inst[:stmt] isa IfOp && return :skip
         return :advance
     end
     @test length(skip_insts) < length(pre_insts)
@@ -817,7 +817,7 @@ end  # use tracking
 
     found = false
     for inst in instructions(sci.entry)
-        op = stmt(inst)
+        op = inst[:stmt]
         op isa ForOp || continue
         c = carries(op)
         @test length(c) == length(op.init_values)
@@ -1156,7 +1156,7 @@ end  # loop carries
     # to test the type-based resolution path
     callee_ssa_idx = nothing
     for inst in instructions(block)
-        s = stmt(inst)
+        s = inst[:stmt]
         s isa Expr && s.head === :call || continue
         # This SSA defines a call result; create a synthetic :call that uses
         # a different SSA (one typed as a singleton function) as the callee.
@@ -1247,8 +1247,8 @@ end
 
     # Find an SSAValue defined in the entry block and look it up from a nested block
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
-            ifop = stmt(inst)
+        if inst[:stmt] isa IfOp
+            ifop = inst[:stmt]
             then_blk = ifop.then_region
             # The condition SSAValue is defined in the entry block
             cond = ifop.condition
@@ -1274,7 +1274,7 @@ end
 
     found = false
     for inst in instructions(sci.entry)
-        op = stmt(inst)
+        op = inst[:stmt]
         op isa IRStructurizer.ControlFlowOp || continue
         for blk in blocks(op)
             if !isempty(arguments(blk))
@@ -1327,8 +1327,8 @@ end  # value_type(block, val)
     end |> only
 
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
-            ops = operands(stmt(inst))
+        if inst[:stmt] isa IfOp
+            ops = operands(inst[:stmt])
             @test length(ops) == 1
             @test ops[1] isa SSAValue  # the condition
             break
@@ -1349,8 +1349,8 @@ end
 
     found = false
     walk(sci) do inst, block
-        if stmt(inst) isa ForOp
-            op = stmt(inst)
+        if inst[:stmt] isa ForOp
+            op = inst[:stmt]
             ops = operands(op)
             # lower, upper, step, plus any init_values
             @test length(ops) >= 3
@@ -1371,8 +1371,8 @@ end
 
     found = false
     walk(sci) do inst, block
-        if stmt(inst) isa WhileOp
-            op = stmt(inst)
+        if inst[:stmt] isa WhileOp
+            op = inst[:stmt]
             ops = operands(op)
             # init_values only (WhileOp has no explicit bounds)
             @test ops isa Vector
@@ -1397,8 +1397,8 @@ end
 
     found = false
     walk(sci) do inst, block
-        if stmt(inst) isa LoopOp
-            op = stmt(inst)
+        if inst[:stmt] isa LoopOp
+            op = inst[:stmt]
             ops = operands(op)
             @test ops isa Vector
             @test length(ops) == length(op.init_values)
@@ -1455,7 +1455,7 @@ end  # operands(block, inst)
     result = def(sci, SSAValue(inst1.ssa_idx))
     @test result !== nothing
     @test result.ssa_idx == inst1.ssa_idx
-    @test block(result) === sci.entry
+    @test result.block === sci.entry
 end
 
 @testset "nested block" begin
@@ -1465,13 +1465,13 @@ end
 
     # Find an SSAValue defined inside a nested block (then/else region)
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
-            op = stmt(inst)
+        if inst[:stmt] isa IfOp
+            op = inst[:stmt]
             inner_inst = first(instructions(op.then_region))
             result = def(sci, SSAValue(inner_inst.ssa_idx))
             @test result !== nothing
             @test result.ssa_idx == inner_inst.ssa_idx
-            @test block(result) === op.then_region
+            @test result.block === op.then_region
             break
         end
     end
@@ -1525,8 +1525,8 @@ end  # def
     for_op = nothing
     for b in eachblock(sci.entry)
         for inst in instructions(b)
-            if stmt(inst) isa ForOp
-                for_op = stmt(inst)::ForOp
+            if inst[:stmt] isa ForOp
+                for_op = inst[:stmt]::ForOp
                 break
             end
         end
@@ -1600,13 +1600,13 @@ end
     # Find the IfOp
     if_inst = nothing
     for inst in instructions(sci.entry)
-        if stmt(inst) isa IfOp
+        if inst[:stmt] isa IfOp
             if_inst = inst
             break
         end
     end
     @test if_inst !== nothing
-    if_op = stmt(if_inst)::IfOp
+    if_op = if_inst[:stmt]::IfOp
 
     then_block = if_op.then_region
     then_insts = collect(instructions(then_block))

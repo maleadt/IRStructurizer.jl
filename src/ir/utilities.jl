@@ -956,8 +956,9 @@ function _walk_pre!(f, block::Block)
     for inst in instructions(block)
         result = f(inst, block)
         result === :interrupt && return :interrupt
-        if stmt(inst) isa ControlFlowOp && result !== :skip
-            for b in blocks(stmt(inst))
+        s = inst[:stmt]
+        if s isa ControlFlowOp && result !== :skip
+            for b in blocks(s)
                 _walk_pre!(f, b) === :interrupt && return :interrupt
             end
         end
@@ -967,8 +968,9 @@ end
 
 function _walk_post!(f, block::Block)
     for inst in instructions(block)
-        if stmt(inst) isa ControlFlowOp
-            for b in blocks(stmt(inst))
+        s = inst[:stmt]
+        if s isa ControlFlowOp
+            for b in blocks(s)
                 _walk_post!(f, b) === :interrupt && return :interrupt
             end
         end

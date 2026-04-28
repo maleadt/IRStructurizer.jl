@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, stmt, flag, block,
+export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type,
        insert_before!, insert_after!, terminator, terminator!, operands,
        source_location
 
@@ -63,9 +63,11 @@ handle held across mutations always sees the current `(stmt, type, flag)`.
 
 Yielded by `instructions(block)` and usable as a key in `UseIndex`.
 
-Use the Symbol-keyed accessors (`inst[:stmt]`, `inst[:type]`, `inst[:flag]`)
-for reads and writes; `value_type(inst)`, `stmt(inst)`, `flag(inst)`,
-`block(inst)` are convenience aliases.
+Field access is Symbol-keyed: `inst[:stmt]`, `inst[:type]`, `inst[:flag]`
+read the live entry; `inst[:stmt] = …` etc. write back. The containing
+block is `inst.block`; the SSA index is `inst.ssa_idx`. The polymorphic
+`value_type(inst)` is a convenience for `inst[:type]` and also accepts
+non-Instruction values (`SSAValue`, `BlockArgument`, …).
 
 Analogous to `Core.Compiler.Instruction` in `Compiler/src/ssair/ir.jl`,
 which is also a `(storage, key)` handle dispatching to parallel field
@@ -81,17 +83,6 @@ end
 
 """Get the Julia type of the instruction result."""
 value_type(i::Instruction) = i[:type]
-
-"""Get the underlying statement (Expr, ControlFlowOp, etc.)."""
-stmt(i::Instruction) = i[:stmt]
-
-"""Get the per-statement IR flag bitmask (e.g. `IR_FLAG_EFFECT_FREE`).
-Carried through from `IRCode.stmts.flag` at structurization; 0 for stmts
-synthesized by the structurizer or by downstream passes."""
-flag(i::Instruction) = i[:flag]
-
-"""Get the block containing this instruction."""
-block(i::Instruction) = i.block
 
 """Convert to SSAValue for use in operand positions."""
 Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)

@@ -48,8 +48,10 @@ Iterate over instructions in a block as `Inst` objects. Each `Inst` bundles an S
 
 ```julia
 for inst in instructions(block)
-    stmt(inst)       # underlying statement (Expr, ControlFlowOp, etc.)
-    value_type(inst) # Julia type of the instruction result
+    inst[:stmt]      # underlying statement (Expr, ControlFlowOp, etc.)
+    inst[:type]      # Julia type of the instruction result (or value_type(inst))
+    inst[:flag]      # IR_FLAG_* bitmask (see Compiler/src/optimize.jl)
+    inst.block       # containing block
 end
 ```
 
@@ -142,8 +144,8 @@ Pre-built index for O(1) definition lookup. Analogous to `uses(block)` which ret
 idx = defs(sci)
 inst = def(idx, SSAValue(3))
 if inst !== nothing
-    stmt(inst)        # the statement
-    block(inst)       # the containing block
+    inst[:stmt]       # the statement
+    inst.block        # the containing block
 end
 ```
 

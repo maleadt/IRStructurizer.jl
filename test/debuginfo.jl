@@ -32,7 +32,7 @@
         sci, _ = code_structured(g, Tuple{Int}) |> only
         # Find the IfOp instruction
         for inst in instructions(sci.entry)
-            if stmt(inst) isa IfOp
+            if inst[:stmt] isa IfOp
                 locs = source_location(sci, inst)
                 # Should have inherited debug info from the branch condition
                 @test !isempty(locs)
@@ -171,7 +171,7 @@
         # Find a loop op and check it has debug info
         found_loop = false
         for inst in instructions(sci.entry)
-            s = stmt(inst)
+            s = inst[:stmt]
             if s isa LoopOp || s isa ForOp || s isa WhileOp
                 locs = source_location(sci, inst)
                 if !isempty(locs)
