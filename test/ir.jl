@@ -1317,6 +1317,21 @@ end
     @test value_type(sci.entry, SSAValue(999999)) === nothing
 end
 
+@testset "GlobalRef" begin
+    # GlobalRef lookup must use the world-anchored binding-partition path
+    # (same as `const_value`) — never `getfield(mod, name)`. On 1.12+ that
+    # would trigger "access to binding ... in a world prior to its
+    # definition world" warnings whenever cuTile compiles a kernel that
+    # references a freshly-defined module-level const (the world is locked
+    # by `invoke_frozen` to a value before the const's definition).
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    @test value_type(sci.entry, GlobalRef(Base, :sin)) === typeof(sin)
+    @test value_type(sci.entry, GlobalRef(Base, :Base)) === Module
+end
+
 end  # value_type(block, val)
 
 @testset "operands(op::ControlFlowOp)" begin
@@ -1643,3 +1658,50 @@ end
     @test operands(block, 42) == Any[]
     @test operands(block, GlobalRef(Base, :+)) == Any[]
 end
+
+@testset "const_value" begin
+    # `const_value(sci, x)` returns `Some(value)` when `x`'s value is
+    # statically known across all operand-position IR-value shapes:
+    # GlobalRefs (anchored on `sci.valid_worlds`), QuoteNodes,
+    # Instructions/BlockArguments with statically-known type, raw
+    # SSAValue / Argument tags (looked up via def / argtypes), and
+    # plain literals.
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    # GlobalRef — function singletons infer to `Const(f)`.
+    @test IRStructurizer.const_value(sci, GlobalRef(Base, :+)) === Some(+)
+    @test IRStructurizer.const_value(sci, GlobalRef(Base, :sin)) === Some(sin)
+    @test IRStructurizer.const_value(sci, GlobalRef(Base, :Base)) === Some(Base)
+
+    # QuoteNode — value is the quoted expression.
+    @test IRStructurizer.const_value(sci, QuoteNode(:foo)) === Some(:foo)
+    @test IRStructurizer.const_value(sci, QuoteNode(42)) === Some(42)
+
+    # Plain literal — the value is itself.
+    @test IRStructurizer.const_value(sci, 42) === Some(42)
+    @test IRStructurizer.const_value(sci, 3.14) === Some(3.14)
+    @test IRStructurizer.const_value(sci, "hello") === Some("hello")
+
+    # Raw SSAValue — look up the def in the SCI; if its type is
+    # statically known, return the value. Defs that are method-call
+    # results (non-singleton, non-Const type) return `nothing`.
+    not_const_inst = first(instructions(sci.entry))
+    @test IRStructurizer.const_value(sci, SSAValue(not_const_inst.ssa_idx)) ===
+        IRStructurizer.const_value(sci, not_const_inst)
+
+    # Argument — `sci.argtypes[n]`. The closure's first arg is itself
+    # (typed `Any` for an anonymous closure), the second is `Int` —
+    # neither is a Const or singleton, so returns `nothing`.
+    @test IRStructurizer.const_value(sci, Core.Argument(2)) === nothing
+    @test IRStructurizer.const_value(sci, Core.Argument(99)) === nothing  # OOB
+
+    # Inference artifacts (MethodInstance / CodeInstance appearing as
+    # the first operand of `:invoke` Exprs) aren't values — explicitly
+    # reject so they don't fall through to the literal-fallback branch.
+    mi = first(Base.specializations(only(methods(sin, Tuple{Float64}))))
+    @test mi isa Core.MethodInstance
+    @test IRStructurizer.const_value(sci, mi) === nothing
+end
+
