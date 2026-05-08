@@ -16,7 +16,7 @@
  Block mutation (SSA-allocating operations)
 =============================================================================#
 
-public root, parent, walk_uses!, IndexedUseRef
+public root, parent, walk_uses!, IndexedUseRef, const_value
 export insert_before!, insert_after!, eachblock, findblock,
        new_block_arg!,
        resolve_call, iscall, callee, callargs,
@@ -190,6 +190,8 @@ Get the Julia type of an arbitrary IR value as visible from `block`.
 For `SSAValue`, searches the current block then walks up the parent chain.
 For `BlockArgument` and `Undef`, returns the type stored on the value.
 For `Argument`/`SlotNumber`, looks up in the root `StructuredIRCode.argtypes`.
+For `GlobalRef`, queries the binding partition at the SCI's
+`valid_worlds.max_world` (see [`const_value`](@ref)).
 For constants, returns `typeof(val)`.
 Returns `nothing` only for an `SSAValue` or `Argument` whose type cannot be found.
 """
@@ -215,7 +217,8 @@ function value_type(block::Block, @nospecialize(val))
         sci = root(block)
         return val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
     elseif val isa GlobalRef
-        return typeof(getfield(val.mod, val.name))
+        sci = root(block)
+        return widenconst(global_lattice_element(val, sci.valid_worlds.max_world))
     elseif val isa QuoteNode
         return typeof(val.value)
     else
@@ -1311,4 +1314,80 @@ function move_after!(inst::Instruction, target::Instruction)
         end
     end
     return Instruction(inst.ssa_idx, dst)
+end
+
+
+#=============================================================================
+ Static-eval helpers
+=============================================================================#
+
+"""
+    const_value(sci::StructuredIRCode, x) -> Union{Some, Nothing}
+
+Return `Some(value)` when `x`'s value is statically known in `sci`,
+otherwise `nothing`. The Julia analog of `static_eval` in `codegen.cpp`:
+dispatches on every operand-position IR shape, recovers the value from
+inference's lattice when it's a `Const` or singleton, and returns the
+literal itself otherwise.
+
+`GlobalRef` lookups are anchored on `sci.valid_worlds` (captured at
+structurization from `IRCode.valid_worlds`) and read only binding-
+partition metadata — never `getfield(mod, name)`. So on 1.12+ this
+neither triggers the "access-to-binding-prior-to-its-definition-world"
+warning nor reflects post-inference rebinds.
+"""
+function const_value(sci::StructuredIRCode, @nospecialize(x))
+    x isa GlobalRef            && return from_type(global_lattice_element(x, sci.valid_worlds.max_world))
+    x isa QuoteNode            && return Some(x.value)
+    x isa Instruction          && return from_type(x[:type])
+    x isa BlockArgument        && return from_type(x.type)
+    x isa Core.SSAValue        && return const_value_ssa(sci, x)
+    x isa Core.Argument        && return (1 <= x.n <= length(sci.argtypes) ?
+                                           from_type(sci.argtypes[x.n]) : nothing)
+    # `MethodInstance` (and `CodeInstance`) appear as the first operand
+    # of `:invoke` Exprs but they're inference artifacts, not values
+    # — match `static_eval` (codegen.cpp:3245–46) by rejecting them
+    # explicitly so they don't fall through to the "literal" branch.
+    x isa Core.MethodInstance  && return nothing
+    x isa Core.CodeInstance    && return nothing
+    # Anything else — `x` is a literal, the value is itself.
+    return Some(x)
+end
+
+# Resolve an `SSAValue` storage tag to its def's type. Linear-scans
+# `eachblock` like `def`, just without materializing an `Instruction`.
+function const_value_ssa(sci::StructuredIRCode, ssa::Core.SSAValue)
+    inst = def(sci, ssa)
+    inst === nothing ? nothing : from_type(inst[:type])
+end
+
+# Internal: recover the value from a type slot. Handles both
+# `Compiler.Const(val)` (inference-narrowed to a specific value) and
+# singleton ghost types (one-instance types like `typeof(sin)`).
+# Mirrors `singleton_type` + `Const`-unwrap in one helper.
+function from_type(@nospecialize(rt))
+    rt === nothing && return nothing
+    rt isa Core.Compiler.Const && return Some(rt.val)
+    if rt isa Type && isdefined(rt, :instance)
+        return Some(rt.instance)
+    end
+    return nothing
+end
+
+# Internal: read a `GlobalRef`'s inferred lattice element at `world`.
+# Mirrors `Core.Compiler.abstract_eval_globalref_type`. Lattice elements
+# aren't part of the public surface; consumers go through `const_value`.
+@static if VERSION >= v"1.12-"
+    function global_lattice_element(g::GlobalRef, world::UInt)
+        binding = convert(Core.Binding, g)
+        partition = Core.Compiler.lookup_binding_partition(world, binding)
+        (_, (leaf_binding, leaf_partition)) =
+            Core.Compiler.walk_binding_partition(binding, partition, world)
+        return Core.Compiler.abstract_eval_partition_load(nothing, leaf_binding, leaf_partition).rt
+    end
+else
+    # 1.11 lacks the binding-partition API and doesn't have the world-age
+    # binding-access warning either, so the direct lookup is safe and the
+    # value (via `Const`) reflects the current binding state.
+    global_lattice_element(g::GlobalRef, ::UInt) = Core.Compiler.Const(getfield(g.mod, g.name))
 end

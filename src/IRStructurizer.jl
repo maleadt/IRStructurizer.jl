@@ -7,7 +7,8 @@ using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
                      construct_domtree, DomTree, dominates,
                      construct_postdomtree, PostDomTree, postdominates,
                      CFGReachability, bb_in_irreducible_loop,
-                     widenconst
+                     widenconst,
+                     WorldRange
 using Base: code_ircode
 
 # structured IR definitions

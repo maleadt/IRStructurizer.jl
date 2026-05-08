@@ -606,10 +606,20 @@ mutable struct StructuredIRCode
     #           val > 0 means anchor (val is another SSA idx to follow). empty!(line_map) wipes all.
     const debuginfo_table::Any
     const line_map::Dict{Int, Int}
+
+    # World-age range over which this IR is consistent. Carried from
+    # `IRCode.valid_worlds` at ingest. Anchors binding-partition lookups
+    # (see [`global_type`](@ref)) so module-binding type queries return the
+    # type the IR was inferred against, even if the world has advanced
+    # since. Defaults to the unbounded range for hand-built SCIs (tests,
+    # MWEs) and on Julia 1.11 (which lacks `IRCode.valid_worlds`).
+    const valid_worlds::WorldRange
 end
 
 StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
-    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing, Dict{Int,Int}())
+    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing,
+                     Dict{Int,Int}(),
+                     WorldRange(typemin(UInt), typemax(UInt)))
 
 function Base.copy(sci::StructuredIRCode)
     # Sever entry→SCI backref before deepcopy to avoid pulling in
@@ -623,6 +633,7 @@ function Base.copy(sci::StructuredIRCode)
         sci.max_ssa_idx, sci.max_arg_idx,
         sci.debuginfo_table,  # shared (read-only)
         copy(sci.line_map),
+        sci.valid_worlds,
     )
     new_sci.entry.parent = new_sci
     fix_parents!(new_sci.entry)
@@ -681,8 +692,17 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         end
     end
 
+    # Carry the IR's world-age range (1.12+; 1.11 doesn't have the field
+    # and also doesn't enforce binding-access world warnings, so the
+    # unbounded default is fine).
+    @static if VERSION >= v"1.12-"
+        valid_worlds = ir.valid_worlds
+    else
+        valid_worlds = WorldRange(typemin(UInt), typemax(UInt))
+    end
+
     sci = StructuredIRCode(argtypes, sptypes, entry, n, 0,
-                           debuginfo_table, line_map)
+                           debuginfo_table, line_map, valid_worlds)
 
     if structurize && n > 0
         entry, max_ssa, max_arg, updated_line_map =
