@@ -1386,8 +1386,13 @@ end
         return Core.Compiler.abstract_eval_partition_load(nothing, leaf_binding, leaf_partition).rt
     end
 else
-    # 1.11 lacks the binding-partition API and doesn't have the world-age
-    # binding-access warning either, so the direct lookup is safe and the
-    # value (via `Const`) reflects the current binding state.
-    global_lattice_element(g::GlobalRef, ::UInt) = Core.Compiler.Const(getfield(g.mod, g.name))
+    # 1.11 lacks the binding-partition API. Delegate to the existing
+    # `abstract_eval_globalref_type`, which returns `Const(value)` for
+    # const bindings, the binding's declared type otherwise — same
+    # `from_type`-friendly shape as the 1.12+ path. Reading via
+    # `getfield(mod, name)` unconditionally would erase the const-vs-
+    # mutable distinction (every binding becomes `Const`), which lets
+    # mutable host globals leak into kernel IR as compile-time values.
+    global_lattice_element(g::GlobalRef, ::UInt) =
+        Core.Compiler.abstract_eval_globalref_type(g)
 end
