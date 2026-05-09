@@ -1675,6 +1675,14 @@ end
     @test IRStructurizer.const_value(sci, GlobalRef(Base, :sin)) === Some(sin)
     @test IRStructurizer.const_value(sci, GlobalRef(Base, :Base)) === Some(Base)
 
+    # Non-const GlobalRef — the binding type isn't a `Const` and isn't
+    # a singleton, so `const_value` returns `nothing`. `Base.stdout` is
+    # typed `IO` and rebound at runtime, so it must NOT leak as a
+    # compile-time value (consumers would silently capture a stale
+    # IOContext). This guards both the 1.12+ binding-partition path
+    # and the 1.11 fallback.
+    @test IRStructurizer.const_value(sci, GlobalRef(Base, :stdout)) === nothing
+
     # QuoteNode — value is the quoted expression.
     @test IRStructurizer.const_value(sci, QuoteNode(:foo)) === Some(:foo)
     @test IRStructurizer.const_value(sci, QuoteNode(42)) === Some(42)
