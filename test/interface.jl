@@ -168,6 +168,47 @@ end
     entry.terminator = Core.ReturnNode(SSAValue(2))
     sci = StructuredIRCode(Any[Any, Int], Any[], entry, 10)
     validate_terminators(sci)  # should not throw
+
+    # Case 9: QuoteNode yields resolve to the type of the wrapped value, not
+    # `QuoteNode`. Inference folds branch results to literal constants (e.g.
+    # `Broadcast.Unknown()`) which Julia represents as `QuoteNode(value)`.
+    # Such IR is legal and must pass validation.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[QuoteNode(:a)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[QuoteNode(:b)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Symbol})
+    push!(entry, 2, Expr(:call, Core.getfield, SSAValue(1), 1), Symbol)
+    entry.terminator = Core.ReturnNode(SSAValue(2))
+    sci = StructuredIRCode(Any[Any], Any[], entry, 10)
+    validate_terminators(sci)  # should not throw
+
+    # Case 9b: a QuoteNode whose wrapped value's type *does* violate the
+    # declared bound must still be rejected — the unwrap is correctness, not
+    # a blanket pass.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[QuoteNode(:a)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Int})
+    entry.terminator = Core.ReturnNode(nothing)
+    sci = StructuredIRCode(Any[Any, Int], Any[], entry, 10)
+    @test_throws ErrorException validate_terminators(sci)
+    try
+        validate_terminators(sci)
+    catch e
+        @test occursin("then yield", e.msg)
+        @test occursin("not <: declared Int", e.msg)
+    end
+
+    # Case 10: GlobalRef yields resolve through the binding's lattice element,
+    # not `GlobalRef`. A const binding to a value of the declared type passes.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[GlobalRef(Base, :pi)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[GlobalRef(Base, :pi)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Irrational{:π}})
+    push!(entry, 2, Expr(:call, Core.getfield, SSAValue(1), 1), Irrational{:π})
+    entry.terminator = Core.ReturnNode(SSAValue(2))
+    sci = StructuredIRCode(Any[Any], Any[], entry, 10)
+    validate_terminators(sci)  # should not throw
 end
 
 @testset "validation: scope-aware undefined SSA" begin
