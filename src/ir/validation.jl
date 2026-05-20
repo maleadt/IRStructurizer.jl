@@ -453,6 +453,11 @@ resolve_type(sci::StructuredIRCode, value::Argument) = sci.argtypes[value.n]
 
 resolve_type(sci::StructuredIRCode, value::SlotNumber) = sci.argtypes[value.id]
 
+resolve_type(sci::StructuredIRCode, value::QuoteNode) = typeof(value.value)
+
+resolve_type(sci::StructuredIRCode, value::GlobalRef) =
+    widenconst(global_lattice_element(value, sci.valid_worlds.max_world))
+
 # Constants: return their runtime type
 resolve_type(sci::StructuredIRCode, value) = typeof(value)
 
