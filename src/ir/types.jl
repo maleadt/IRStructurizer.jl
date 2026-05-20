@@ -616,10 +616,18 @@ mutable struct StructuredIRCode
     const valid_worlds::WorldRange
 end
 
-StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx) =
-    StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing,
-                     Dict{Int,Int}(),
-                     WorldRange(typemin(UInt), typemax(UInt)))
+# Minimal constructor for hand-built SCIs (tests, MWEs). Wires the parent
+# chain (entry → SCI, sub-blocks → containing block) so `root(block)`
+# walks succeed — the full `StructuredIRCode(ir::IRCode; ...)` constructor
+# does the same after structurization.
+function StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx)
+    sci = StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing,
+                           Dict{Int,Int}(),
+                           WorldRange(typemin(UInt), typemax(UInt)))
+    sci.entry.parent = sci
+    fix_parents!(sci.entry)
+    return sci
+end
 
 function Base.copy(sci::StructuredIRCode)
     # Sever entry→SCI backref before deepcopy to avoid pulling in

@@ -403,6 +403,18 @@ end  # block mutation
             break
         end
     end
+
+    # Hand-built SCIs via the 4-arg constructor also wire the parent chain,
+    # so `root` walks succeed on tests/MWEs that don't go through `IRCode`.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Int})
+    entry.terminator = Core.ReturnNode(nothing)
+    sci_manual = StructuredIRCode(Any[Any, Int], Any[], entry, 10)
+    @test parent(sci_manual.entry) === sci_manual
+    @test parent(then_blk) === entry
+    @test IRStructurizer.root(then_blk) === sci_manual
 end
 
 @testset "eachblock(sci)" begin
