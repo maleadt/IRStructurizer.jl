@@ -194,36 +194,14 @@ For `GlobalRef`, queries the binding partition at the SCI's
 `valid_worlds.max_world` (see [`const_value`](@ref)).
 For constants, returns `typeof(val)`.
 Returns `nothing` only for an `SSAValue` or `Argument` whose type cannot be found.
+
+The widened-type view over [`argextype`](@ref); call `const_value` for the
+static value (when known).
 """
 function value_type(block::Block, @nospecialize(val))
-    if val isa SSAValue
-        entry = get(block.body, val.id, nothing)
-        entry !== nothing && return entry.type
-        p = block.parent
-        while p isa Block
-            entry = get(p.body, val.id, nothing)
-            entry !== nothing && return entry.type
-            p = p.parent
-        end
-        return nothing
-    elseif val isa BlockArgument
-        return val.type
-    elseif val isa Undef
-        return val.type
-    elseif val isa Argument
-        sci = root(block)
-        return val.n <= length(sci.argtypes) ? sci.argtypes[val.n] : nothing
-    elseif val isa SlotNumber
-        sci = root(block)
-        return val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
-    elseif val isa GlobalRef
-        sci = root(block)
-        return widenconst(global_lattice_element(val, sci.valid_worlds.max_world))
-    elseif val isa QuoteNode
-        return typeof(val.value)
-    else
-        return typeof(val)  # literal constant
-    end
+    lat = argextype(block, val)
+    lat === nothing && return nothing
+    return widenconst(lat)
 end
 
 """
@@ -1335,30 +1313,65 @@ structurization from `IRCode.valid_worlds`) and read only binding-
 partition metadata — never `getfield(mod, name)`. So on 1.12+ this
 neither triggers the "access-to-binding-prior-to-its-definition-world"
 warning nor reflects post-inference rebinds.
+
+The static-value view over [`argextype`](@ref); call `value_type` for the
+widened type instead.
 """
-function const_value(sci::StructuredIRCode, @nospecialize(x))
-    x isa GlobalRef            && return from_type(global_lattice_element(x, sci.valid_worlds.max_world))
-    x isa QuoteNode            && return Some(x.value)
-    x isa Instruction          && return from_type(x[:type])
-    x isa BlockArgument        && return from_type(x.type)
-    x isa Core.SSAValue        && return const_value_ssa(sci, x)
-    x isa Core.Argument        && return (1 <= x.n <= length(sci.argtypes) ?
-                                           from_type(sci.argtypes[x.n]) : nothing)
-    # `MethodInstance` (and `CodeInstance`) appear as the first operand
-    # of `:invoke` Exprs but they're inference artifacts, not values
-    # — match `static_eval` (codegen.cpp:3245–46) by rejecting them
-    # explicitly so they don't fall through to the "literal" branch.
-    x isa Core.MethodInstance  && return nothing
-    x isa Core.CodeInstance    && return nothing
-    # Anything else — `x` is a literal, the value is itself.
-    return Some(x)
+const_value(sci::StructuredIRCode, @nospecialize(x)) = from_type(argextype(sci, x))
+
+"""
+    argextype(src, val) -> Any
+
+Inferred lattice element for an operand-position IR value, either a
+`Compiler.Const(v)` (statically known value), a widened `Type`, or
+`nothing` for inference artifacts (`MethodInstance`/`CodeInstance`) and
+unresolvable `SSAValue`/`Argument` tags. Mirrors `Core.Compiler.argextype`
+against `StructuredIRCode`-shaped IR.
+
+`src` selects the SSA lookup strategy: a `Block` walks the parent chain
+(structured scoping); a `StructuredIRCode` does a flat scan via [`def`](@ref).
+
+Consumers go through [`value_type`](@ref) (widened type) or
+[`const_value`](@ref) (static value when known).
+"""
+function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
+    val isa BlockArgument && return val.type
+    val isa Undef && return val.type
+    val isa Instruction && return val[:type]
+    # `MethodInstance` and `CodeInstance` appear as the first operand of
+    # `:invoke` Exprs but they're inference artifacts, not values — match
+    # `static_eval` (codegen.cpp:3245–46) by rejecting them explicitly so
+    # they don't fall through to the literal branch.
+    (val isa Core.MethodInstance || val isa Core.CodeInstance) && return nothing
+    val isa QuoteNode && return Core.Compiler.Const(val.value)
+    val isa SSAValue && return _argextype_ssa(src, val)
+    # The remaining shapes need access to `sci.argtypes`/`sci.valid_worlds`.
+    sci = src isa StructuredIRCode ? src : root(src)
+    val isa Argument && return 1 <= val.n <= length(sci.argtypes) ? sci.argtypes[val.n] : nothing
+    val isa SlotNumber && return 1 <= val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
+    val isa GlobalRef && return global_lattice_element(val, sci.valid_worlds.max_world)
+    # Anything else — `val` is a literal; wrap as `Const` so widenconst /
+    # from_type recover `typeof(val)` / `Some(val)` respectively.
+    return Core.Compiler.Const(val)
 end
 
-# Resolve an `SSAValue` storage tag to its def's type. Linear-scans
-# `eachblock` like `def`, just without materializing an `Instruction`.
-function const_value_ssa(sci::StructuredIRCode, ssa::Core.SSAValue)
-    inst = def(sci, ssa)
-    inst === nothing ? nothing : from_type(inst[:type])
+# SSA type lookup: parent-chain walk (Block, structured scope) vs
+# flat scan via `def` (SCI, no scope info available).
+function _argextype_ssa(block::Block, val::SSAValue)
+    entry = get(block.body, val.id, nothing)
+    entry !== nothing && return entry.type
+    p = block.parent
+    while p isa Block
+        entry = get(p.body, val.id, nothing)
+        entry !== nothing && return entry.type
+        p = p.parent
+    end
+    return nothing
+end
+
+function _argextype_ssa(sci::StructuredIRCode, val::SSAValue)
+    inst = def(sci, val)
+    inst === nothing ? nothing : inst[:type]
 end
 
 # Internal: recover the value from a type slot. Handles both

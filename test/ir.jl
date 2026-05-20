@@ -403,6 +403,18 @@ end  # block mutation
             break
         end
     end
+
+    # Hand-built SCIs via the 4-arg constructor also wire the parent chain,
+    # so `root` walks succeed on tests/MWEs that don't go through `IRCode`.
+    then_blk = Block(); then_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    else_blk = Block(); else_blk.terminator = YieldOp(Any[Core.Argument(2)])
+    entry = Block()
+    push!(entry, 1, IfOp(true, then_blk, else_blk), Tuple{Int})
+    entry.terminator = Core.ReturnNode(nothing)
+    sci_manual = StructuredIRCode(Any[Any, Int], Any[], entry, 10)
+    @test parent(sci_manual.entry) === sci_manual
+    @test parent(then_blk) === entry
+    @test IRStructurizer.root(then_blk) === sci_manual
 end
 
 @testset "eachblock(sci)" begin
@@ -1334,6 +1346,51 @@ end
 
 end  # value_type(block, val)
 
+@testset "argextype" begin
+    # `argextype` is the lattice-element primitive `value_type` and
+    # `const_value` share. It returns the same shapes as Julia's
+    # `Compiler.argextype`: `Compiler.Const(v)` for statically known
+    # values, a widened `Type` for SSA defs / args / globals, and
+    # `nothing` for inference artifacts.
+    sci, _ = code_structured(Tuple{Int}) do x::Int
+        x + 1
+    end |> only
+
+    Const = Core.Compiler.Const
+
+    # QuoteNode and literals → Const-wrapped (so widenconst recovers
+    # the type and from_type recovers the value).
+    @test IRStructurizer.argextype(sci.entry, QuoteNode(:foo)) === Const(:foo)
+    @test IRStructurizer.argextype(sci.entry, 42) === Const(42)
+    @test IRStructurizer.argextype(sci.entry, Base) === Const(Base)
+
+    # Argument → argtypes lookup, with bounds check.
+    @test IRStructurizer.argextype(sci.entry, Core.Argument(2)) === sci.argtypes[2]
+    @test IRStructurizer.argextype(sci.entry, Core.Argument(99)) === nothing
+
+    # SlotNumber resolves through argtypes the same way as Argument.
+    @test IRStructurizer.argextype(sci.entry, Core.SlotNumber(2)) === sci.argtypes[2]
+    @test IRStructurizer.argextype(sci.entry, Core.SlotNumber(99)) === nothing
+
+    # GlobalRef → binding-partition lattice element (a `Const` for const
+    # singletons, a widened type otherwise).
+    @test IRStructurizer.argextype(sci.entry, GlobalRef(Base, :sin)) === Const(sin)
+
+    # Inference artifacts → nothing (not values).
+    mi = first(Base.specializations(only(methods(sin, Tuple{Float64}))))
+    @test IRStructurizer.argextype(sci.entry, mi) === nothing
+
+    # SSA lookup: Block walks the parent chain (structured scoping),
+    # StructuredIRCode does a flat scan. Both find a def in the entry,
+    # but they differ on SSAs not reachable from a given block — verified
+    # implicitly by the value_type/const_value testsets above.
+    inst = first(instructions(sci.entry))
+    @test IRStructurizer.argextype(sci.entry, SSAValue(inst.ssa_idx)) === inst[:type]
+    @test IRStructurizer.argextype(sci, SSAValue(inst.ssa_idx)) === inst[:type]
+    @test IRStructurizer.argextype(sci.entry, SSAValue(999999)) === nothing
+    @test IRStructurizer.argextype(sci, SSAValue(999999)) === nothing
+end
+
 @testset "operands(op::ControlFlowOp)" begin
 
 @testset "IfOp" begin
@@ -1704,6 +1761,12 @@ end
     # neither is a Const or singleton, so returns `nothing`.
     @test IRStructurizer.const_value(sci, Core.Argument(2)) === nothing
     @test IRStructurizer.const_value(sci, Core.Argument(99)) === nothing  # OOB
+
+    # SlotNumber routes through argtypes the same way as Argument — a
+    # slot reference is a position, not a value, so the old literal-
+    # fallback behavior (returning `Some(SlotNumber(n))`) was wrong.
+    @test IRStructurizer.const_value(sci, Core.SlotNumber(2)) === nothing
+    @test IRStructurizer.const_value(sci, Core.SlotNumber(99)) === nothing  # OOB
 
     # Inference artifacts (MethodInstance / CodeInstance appearing as
     # the first operand of `:invoke` Exprs) aren't values — explicitly

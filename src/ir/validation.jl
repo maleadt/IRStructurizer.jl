@@ -177,8 +177,8 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
             end
             for i in 1:min(arity, length(expected))
                 Ti = expected[i]
-                check_yield_type!(errors, sci, then_term.values[i], Ti, idx, i, "then")
-                check_yield_type!(errors, sci, else_term.values[i], Ti, idx, i, "else")
+                check_yield_type!(errors, op.then_region, then_term.values[i], Ti, idx, i, "then")
+                check_yield_type!(errors, op.else_region, else_term.values[i], Ti, idx, i, "else")
             end
         end
     end
@@ -191,12 +191,14 @@ end
 # Check a single yield value against the IfOp's declared per-position type.
 # `Undef` placeholders (used for uninitialized slots on one branch) are skipped
 # — their recorded type is already the declared slot type, so the <: check is
-# trivially satisfied, but an explicit skip keeps intent clear.
-function check_yield_type!(errors::Vector{String}, sci::StructuredIRCode,
+# trivially satisfied, but an explicit skip keeps intent clear. `block` is the
+# yielding region, so `value_type` walks the parent chain and resolves SSAs
+# defined in the surrounding scope.
+function check_yield_type!(errors::Vector{String}, block::Block,
                             @nospecialize(value), @nospecialize(expected),
                             idx::Int, pos::Int, branch::String)
     value isa Undef && return
-    ty = resolve_type(sci, value)
+    ty = value_type(block, value)
     ty === nothing && return
     if !(ty <: expected)
         push!(errors, "IfOp at %$idx: $branch yield at position $pos has type $ty, not <: declared $expected")
@@ -433,39 +435,3 @@ function validate_ssa_uniqueness(sci::StructuredIRCode)
     return true
 end
 
-#=============================================================================
- Type Resolution for IRValues
-=============================================================================#
-
-"""
-    resolve_type(sci::StructuredIRCode, value::IRValue) -> Any
-
-Resolve the Julia type of an IRValue.
-Returns `nothing` if the type cannot be resolved.
-"""
-function resolve_type end
-
-resolve_type(sci::StructuredIRCode, value::Undef) = value.type
-
-resolve_type(sci::StructuredIRCode, value::BlockArgument) = value.type
-
-resolve_type(sci::StructuredIRCode, value::Argument) = sci.argtypes[value.n]
-
-resolve_type(sci::StructuredIRCode, value::SlotNumber) = sci.argtypes[value.id]
-
-resolve_type(sci::StructuredIRCode, value::QuoteNode) = typeof(value.value)
-
-resolve_type(sci::StructuredIRCode, value::GlobalRef) =
-    widenconst(global_lattice_element(value, sci.valid_worlds.max_world))
-
-# Constants: return their runtime type
-resolve_type(sci::StructuredIRCode, value) = typeof(value)
-
-# SSAValue: search the structured IR for its definition
-function resolve_type(sci::StructuredIRCode, value::SSAValue)
-    for block in eachblock(sci)
-        entry = get(block.body, value.id, nothing)
-        entry !== nothing && return entry.type
-    end
-    return nothing
-end
