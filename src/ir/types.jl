@@ -83,8 +83,8 @@ end
 
 SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[], Dict{Int,Int}())
 
-# Iteration yields idx => (; stmt, type, flag) pairs
-function Base.iterate(m::SSAMap, state::Int=1)
+# Iteration yields idx => (; stmt, type, flag) pairs.
+@inline function Base.iterate(m::SSAMap, state::Int=1)
     state > length(m.ssa_idxes) && return nothing
     idx = m.ssa_idxes[state]
     entry = (; stmt=m.stmts[state], type=m.types[state], flag=m.flags[state])
