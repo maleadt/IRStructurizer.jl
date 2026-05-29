@@ -251,8 +251,9 @@ function find_gated_body(ctx::StructurizeCtx, current::Int,
             for si in first(bb.stmts):last(bb.stmts)
                 stmt = ir.stmts.stmt[si]
                 if stmt isa PhiNode
-                    for (k, v) in enumerate(stmt.values)
-                        isassigned(stmt.values, k) || continue
+                    for k in eachindex(stmt.values)
+                        isassigned(stmt.values, k) || continue   # undef phi slot
+                        v = stmt.values[k]
                         v isa SSAValue && v.id ∈ body_defs || continue
                         if !(merge_in_region && blk_idx == merge &&
                              Int(stmt.edges[k]) ∈ body_region)

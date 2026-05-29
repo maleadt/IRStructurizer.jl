@@ -1264,6 +1264,28 @@ end
     end
 end
 
+@testset "short-circuit guard with an undef phi slot in the escape check" begin
+    # Regression (found via AcceleratedKernels' block merge-sort): a value defined
+    # only inside a `||`-guarded body and used inside a SECOND `||`-guard gives the
+    # merge phi an undefined incoming slot. find_gated_body's escape check iterated
+    # `enumerate(phi.values)`, reading the undef slot before its `isassigned` guard
+    # → UndefRefError. It now reads the value only after the guard.
+    function undef_phi(c1::Bool, c2::Bool, n::Int)
+        if c1 || c2
+            t = n + 1
+        end
+        s = 0
+        if c1 || c2
+            s = t
+        end
+        return s
+    end
+    sci_up, _ = code_structured(undef_phi, Tuple{Bool, Bool, Int}) |> only  # must not throw
+    for c1 in (false, true), c2 in (false, true)
+        @test execute(sci_up, c1, c2, 7) == undef_phi(c1, c2, 7)
+    end
+end
+
 @testset "loop exit through fallthrough (not GotoIfNot dest)" begin
     # Regression test: find_loop_exit_condition only checked if GotoIfNot.dest
     # exited the loop, but missed the case where the *fallthrough* path (cond=true)
