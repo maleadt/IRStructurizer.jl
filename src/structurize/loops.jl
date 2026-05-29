@@ -137,6 +137,7 @@ function emit_ifop_result!(block::Block, if_op::IfOp, phi_indices::Vector{Int},
     if_ssa = alloc_ssa!(ctx)
     remap = ctx.ssa_remap
     if !isempty(phi_indices)
+        # `phi_types` come pre-widened from `ctx.types`.
         result_type = Tuple{phi_types...}
         push!(block, if_ssa, if_op, result_type)
         line_anchor != 0 && anchor_line!(ctx, if_ssa, line_anchor)
@@ -205,11 +206,13 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         fresh = alloc_ssa!(ctx)
         ctx.ssa_remap[ex.ssa_idx] = fresh
         anchor_line!(ctx, fresh, ex.ssa_idx)
-        push!(init_values, Undef(ex.type))
+        # `ex.type` bypasses `ctx.types`, so widen it here too.
+        ext = widenconst(ex.type)
+        push!(init_values, Undef(ext))
         push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
         push!(phi_indices, ex.ssa_idx)           # getfield OUTSIDE uses original
-        push!(phi_types, ex.type)
-        arg = BlockArgument(alloc_arg!(ctx), ex.type)
+        push!(phi_types, ext)
+        arg = BlockArgument(alloc_arg!(ctx), ext)
         push!(body.args, arg)
     end
 

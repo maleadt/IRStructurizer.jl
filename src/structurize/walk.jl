@@ -203,9 +203,11 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     merge_phis = if merge !== nothing && merge ∈ region_blocks &&
                    (!haskey(ctx.loop_map, merge) || is_multi_entry_header)
         phis = extract_merge_phis(ir, merge, region_blocks)
-        # If merge has no phis, check its successors for phis
-        # (handles pass-through merge blocks like in || patterns)
-        if isempty(phis)
+        # No phis: absorb a genuine pass-through (no-phi block forwarding
+        # unconditionally) and use its successor's phis — the || pattern. Gate on
+        # a single successor: a multi-successor merge is itself a branch (e.g. a
+        # sequential `if` sharing the condition) and must not be absorbed.
+        if isempty(phis) && length(ir.cfg.blocks[merge].succs) == 1
             for succ in ir.cfg.blocks[merge].succs
                 if succ ∈ region_blocks && !haskey(ctx.loop_map, succ)
                     succ_phis = extract_merge_phis(ir, succ, region_blocks)

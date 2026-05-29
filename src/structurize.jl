@@ -29,7 +29,12 @@ function StructurizeCtx(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}())
     postdomtree = construct_postdomtree(ir)
     loops = compute_natural_loops(ir, domtree)
     n = length(ir.stmts.stmt)
-    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, copy(ir.stmts.type), Dict{Int,Int}(), line_map)
+    # `ctx.types` feeds only structural positions (op result / block-arg / Undef
+    # types), which must be concrete `Type`s. Widen so a lattice element (e.g.
+    # `Core.Const` on a phi with one literal edge) can't land there; statement
+    # types copied verbatim by the walk keep their original `ir.stmts.type`.
+    types = Any[widenconst(t) for t in ir.stmts.type]
+    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, types, Dict{Int,Int}(), line_map)
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)

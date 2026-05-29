@@ -584,6 +584,39 @@ end  # nested control flow
     @test @roundtrip f_dup(5)
 end
 
+@testset "sequential ifs sharing a condition in a loop" begin
+    # KA tail-block masking shape: sequential `if cond` diamonds sharing an
+    # opaque condition. `opaque`: non-folding cond; `sink`: side effect, no value.
+    @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
+    @noinline sink(x) = (Base.donotdelete(x); nothing)
+
+    # 2nd if updates an escaping accumulator; the 1st if's phi-free merge must not
+    # be absorbed as a pass-through (→ "SSA values used but not defined").
+    function seq_ifs_loop(n::Int, c::Bool)
+        cond = opaque(c)
+        acc = 0
+        for kt in 1:n
+            if cond; sink(kt); end
+            if cond; acc += kt; end
+        end
+        return acc
+    end
+    @test @roundtrip seq_ifs_loop(5, true)
+    @test @roundtrip seq_ifs_loop(5, false)
+    @test @roundtrip seq_ifs_loop(10, true)
+
+    # `y` is defined on one edge only → its merge phi is typed `Core.Const`,
+    # illegal in a structural type position unless widened.
+    function const_merge_phi(c::Bool)
+        cond = opaque(c)
+        if cond; x = 3.0; else; x = 4.0; end
+        if cond; y = 1.0; end
+        return cond ? y : x
+    end
+    @test @roundtrip const_merge_phi(true)
+    @test @roundtrip const_merge_phi(false)
+end
+
 @testset "type preservation" begin
     sci, _ = code_structured(Tuple{Float64}) do x::Float64
         x + 1.0
