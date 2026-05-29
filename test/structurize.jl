@@ -1050,13 +1050,8 @@ end
 end
 
 @testset "short-circuit && with sub-diamond in else branch" begin
-    # Regression: short-circuit `&&` whose `else` path is itself a non-trivial
-    # diamond produces a CFG where the false_dest has multi-pred (the branch
-    # source AND the inner condition's false edge). `find_branch_regions`
-    # leaves else_blocks empty and `make_empty_branch_block` would yield a
-    # value defined inside the (un-structurized) subtree — failing
-    # `validate_ssa_defs`. The fix tail-duplicates the dominator subtree of
-    # the empty branch's destination with fresh SSA indices.
+    # `&&` whose else-path is itself a diamond: the multi-entry continuation (the
+    # inner diamond) is structured ONCE behind the materialized predicate.
     f_and_diamond = (x::Int, y::Int, z::Int) -> begin
         a = if x > 0 && y > 0
             x * y
@@ -1072,14 +1067,14 @@ end
     @test code_structured(f_and_diamond, Tuple{Int, Int, Int}) isa Vector
     @test @roundtrip f_and_diamond(1,  1,  1)   # %5 && %9 → x*y
     @test @roundtrip f_and_diamond(-1, 1,  1)   # outer-else → z+1
-    @test @roundtrip f_and_diamond(1, -1,  1)   # then → inner-else (cloned subtree) → z+1
+    @test @roundtrip f_and_diamond(1, -1,  1)   # then → inner-else → z+1
     @test @roundtrip f_and_diamond(-1,-1, -1)   # outer-else → -z
-    @test @roundtrip f_and_diamond(1, -1, -1)   # then → inner-else (cloned subtree) → -z
+    @test @roundtrip f_and_diamond(1, -1, -1)   # then → inner-else → -z
 end
 
 @testset "short-circuit || with sub-diamond in then branch" begin
-    # Symmetric to the `&&` case: the merge-tail is reached from sibling
-    # regions via `||`. Triggers `set_exit_yield!`'s tail-duplication path.
+    # Symmetric `||`: the value-producing then-body (inner diamond) is the
+    # multi-entry continuation; gated once, body + skip values threaded as results.
     f_or_diamond = (x::Int, y::Int, z::Int) -> begin
         a = if x > 0 || y > 0
             if z > 0
@@ -1098,6 +1093,175 @@ end
     @test @roundtrip f_or_diamond(1, -1,  1)
     @test @roundtrip f_or_diamond(-1,-1, -1)
     @test @roundtrip f_or_diamond(1, -1, -1)
+end
+
+@testset "short-circuit || guarding a phi-free side-effect body" begin
+    # `if a || b { side_effect }` with a phi-free body: previously dropped (the
+    # body lands in neither arm region). Now gated once via the multiplexer.
+    @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
+
+    # Recursively count `:call` statements whose callee is `GlobalRef(_, fname)`
+    # across all nested control-flow blocks. Used to assert the side-effecting
+    # store appears exactly once (no body duplication).
+    function count_calls(blk::Block, fname::Symbol)
+        n = 0
+        for (_, entry) in blk.body
+            stmt = entry.stmt
+            if stmt isa Expr && stmt.head === :call
+                callee = get(stmt.args, 1, nothing)
+                callee isa GlobalRef && callee.name === fname && (n += 1)
+            elseif stmt isa ControlFlowOp
+                for sub in IRStructurizer.blocks(stmt)
+                    n += count_calls(sub, fname)
+                end
+            end
+        end
+        return n
+    end
+
+    # --- || guarding a Ref store (no value escapes) ---
+    function orfun!(r::Base.RefValue{Int}, flag::Bool, g::Int)
+        if opaque(flag) || g != 0
+            r[] = 99
+        end
+        return nothing
+    end
+    sci_or, _ = code_structured(orfun!, Tuple{Base.RefValue{Int}, Bool, Int}) |> only
+    # The store appears EXACTLY ONCE — no body duplication.
+    @test count_calls(sci_or.entry, :setfield!) == 1
+    for (flag, g) in ((false, 0), (false, 5), (true, 0), (true, 5))
+        r = Ref(0)
+        execute(sci_or, r, flag, g)
+        @test r[] == ((flag || g != 0) ? 99 : 0)
+    end
+
+    # --- && guarding a Ref store (regression: must still gate correctly) ---
+    function andfun!(r::Base.RefValue{Int}, a::Bool, b::Bool)
+        if opaque(a) && opaque(b)
+            r[] = 99
+        end
+        return nothing
+    end
+    sci_and, _ = code_structured(andfun!, Tuple{Base.RefValue{Int}, Bool, Bool}) |> only
+    @test count_calls(sci_and.entry, :setfield!) == 1
+    for (a, b) in ((false, false), (false, true), (true, false), (true, true))
+        r = Ref(0)
+        execute(sci_and, r, a, b)
+        @test r[] == ((a && b) ? 99 : 0)
+    end
+
+    # --- 3-way || (a || b || c) guarding a side effect (generalizes) ---
+    function or3!(r::Base.RefValue{Int}, a::Bool, b::Bool, c::Int)
+        if opaque(a) || opaque(b) || c != 0
+            r[] = 99
+        end
+        return nothing
+    end
+    sci_or3, _ = code_structured(or3!, Tuple{Base.RefValue{Int}, Bool, Bool, Int}) |> only
+    @test count_calls(sci_or3.entry, :setfield!) == 1
+    for (a, b, c) in ((false, false, 0), (false, false, 5),
+                      (false, true, 0), (true, false, 0), (true, true, 9))
+        r = Ref(0)
+        execute(sci_or3, r, a, b, c)
+        @test r[] == ((a || b || c != 0) ? 99 : 0)
+    end
+
+    # --- mixed (a || b) && c guarding a side effect (must stay correct) ---
+    function mixfun!(r::Base.RefValue{Int}, a::Bool, b::Bool, c::Bool)
+        if (opaque(a) || opaque(b)) && opaque(c)
+            r[] = 99
+        end
+        return nothing
+    end
+    sci_mix, _ = code_structured(mixfun!, Tuple{Base.RefValue{Int}, Bool, Bool, Bool}) |> only
+    @test count_calls(sci_mix.entry, :setfield!) == 1
+    for (a, b, c) in ((false, false, true), (true, false, false),
+                      (true, false, true), (false, true, true), (true, true, true))
+        r = Ref(0)
+        execute(sci_mix, r, a, b, c)
+        @test r[] == (((a || b) && c) ? 99 : 0)
+    end
+
+    # --- || guarding a side effect INSIDE a loop (KA tail-masking shape) ---
+    # The body BB sits in the loop body; blocks dominated by the branch but past
+    # the join (the loop latch) must NOT be swallowed into the gated body.
+    function or_in_loop!(r::Base.RefValue{Int}, c::Bool, n::Int)
+        for k in 1:n
+            if opaque(c) || k > 2
+                r[] += k
+            end
+        end
+        return nothing
+    end
+    sci_loop, _ = code_structured(or_in_loop!, Tuple{Base.RefValue{Int}, Bool, Int}) |> only
+    @test count_calls(sci_loop.entry, :setfield!) == 1
+    for (c, n) in ((false, 5), (true, 5), (false, 2), (true, 0))
+        r = Ref(0)
+        execute(sci_loop, r, c, n)
+        expected = 0
+        for k in 1:n
+            (c || k > 2) && (expected += k)
+        end
+        @test r[] == expected
+    end
+
+    # --- nested ||-guarded bodies (a gated body inside another) ---
+    # The inner `||`'s continuation is the shared outer merge, which lies outside
+    # the outer body region — the multiplexer must still gate the inner body once.
+    function nested!(r::Base.RefValue{Int}, a::Bool, b::Bool, c::Bool, d::Bool)
+        if opaque(a) || opaque(b)
+            r[] += 1
+            if opaque(c) || opaque(d)
+                r[] += 10
+            end
+        end
+        return nothing
+    end
+    sci_nest, _ = code_structured(nested!, Tuple{Base.RefValue{Int}, Bool, Bool, Bool, Bool}) |> only
+    @test count_calls(sci_nest.entry, :setfield!) == 2   # `r[]+=1` and `r[]+=10`, once each
+    for a in (false, true), b in (false, true), c in (false, true), d in (false, true)
+        r = Ref(0)
+        execute(sci_nest, r, a, b, c, d)
+        expected = 0
+        if a || b
+            expected += 1
+            (c || d) && (expected += 10)
+        end
+        @test r[] == expected
+    end
+
+    # `||`-guarded body that fans into the continuation at multiple internal points
+    # with throw paths (the AcceleratedKernels exclusive-scan shape). Throws give
+    # `ipdom(current) == 0`, so an ipdom heuristic fails; the edge-target
+    # continuation finds {body, merge} robustly. Body must run iff (inc || iblk!=0).
+    function ak_shape!(r::Base.RefValue{Int}, inc::Bool, iblk::Int, k::Int, v::Vector{Int})
+        if opaque(inc) || iblk != 0
+            # body: a guarded array access (throw path → ipdom 0) and an internal
+            # early exit to the continuation, mirroring the `kt == last` early-out.
+            x = v[k]            # bounds check → throw/unreachable path
+            if k == 1
+                r[] = x         # internal exit #1 to the continuation
+            else
+                r[] = x + 100   # internal exit #2 to the continuation
+            end
+        end
+        return nothing
+    end
+    tt = Tuple{Base.RefValue{Int}, Bool, Int, Int, Vector{Int}}
+    sci_ak, _ = code_structured(ak_shape!, tt) |> only
+    # The two body stores stay once each — no tail duplication of the body.
+    @test count_calls(sci_ak.entry, :setfield!) == 2
+    vv = [11, 22, 33]
+    for inc in (false, true), iblk in (0, 2), k in (1, 3)
+        r = Ref(-1)
+        execute(sci_ak, r, inc, iblk, k, vv)
+        expected = -1
+        if inc || iblk != 0
+            x = vv[k]
+            expected = (k == 1) ? x : x + 100
+        end
+        @test r[] == expected
+    end
 end
 
 @testset "loop exit through fallthrough (not GotoIfNot dest)" begin

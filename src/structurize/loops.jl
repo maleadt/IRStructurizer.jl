@@ -74,6 +74,209 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
     return then_blocks, else_blocks, merge
 end
 
+"""
+    branch_continuation(ctx, current, true_dest, false_dest, then_blocks,
+                         else_blocks, region_blocks)
+        -> (continuation_entries::Vector{Int}, notContinuation::Set{Int})
+
+Compute the branch continuation MLIR-style, mirroring
+`transformToStructuredCFBranches` in CFGToSCF.cpp (~lines 969-1098).
+
+`notContinuation` (CFGToSCF.cpp `notContinuation`) = `current` plus every block
+SOLELY dominated by one of the branch successors — exactly `then_blocks` and
+`else_blocks` (each is the dominator subtree of a single-predecessor successor,
+which is how `find_branch_regions` already computes them; CFGToSCF.cpp lines
+977-990).
+
+The continuation is then derived from the **edges leaving `notContinuation`**
+(CFGToSCF.cpp lines 1054-1090, the `continuationEdges` loop), NOT from
+post-dominance. This is the part that makes the analysis robust to virtual exits
+(throw/`÷`/undef paths give `ipdom == 0`) and to bodies that fan into the
+continuation at several internal points: every such region-exit edge target is a
+continuation entry. Region-exit/return-like blocks (no successors, CFGToSCF.cpp
+`isRegionExitBlock`) contribute nothing here — they stay as case-2 unstructured
+sub-regions handled by the recursive walk. The distinct edge targets are the
+continuation entry blocks, deduplicated preserving first-seen order.
+
+A continuation entry may leave `region_blocks` entirely: when a gated body is
+NESTED in another, the inner branch's skip path targets the SHARED outer merge,
+which the outer multiplexer left out of the inner region. We therefore keep
+out-of-region targets as entries, but DROP loop boundaries (`loop_ctx`): a
+back-edge to the header is a continue and an edge out of the loop is a break —
+neither is part of this branch's forward continuation.
+"""
+function branch_continuation(ctx::StructurizeCtx, current::Int,
+                              true_dest::Int, false_dest::Int,
+                              then_blocks::Set{Int}, else_blocks::Set{Int},
+                              region_blocks::Set{Int},
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
+    ir = ctx.ir
+    nblocks = length(ir.cfg.blocks)
+
+    # notContinuation = branch entry ∪ arm regions; continuation = distinct
+    # targets of edges leaving it (edge targets, not post-dominance → survives
+    # virtual exits). MLIR transformToStructuredCFBranches:
+    # https://github.com/llvm/llvm-project/blob/cabad14763b27802296b44b3b5e507f6a4f7a3c5/mlir/lib/Transforms/Utils/CFGToSCF.cpp
+    notContinuation = Set{Int}((current,))
+    union!(notContinuation, then_blocks)
+    union!(notContinuation, else_blocks)
+
+    scan = Int[current]
+    append!(scan, then_blocks)
+    append!(scan, else_blocks)
+
+    entries = Int[]
+    seen = Set{Int}()
+    for b in scan
+        1 <= b <= nblocks || continue
+        bb = ir.cfg.blocks[b]
+        isempty(bb.succs) && continue   # return-like block: no continuation edge
+        for succ in bb.succs
+            succ ∈ notContinuation && continue
+            # loop boundary (continue/break) — handled by the loop machinery
+            if loop_ctx !== nothing &&
+               (succ == loop_ctx.header || succ ∉ loop_ctx.loop_blocks)
+                continue
+            end
+            dominates(ctx.domtree, succ, b) && continue   # back-edge to enclosing header
+            if succ ∉ seen
+                push!(seen, succ)
+                push!(entries, succ)
+            end
+        end
+    end
+    return entries, notContinuation
+end
+
+"""
+    find_gated_body(...) -> (body_entry, body_region, merge) | nothing
+
+A short-circuit-guarded body (`if a||b { body }`, `&&`, value forms): the body is
+reached from BOTH arms, so it lands in neither then/else region and the branch
+continuation has TWO entries. Returns the gated body, its region, and the merge
+it exits to; `nothing` if the shape doesn't match (→ ordinary IfOp path).
+
+The continuation is computed MLIR-style (`branch_continuation`), not via `ipdom`
+— robust to virtual exits and to a body that fans into `merge` at several
+internal points. `emit_gated_branch!` then gates the body under one `scf.if` via
+the edge multiplexer, structurized ONCE (no duplication).
+
+Requires: exactly 2 continuation entries; the `body` (dominated by `current`)
+exits only to `merge` (which may sit outside `region_blocks` — a nested gated
+body's shared outer merge); the body region is fully enclosed (preds from
+arms/body, succs to body/merge/return-like); no body value escapes except a phi
+value at `merge` (threaded out as a multiplexer result).
+"""
+function find_gated_body(ctx::StructurizeCtx, current::Int,
+                          true_dest::Int, false_dest::Int,
+                          then_blocks::Set{Int}, else_blocks::Set{Int},
+                          region_blocks::Set{Int},
+                          loop_ctx::Union{Nothing, LoopCtx}=nothing)
+    ir = ctx.ir
+    nblocks = length(ir.cfg.blocks)
+
+    entries, _notContinuation = branch_continuation(
+        ctx, current, true_dest, false_dest, then_blocks, else_blocks,
+        region_blocks, loop_ctx)
+
+    # Only a 2-entry continuation needs the multiplexer (else: ordinary IfOp path).
+    length(entries) == 2 || return nothing
+
+    # arms the selector fans into (incl. `current` for the `&&` shape, where
+    # false_dest is the body reached directly from current)
+    arms = union(then_blocks, else_blocks)
+    push!(arms, true_dest); push!(arms, false_dest); push!(arms, current)
+
+    # 2-entry case: gate the `body` (dominated by current, exits only to `merge`),
+    # then fall through to `merge`.
+    A, B = entries[1], entries[2]
+    for (body_entry, merge) in ((A, B), (B, A))
+        body_entry == merge && continue
+        dominates(ctx.domtree, current, body_entry) || continue
+        merge <= nblocks || continue
+
+        # body region = body_entry's dominator subtree, up to (not incl.) `merge`
+        dominated = Set{Int}()
+        collect_dominated!(dominated, ctx.domtree, body_entry, region_blocks)
+        body_region = Set{Int}()
+        ok = true
+        for b in dominated
+            b == merge && continue
+            dominates(ctx.domtree, merge, b) && continue
+            push!(body_region, b)
+        end
+        (isempty(body_region) || body_entry ∉ body_region) && continue
+
+        # closure: body preds from arms/body (single entry); succs to body/merge/
+        # return-like (throw/unreachable blocks stay nested in the body)
+        ok = true
+        for b in body_region
+            b <= nblocks || (ok = false; break)
+            for pred in ir.cfg.blocks[b].preds
+                pred ∈ body_region && continue
+                if !(b == body_entry && pred ∈ arms)
+                    ok = false; break
+                end
+            end
+            ok || break
+            for succ in ir.cfg.blocks[b].succs
+                (succ ∈ body_region || succ == merge) && continue
+                # return-like succ (throw/unreachable): keep it in the body
+                if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
+                   succ ∈ region_blocks
+                    push!(body_region, succ)
+                    continue
+                end
+                ok = false; break
+            end
+            ok || break
+        end
+        ok || continue
+
+        # must be reached from an arm, and not a self-loop entry
+        body_entry ∈ ir.cfg.blocks[body_entry].preds && continue
+        any(p -> p ∈ arms, ir.cfg.blocks[body_entry].preds) || continue
+
+        # a body value may escape only as a phi value at `merge` (threaded out as a
+        # multiplexer result, so def and use share scope); else it'd be stranded → bail
+        merge_in_region = merge ∈ region_blocks
+        body_defs = Set{Int}()
+        for b in body_region, si in first(ir.cfg.blocks[b].stmts):last(ir.cfg.blocks[b].stmts)
+            push!(body_defs, si)
+        end
+        escapes = false
+        for blk_idx in 1:nblocks
+            blk_idx ∈ body_region && continue
+            bb = ir.cfg.blocks[blk_idx]
+            for si in first(bb.stmts):last(bb.stmts)
+                stmt = ir.stmts.stmt[si]
+                if stmt isa PhiNode
+                    for (k, v) in enumerate(stmt.values)
+                        isassigned(stmt.values, k) || continue
+                        v isa SSAValue && v.id ∈ body_defs || continue
+                        if !(merge_in_region && blk_idx == merge &&
+                             Int(stmt.edges[k]) ∈ body_region)
+                            escapes = true; break
+                        end
+                    end
+                else
+                    for u in stmt_ssa_uses(stmt)
+                        if u.id ∈ body_defs
+                            escapes = true; break
+                        end
+                    end
+                end
+                escapes && break
+            end
+            escapes && break
+        end
+        escapes && continue
+
+        return body_entry, body_region, merge
+    end
+    return nothing
+end
+
 """Count predecessors of `block` in `region` that are not loop backedges to `block`."""
 function count_non_backedge_preds(ir::IRCode, ctx::StructurizeCtx, block::Int, region::Set{Int})
     count = 0
