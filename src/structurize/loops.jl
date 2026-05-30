@@ -668,6 +668,10 @@ function stmt_ssa_uses(@nospecialize(stmt))
         return (stmt.cond,)
     elseif stmt isa ReturnNode && isdefined(stmt, :val) && stmt.val isa SSAValue
         return (stmt.val,)
+    elseif stmt isa PiNode && stmt.val isa SSAValue
+        # A `PiNode`'s refined value is a real use — without this, a post-loop
+        # type-assertion on a loop-internal SSA isn't threaded out as an exit.
+        return (stmt.val,)
     else
         return ()
     end

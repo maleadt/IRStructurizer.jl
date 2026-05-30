@@ -1701,6 +1701,17 @@ end
     @test moved_pos < if_pos
 end
 
+@testset "stmt_ssa_uses sees PiNode operand" begin
+    # A `PiNode`'s refined value is a real use. Missing it lets a post-loop
+    # type-assertion on a loop-internal SSA escape detection, so the value is
+    # never threaded out as a loop result → an out-of-scope reference in a
+    # sibling region. (Regression: AcceleratedKernels' nd-reduction kernel.)
+    @test collect(IRStructurizer.stmt_ssa_uses(Core.PiNode(SSAValue(7), Int))) ==
+          [SSAValue(7)]
+    # A PiNode over a non-SSA value (e.g. an Argument) contributes no SSA use.
+    @test isempty(collect(IRStructurizer.stmt_ssa_uses(Core.PiNode(Core.Argument(2), Int))))
+end
+
 @testset "operands dispatches on IR types" begin
     # PiNode
     pi = Core.PiNode(SSAValue(1), Int)
