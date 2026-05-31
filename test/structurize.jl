@@ -1726,3 +1726,29 @@ end  # Julia for-in-range integration
     # All block args must be unique (no two equal values)
     @test length(all_args) == length(unique(all_args))
 end
+
+@testset "throw inside a loop is preserved (not dropped as a bare break)" begin
+    # A throw INSIDE a counted loop exits the loop to a dead-end (no-successors,
+    # Union{}-typed) block. Previously that block was collapsed to a bare BreakOp,
+    # silently DROPPING the throw — the function returned normally on bad input.
+    # The exit-block statements (the throw) must now be preserved (emitted in place,
+    # terminated by `unreachable`/ReturnNode()).
+    function loop_throw(a::Vector{Float32}, n::Int)
+        acc = 0.0f0
+        for k in 1:n
+            x = @inbounds a[k]
+            if x < 0.0f0
+                throw(DomainError(x))
+            end
+            acc += x
+        end
+        return acc
+    end
+    sci, _ = code_structured(loop_throw, Tuple{Vector{Float32}, Int}) |> only
+    # Behavioral: good input sums; a negative element THROWS. (The bug returned
+    # normally — the loop-exit throw block had been silently dropped to a bare
+    # break.) Executing the structured IR exercises that the throw both survived
+    # structurization and fires.
+    @test execute(sci, Float32[1, 2, 3], 3) == 6.0f0
+    @test_throws DomainError execute(sci, Float32[1, -2, 3], 3)
+end
