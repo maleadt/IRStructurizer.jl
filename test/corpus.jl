@@ -382,4 +382,54 @@ end
     @test @roundtrip invoke_closure(4)
 end
 
+@testset "D-mux: irreducible CFGs (entry multiplexer)" begin
+    # `@goto` produces multi-entry SCCs that no block dominates — irreducible.
+    # normalize_cf inserts one entry multiplexer (the disc-as-carried-value form):
+    # the SCC's entry blocks collapse to a single loop header that dispatches on a
+    # discriminator carry, and a latch unifies the back edges. The result is a
+    # plain reducible LoopOp the existing lift handles. (Was rejected with
+    # UnstructuredControlFlowError; see GROUND_TRUTH.md §3 D-mux.)
+
+    # Canonical 2-entry SCC {BB3,BB5,BB6,BB8}, entries BB3 (from BB1) and BB6
+    # (from BB2). Only terminating inputs (x<=0 with small y oscillates forever,
+    # in the source too).
+    function irreducible(x::Int, y::Int)
+        if x > 0; @goto L2; end
+        @label L1; y += x; if y > 100; return y; end; @goto L2_body
+        @label L2; @label L2_body; y += 1; if y > 100; return y; end; @goto L1
+    end
+    for (x, y) in ((1, 50), (5, 200), (3, 98), (2, -10), (0, 0), (-1, 200), (100, 1))
+        @test @roundtrip irreducible(x, y)
+    end
+
+    # 3-entry SCC → an N=3 discriminator compare-chain in the mux dispatch.
+    function irr3(s::Int, n::Int)
+        acc = 0
+        s == 0 && @goto A
+        s == 1 && @goto B
+        @goto C
+        @label A; acc += 1; acc > n && return acc; @goto B
+        @label B; acc += 2; acc > n && return acc; @goto C
+        @label C; acc += 3; acc > n && return acc; @goto A
+    end
+    for (s, n) in ((0, 10), (1, 10), (2, 10), (0, 0), (1, 5), (2, 100))
+        @test @roundtrip irr3(s, n)
+    end
+
+    # Structural: the SCC collapses to exactly one LoopOp (irreducible loops stay
+    # LoopOp — no While/For promotion, there is no single counting condition), and
+    # structurization succeeds + validates (no UnstructuredControlFlowError).
+    sci, _ = code_structured(irreducible, Tuple{Int, Int}) |> only
+    @test count_stmts(sci.entry, s -> s isa LoopOp) == 1
+    sci3, _ = code_structured(irr3, Tuple{Int, Int}) |> only
+    @test count_stmts(sci3.entry, s -> s isa LoopOp) == 1
+
+    # Determinism (I1): structurizing the same IR twice yields the same shape —
+    # the mux sorts its entries, so no iteration-order nondeterminism leaks in.
+    ir, _ = only(code_ircode(irr3, Tuple{Int, Int}))
+    s1 = sprint(show, MIME"text/plain"(), StructuredIRCode(ir))
+    s2 = sprint(show, MIME"text/plain"(), StructuredIRCode(ir))
+    @test s1 == s2
+end
+
 end  # golden corpus

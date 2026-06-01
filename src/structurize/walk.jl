@@ -46,8 +46,9 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
 
     # Advance the walker toward `target`, resolving loop boundaries
     # (back-edge → ContinueOp, exit → BreakOp); returns nothing if `target`
-    # leaves the region.
-    advance = target -> resolve_dest(target, region_blocks, loop_ctx, block, ctx)
+    # leaves the region. `source` is the block we are leaving — used to resolve
+    # an exit block's phis when re-materializing a region-exit.
+    advance = (target, source) -> resolve_dest(target, region_blocks, loop_ctx, block, ctx, source)
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
@@ -58,12 +59,13 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             if loop_body !== nothing
                 loop_exit = emit_loop!(block, ctx, current, loop_body, region_blocks)
                 # Update last_block to the loop's exit predecessor (for merge phi lookup)
+                exit_src = current
                 if loop_exit !== nothing
                     for b in loop_body
-                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b)
+                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b; exit_src = b)
                     end
                 end
-                current = advance(loop_exit)
+                current = advance(loop_exit, exit_src)
                 continue
             end
         end
@@ -83,15 +85,15 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             end
             return block
         elseif term isa GotoNode
-            current = advance(term.label)
+            current = advance(term.label, current)
         elseif term isa GotoIfNot
             next = emit_branch!(block, ctx, current, term, region_blocks, merge_phis, loop_ctx)
             next === nothing && return block
-            current = advance(next)
+            current = advance(next, current)
         else
             # Fallthrough
             next = current + 1
-            current = advance(next <= nblocks ? next : nothing)
+            current = advance(next <= nblocks ? next : nothing, current)
         end
     end
 
@@ -109,7 +111,8 @@ Returns the dest to continue walking, or nothing if it's a loop exit/back-edge.
 """
 function resolve_dest(dest, region_blocks::Set{Int},
                        loop_ctx::Union{Nothing, LoopCtx}, block::Block,
-                       ctx::Union{Nothing, StructurizeCtx}=nothing)
+                       ctx::Union{Nothing, StructurizeCtx}=nothing,
+                       source::Int=0)
     dest === nothing && return nothing
     if loop_ctx !== nothing
         if dest == loop_ctx.header
@@ -124,7 +127,7 @@ function resolve_dest(dest, region_blocks::Set{Int},
             # breaks — control leaves the loop and the outer walk continues there.
             if ctx !== nothing && block.terminator === nothing &&
                dest != loop_ctx.exit_dest && is_region_exit(ctx.ir, dest)
-                emit_region_exit!(block, ctx, dest)
+                emit_region_exit!(block, ctx, dest, source)
                 return nothing
             end
             block.terminator === nothing &&
@@ -146,17 +149,47 @@ end
 
 """Emit a region-exit block's statements into `block` and set its terminator: the
 block's own `ReturnNode` (re-materialized, value remapped) if it has one, else
-`unreachable` (`ReturnNode()`) for a throw/dead-end."""
-function emit_region_exit!(block::Block, ctx::StructurizeCtx, dest::Int)
+`unreachable` (`ReturnNode()`) for a throw/dead-end. If the returned value is a
+phi of `dest` (e.g. a loop-exit `return acc` whose phi merges the loop value),
+it is resolved to the value on the edge from `source` — the block we re-
+materialize this exit from — so the return reads an in-scope value, not the
+phi (which the walk skips) or the loop's own result."""
+function emit_region_exit!(block::Block, ctx::StructurizeCtx, dest::Int, source::Int=0)
     emit_block_stmts!(block, ctx, dest)
     term = find_terminator(ctx.ir, dest)
     if term isa ReturnNode && isdefined(term, :val)
-        val = remap_ssa_ref(term.val, ctx.ssa_remap)
+        val = resolve_region_exit_value(ctx, dest, source, term.val)
         block.terminator = val === term.val ? term : ReturnNode(val)
     else
         block.terminator = ReturnNode()  # throw/unreachable dead-end
     end
     return block
+end
+
+"""Resolve a region-exit's return value. If `val` is a phi defined in `dest`,
+return the value that phi carries on the edge from `source` (remapped); else
+remap `val` normally."""
+function resolve_region_exit_value(ctx::StructurizeCtx, dest::Int, source::Int,
+                                   @nospecialize(val))
+    if val isa SSAValue && source != 0
+        ev = phi_edge_value(ctx.ir, dest, val.id, source)
+        ev !== nothing && return remap_ssa_ref(ev, ctx.ssa_remap)
+    end
+    return remap_ssa_ref(val, ctx.ssa_remap)
+end
+
+"""If `ssa` is a phi in block `dest`, return the value it carries on the edge
+from predecessor `source`, or `nothing` if `ssa` is not such a phi / has no
+assigned value for that edge."""
+function phi_edge_value(ir::IRCode, dest::Int, ssa::Int, source::Int)
+    bb = ir.cfg.blocks[dest]
+    ssa in first(bb.stmts):last(bb.stmts) || return nothing
+    stmt = ir.stmts.stmt[ssa]
+    stmt isa PhiNode || return nothing
+    for (k, edge) in enumerate(stmt.edges)
+        Int(edge) == source && isassigned(stmt.values, k) && return stmt.values[k]
+    end
+    return nothing
 end
 
 #=============================================================================
@@ -476,7 +509,7 @@ function make_empty_branch_block(dest::Int, from::Int,
             # instead of collapsing to a BreakOp (which would drop the return
             # value or the throw).
             if dest != loop_ctx.exit_dest && is_region_exit(ir, dest)
-                emit_region_exit!(b, ctx, dest)
+                emit_region_exit!(b, ctx, dest, from)
                 return b
             end
             b.terminator = BreakOp(copy(loop_ctx.break_values))

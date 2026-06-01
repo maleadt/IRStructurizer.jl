@@ -487,7 +487,16 @@ end
 
 """The created multiplexer: its block id, the distinct entries (in order), the
 per-entry argument-slice offset into the mux's args, the discriminator arg id
-(0 if a single entry), and any extra arg ids appended at the tail."""
+(0 if a single entry), and any extra arg ids appended at the tail.
+
+`absorb` distinguishes the two roles. When `true` (a loop-header mux: the entries
+are dispatch arms reached *only* from the mux, e.g. irreducible headers), the
+mux reuses the entries' own arg ids and the entries are left arg-less, so each
+entry's body references the mux's carries directly — the dispatch passes nothing
+(disc-as-carried-value). When `false` (a branch-continuation mux: an entry may
+also be reached from inside the continuation, e.g. a short-circuit merge), the
+mux's slice args are fresh and the dispatch forwards them into the entries' phis,
+which the merge-phi machinery then resolves."""
 struct EdgeMux
     mux_id::Int
     entries::Vector{Int}
@@ -496,18 +505,23 @@ struct EdgeMux
     arg_ids::Vector{Int}
     disc_id::Int
     extra_ids::Vector{Int}
+    absorb::Bool
 end
 
 entry_index(mux::EdgeMux, e::Int) = findfirst(==(e), mux.entries)::Int - 1   # 0-based
+# Values the dispatch forwards to entry `e`. Empty under `absorb` (the entry has
+# no args; its body reads the mux's carries directly).
 slice_vals(mux::EdgeMux, e::Int) =
+    mux.absorb ? Any[] :
     Any[SSAValue(mux.arg_ids[mux.offset[e] + k]) for k in 1:mux.nargs[e]]
 
 """Create a multiplexer block for the distinct targets of `entry_list`. Its
 arguments are the union of the entries' block arguments (each entry's slice
 recorded by offset), followed by a discriminator (only if >1 distinct entry),
-followed by `extra_types` block args. Does not yet redirect edges or dispatch —
-see [`redirect_edge!`](@ref) and [`dispatch!`](@ref)."""
-function create_mux!(m::MCFG, entry_list::Vector{Int}; extra_types::Vector=Any[])
+followed by `extra_types` block args. See [`EdgeMux`](@ref) for `absorb`. Does
+not yet redirect edges or dispatch — see [`redirect_edge!`](@ref)/[`dispatch!`](@ref)."""
+function create_mux!(m::MCFG, entry_list::Vector{Int}; absorb::Bool=false,
+                     extra_types::Vector=Any[])
     entries = Int[]
     for e in entry_list
         e in entries || push!(entries, e)
@@ -519,13 +533,18 @@ function create_mux!(m::MCFG, entry_list::Vector{Int}; extra_types::Vector=Any[]
     nargs = Dict{Int, Int}()
     for e in entries
         offset[e] = length(arg_ids)
-        ea = m.blocks[e].args
+        ea = copy(m.blocks[e].args)
         nargs[e] = length(ea)
-        for a in ea
-            id = alloc_id!(m)
-            m.types[id] = get(m.types, a, Any)
-            m.codelocs[id] = get(m.codelocs, a, _NOLOC)
-            push!(arg_ids, id)
+        if absorb
+            append!(arg_ids, ea)            # reuse the entry's arg ids as carries
+            empty!(m.blocks[e].args)        # entry becomes arg-less
+        else
+            for a in ea
+                id = alloc_id!(m)
+                m.types[id] = get(m.types, a, Any)
+                m.codelocs[id] = get(m.codelocs, a, _NOLOC)
+                push!(arg_ids, id)
+            end
         end
     end
 
@@ -547,7 +566,7 @@ function create_mux!(m::MCFG, entry_list::Vector{Int}; extra_types::Vector=Any[]
     end
 
     mux_id = add_block!(m, MBlock(copy(arg_ids), MStmt[], MReturn(), _NOLOC, Any))
-    return EdgeMux(mux_id, entries, offset, nargs, arg_ids, disc_id, extra_ids)
+    return EdgeMux(mux_id, entries, offset, nargs, arg_ids, disc_id, extra_ids, absorb)
 end
 
 """Redirect `ref` through the mux: write its real operands into its target
@@ -616,6 +635,7 @@ targets, then emit the dispatch — MLIR's `createSingleEntryBlock`. Returns the
 mux. `extra` supplies (type, per-edge-value-fn) for an extra carried arg (the
 latch's `shouldRepeat`); `excluded` entries are left out of the dispatch."""
 function single_entry_mux!(m::MCFG, edge_refs_list::Vector{EdgeRef};
+                           absorb::Bool=false,
                            extra_types::Vector=Any[],
                            extra_for::Function=(_ -> Any[]),
                            excluded::Set{Int}=Set{Int}())
@@ -624,10 +644,115 @@ function single_entry_mux!(m::MCFG, edge_refs_list::Vector{EdgeRef};
         t = edge_of(m, r).target
         t in targets || push!(targets, t)
     end
-    mux = create_mux!(m, targets; extra_types)
+    mux = create_mux!(m, targets; absorb, extra_types)
     for r in edge_refs_list
         redirect_edge!(m, mux, r; extra_vals=extra_for(r))
     end
     dispatch!(m, mux; excluded)
     return mux
+end
+
+#=============================================================================
+ normalize_cf — the mutate-then-lift driver.
+
+ Repeatedly find one multi-entry situation and collapse it to single-entry with
+ an EdgeMultiplexer, until none remain. The lift (`structurize_region!`) then
+ only ever sees single-entry regions. Currently handles irreducible (multi-entry)
+ loop headers; continuation muxing is added in a later milestone.
+=============================================================================#
+
+_term_targets(t::MGoto) = (t.edge.target,)
+_term_targets(t::MCondBr) = (t.t.target, t.f.target)
+_term_targets(t::MReturn) = ()
+
+"""A lightweight `CFG` over the mutable blocks (preds/succs only; statement
+ranges are placeholders) for dominance / SCC queries during normalization. Block
+indices equal MBlock ids, so results map straight back."""
+function build_cfg(m::MCFG)
+    nb = length(m.blocks)
+    succs = [Int[] for _ in 1:nb]
+    preds = [Int[] for _ in 1:nb]
+    for (i, b) in enumerate(m.blocks)
+        for tgt in _term_targets(b.term)
+            push!(succs[i], tgt)
+            push!(preds[tgt], i)
+        end
+    end
+    bbs = [BasicBlock(StmtRange(i, i), preds[i], succs[i]) for i in 1:nb]
+    return CFG(bbs, collect(1:nb))
+end
+
+"""Find one irreducible (multi-entry) SCC and collapse its entry blocks to a
+single entry with a mux, MLIR's `createSingleEntryBlock` over entry∪back edges.
+Returns `true` if it muxed one, `false` if the CFG has no irreducible SCC."""
+function normalize_one_irreducible!(m::MCFG)
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    reach = CFGReachability(cfg, domtree)
+    nb = length(m.blocks)
+
+    by_scc = Dict{Int, Vector{Int}}()
+    for bb in 1:nb
+        reach.irreducible[bb] && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
+    end
+    isempty(by_scc) && return false
+
+    # Deterministic pick (no block-index leak into structure beyond a stable
+    # tie-break): smallest SCC id, entry blocks sorted (I1 / D74999).
+    S = by_scc[minimum(keys(by_scc))]
+    Sset = Set(S)
+    entry_blocks = sort!([b for b in S if any(p -> p ∉ Sset, cfg.blocks[b].preds)])
+    @assert length(entry_blocks) >= 1 "irreducible SCC with no entry block"
+
+    # Separate the edges into entry blocks: external (entry edges) and in-SCC
+    # (back edges). Both route through the entry mux; the back edges are routed a
+    # second time through a latch so the header gets a single back edge.
+    entry_refs = EdgeRef[]
+    back_refs = EdgeRef[]
+    for src in sort!(collect(1:nb)), e in entry_blocks
+        dst = src in Sset ? back_refs : entry_refs
+        append!(dst, edge_refs(m, src, e))
+    end
+
+    # 1. Entry mux: collapse the multiple entry blocks to one header. It *absorbs*
+    #    the entries' args (becomes the loop header carrying them); each entry, a
+    #    dispatch arm reached only from the mux, reads them directly.
+    mux = single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
+
+    # 2. Single back edge: the header now has several back-edge predecessors, each
+    #    carrying different header-arg values — which the lift's single carried-
+    #    value set can't represent. Route the back edges through a latch (a mux
+    #    onto the single target = the header), unifying them into one back edge.
+    if length(back_refs) >= 2
+        single_entry_mux!(m, back_refs)        # target = the header mux; absorb=false
+    end
+    return true
+end
+
+"""Mutate `m` until no multi-entry situation remains. Each mux strictly reduces
+the count (the mux block is single-entry by construction), so this terminates."""
+function normalize_cf!(m::MCFG)
+    changed = false
+    guard = 0
+    limit = length(m.blocks) + 16
+    while normalize_one_irreducible!(m)
+        changed = true
+        guard += 1
+        guard > limit && error("normalize_cf! failed to converge (likely a mux bug)")
+    end
+    return changed
+end
+
+"""
+    normalize_cf(ir::IRCode) -> IRCode
+
+Collapse every multi-entry CFG situation (irreducible loop headers; later,
+multi-predecessor continuations) to single-entry via edge multiplexers, so the
+lift only structurizes single-entry regions. Returns `ir` unchanged when it is
+already reducible/single-entry everywhere (the common case) — no perturbation.
+"""
+function normalize_cf(ir::IRCode)
+    m = ingest(ir)
+    normalize_cf!(m) || return ir
+    return emit(m)
 end

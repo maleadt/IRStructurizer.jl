@@ -369,7 +369,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
 
     # 3. Find extra exit values (loop-internal SSAs used outside)
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
-    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported)
+    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported, exit_dest)
 
     # 4. Build init/carried values and block arguments
     init_values = IRValue[]
@@ -534,36 +534,38 @@ function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
 end
 
 """
-Find the primary exit destination of a loop.
+Find the loop's *primary* exit: where control goes when the loop stops iterating
+normally — the continuation. The loop breaks to it and its loop values are
+threaded out as results. A *secondary* exit (an early `return`/`throw` reached
+mid-body) is re-materialized in place instead (invariant I8).
 
-Prefers the immediate post-dominator of the header (the structurally correct
-continuation point). Falls back to any exit with successors (non-dead-end),
-then any exit at all.
+The primary exit is taken at the loop's "keep iterating?" decision, so its source
+block is adjacent to the back edge: it branches to the exit on one side and, on
+the other, to the loop header or a latch (a back-edge source). An irreducible
+loop's mux header dispatches *into* the loop and its latch only loops back, so no
+block is both an exit source and back-edge-adjacent → there is no primary exit
+(`nothing`): every escape is an early return, re-materialized, and the loop has
+no break/result.
+
+Layout-independent (invariant I1): candidates are sorted and the header's
+post-dominator is preferred; nothing keys on raw block order. (MLIR's
+single-exiting latch removes this choice entirely — the M4 cleanup.)
 """
 function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     ir = ctx.ir
-    nblocks = length(ir.cfg.blocks)
-    exits = Int[]
-    for b in loop_blocks
-        for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks && succ ∉ exits && push!(exits, succ)
-        end
-    end
+    exits = sort!(collect(find_loop_exits(ir, loop_blocks)))
     isempty(exits) && return nothing
     length(exits) == 1 && return exits[1]
-    # Prefer post-dominator of header (the natural continuation)
+    latches = Set{Int}(b for b in loop_blocks if header in ir.cfg.blocks[b].succs)
+    backedge_adjacent(b) = header in ir.cfg.blocks[b].succs ||
+                           any(s -> s in latches, ir.cfg.blocks[b].succs)
+    cands = sort!([e for e in exits
+                   if any(b -> e in ir.cfg.blocks[b].succs && backedge_adjacent(b), loop_blocks)])
+    isempty(cands) && return nothing
+    length(cands) == 1 && return cands[1]
     ipdom = ctx.postdomtree.idoms_bb[header]
-    ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
-    # Fall back: prefer exits with successors, then non-throw dead-ends
-    for e in exits
-        e <= nblocks && !isempty(ir.cfg.blocks[e].succs) && return e
-    end
-    for e in exits
-        if e <= nblocks && isempty(ir.cfg.blocks[e].succs)
-            ir.stmts.type[last(ir.cfg.blocks[e].stmts)] !== Union{} && return e
-        end
-    end
-    return first(exits)
+    ipdom != 0 && ipdom in cands && return ipdom
+    return first(cands)
 end
 
 """Find all blocks outside `loop_blocks` that are successors of loop blocks."""
@@ -580,34 +582,25 @@ end
 """
 Find loop-internal SSA values referenced outside the loop.
 
-Scans blocks reachable from loop exit edges (not the entire IR). This is more
-precise than scanning all non-loop blocks: it excludes blocks before the loop
-or on branches that bypass it. Values escape through exit-block phis, direct
-references at downstream blocks, or as operands of sequential loops.
+Scans the post-loop region reachable from the *primary* exit (`exit_dest`), not
+every exit edge: a value only needs threading out if it is read at the loop's
+continuation. Secondary region-exits (early `return`/`throw`) are re-materialized
+in place and read their loop values directly, so they are not scanned — and a
+loop with no primary exit (`exit_dest === nothing`, e.g. an irreducible loop that
+escapes only via early returns) has no escaping values at all. Values escape
+through the continuation's exit-block phis, direct references downstream, or as
+operands of a sequential loop.
 """
 function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
-                                 already_exported::Set{Int})
+                                 already_exported::Set{Int},
+                                 exit_dest::Union{Int, Nothing})
     result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
     seen = Set{Int}()
 
-    # Collect non-loop blocks reachable from loop exit edges.
-    # Skip throw/unreachable blocks (terminal type Union{}): these are error
-    # paths whose values don't need threading because find_loop_exit prefers
-    # non-throw continuations, so throw blocks are not walked after the loop.
+    # Seed from the primary exit only; BFS its successors gives the post-loop
+    # region where loop values may be read.
     reachable = Set{Int}()
-    worklist = Int[]
-    nblocks = length(ir.cfg.blocks)
-    for b in loop_blocks
-        for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks || continue
-            # Skip throw/unreachable blocks
-            if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
-               ir.stmts.type[last(ir.cfg.blocks[succ].stmts)] === Union{}
-                continue
-            end
-            push!(worklist, succ)
-        end
-    end
+    worklist = exit_dest === nothing ? Int[] : Int[exit_dest]
     while !isempty(worklist)
         b = pop!(worklist)
         b ∈ reachable && continue

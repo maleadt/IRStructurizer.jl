@@ -666,6 +666,13 @@ validates that no unstructured control flow remains.
 """
 function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
                           promote::Bool=true)
+    # Mutate-then-lift: collapse every multi-entry CFG situation (irreducible
+    # loop headers; multi-predecessor continuations) to single-entry with edge
+    # multiplexers *before* capturing debug info, so all downstream views use the
+    # normalized IR. A no-op (returns `ir` untouched) for already-reducible CFGs.
+    if structurize && !isempty(ir.stmts.stmt)
+        ir = normalize_cf(ir)
+    end
     argtypes = copy(ir.argtypes)
     sptypes = copy(ir.sptypes)
     stmts = ir.stmts.stmt
