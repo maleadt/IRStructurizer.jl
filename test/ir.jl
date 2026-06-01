@@ -658,6 +658,23 @@ end
     @test length(idx[SSAValue(1)]) == 1  # ReturnNode terminator
 end
 
+@testset "uses tracks :invoke callee (args[2])" begin
+    # `:invoke` args are [CodeInstance/MI, callee, args…]. The callee (args[2])
+    # is a real SSA use — e.g. an outlined closure being applied; missing it lets
+    # DCE drop the statement defining the callee, dangling the invoke. The MI at
+    # args[1] is not a value (here a stand-in Symbol), so it's never a use.
+    block = Block()
+    push!(block.body, (1, Expr(:invoke, :stand_in_mi, SSAValue(0), SSAValue(2)), Int))
+    block.terminator = ReturnNode(SSAValue(1))
+    idx = uses(block)
+    @test length(idx[SSAValue(0)]) == 1   # callee counted as a use
+    @test length(idx[SSAValue(2)]) == 1   # the call argument
+    # replace_uses! must rewrite the callee operand too.
+    replace_uses!(block, SSAValue(0), SSAValue(99))
+    @test isempty(uses(block)[SSAValue(0)])
+    @test length(uses(block)[SSAValue(99)]) == 1
+end
+
 @testset "replace_uses! mutates all positions" begin
     # Verify replace_uses! works on Expr args
     block = Block()
@@ -1699,6 +1716,17 @@ end
     moved_pos = findfirst(==(moved_id), entry_ids)
     @test moved_pos !== nothing
     @test moved_pos < if_pos
+end
+
+@testset "stmt_ssa_uses sees PiNode operand" begin
+    # A `PiNode`'s refined value is a real use. Missing it lets a post-loop
+    # type-assertion on a loop-internal SSA escape detection, so the value is
+    # never threaded out as a loop result → an out-of-scope reference in a
+    # sibling region. (Regression: AcceleratedKernels' nd-reduction kernel.)
+    @test collect(IRStructurizer.stmt_ssa_uses(Core.PiNode(SSAValue(7), Int))) ==
+          [SSAValue(7)]
+    # A PiNode over a non-SSA value (e.g. an Argument) contributes no SSA use.
+    @test isempty(collect(IRStructurizer.stmt_ssa_uses(Core.PiNode(Core.Argument(2), Int))))
 end
 
 @testset "operands dispatches on IR types" begin

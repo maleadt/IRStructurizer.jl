@@ -441,9 +441,12 @@ is_value_like_stmt(@nospecialize(s)) =
 # Fallback for unknown statement types (no-op)
 walk_uses!(f, ::Any) = nothing
 
-# Expr: walk operands
+# Expr: walk operands. For `:invoke`, args are [CodeInstance/MI, callee, args…];
+# the callee (args[2]) is a real SSA use (e.g. a closure being applied) and must
+# be walked — so start at 2. The CodeInstance/MI at args[1] is not a value, so
+# skipping it (by starting at 2) is correct for both `:invoke` and `:call`.
 function walk_uses!(f, expr::Expr)
-    start = expr.head === :invoke ? 3 : 2
+    start = 2
     for i in start:length(expr.args)
         f(IndexedUseRef(expr.args, i))
     end
@@ -597,7 +600,9 @@ end
 """Check if a statement references `target` in any operand position."""
 function _references(@nospecialize(stmt), @nospecialize(target))
     if stmt isa Expr
-        start = stmt.head === :invoke ? 3 : 2
+        # `:invoke` callee (args[2]) is a real use; the MI at args[1] is not a
+        # value, so start at 2 for both `:invoke` and `:call`.
+        start = 2
         for i in start:length(stmt.args)
             normalize_key(stmt.args[i]) == target && return true
         end
