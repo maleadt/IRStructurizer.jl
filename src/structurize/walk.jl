@@ -203,9 +203,9 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
                 first(s for s in bb_succs if s != false_dest)
     cond = remap_ssa_ref(gotoifnot.cond, ctx.ssa_remap)
 
-    # Determine branch regions and merge block using dominance
+    # Determine branch regions and merge block using dominance + exclusion
     then_blocks, else_blocks, merge = find_branch_regions(
-        ctx, current, true_dest, false_dest, region_blocks)
+        ctx, current, true_dest, false_dest, region_blocks, loop_ctx)
 
     # Short-circuit-guarded body (`if a || b { body }`, `a && b`, value forms):
     # the body is the multi-entry continuation reached from BOTH arms, so it falls
@@ -233,27 +233,13 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     else
         false
     end
+    # Continuation-by-exclusion finds the *real* merge directly, so a phi-free
+    # merge is genuinely phi-free: the walk continues through it without a
+    # separate pass-through "absorption" step (D-absorb retired). A no-phi merge
+    # yields `nothing` here → the "merge exists but no phis" path below.
     merge_phis = if merge !== nothing && merge ∈ region_blocks &&
                    (!haskey(ctx.loop_map, merge) || is_multi_entry_header)
         phis = extract_merge_phis(ir, merge, region_blocks)
-        # No phis: absorb a genuine pass-through (no-phi block forwarding
-        # unconditionally) and use its successor's phis — the || pattern. Gate on
-        # a single successor: a multi-successor merge is itself a branch (e.g. a
-        # sequential `if` sharing the condition) and must not be absorbed.
-        if isempty(phis) && length(ir.cfg.blocks[merge].succs) == 1
-            for succ in ir.cfg.blocks[merge].succs
-                if succ ∈ region_blocks && !haskey(ctx.loop_map, succ)
-                    succ_phis = extract_merge_phis(ir, succ, region_blocks)
-                    if !isempty(succ_phis)
-                        # Absorb the pass-through block into the branch regions
-                        # and use the successor as the real merge
-                        merge = succ
-                        phis = succ_phis
-                        break
-                    end
-                end
-            end
-        end
         isempty(phis) ? nothing : phis
     else
         nothing

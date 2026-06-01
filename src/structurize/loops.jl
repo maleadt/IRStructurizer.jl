@@ -3,16 +3,27 @@
 =============================================================================#
 
 """
-    find_branch_regions(ctx, current, true_dest, false_dest, region_blocks)
+    find_branch_regions(ctx, current, true_dest, false_dest, region_blocks, loop_ctx)
         -> (then_blocks, else_blocks, merge)
 
-Split region_blocks into then/else regions using dominance.
-A successor with a single predecessor gets all blocks it dominates.
-A successor with multiple predecessors is a merge block (empty region).
+Split region_blocks into then/else regions using dominance, and select the merge
+(continuation) block by exclusion (`branch_continuation`).
+
+A successor with a single non-backedge predecessor gets all blocks it dominates
+(MLIR's edge-domination test, `CFGToSCF.cpp:981`). A successor with multiple
+predecessors is a merge block (empty arm region).
+
+The merge is the *single* common target of the edges leaving the branch — i.e.
+`branch_continuation` returning exactly one entry. When the continuation is
+absent (both arms diverge) or has more than one entry (a multi-entry
+continuation that needs the edge multiplexer), `merge` is `nothing` and the
+caller routes accordingly. Post-dominance never enters as an ordering key, so
+the result depends only on CFG topology + dominance (invariant I1).
 """
 function find_branch_regions(ctx::StructurizeCtx, current::Int,
                               true_dest::Int, false_dest::Int,
-                              region_blocks::Set{Int})
+                              region_blocks::Set{Int},
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
     ir = ctx.ir
     nblocks = length(ir.cfg.blocks)
 
@@ -37,39 +48,13 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
     # (a block should only be in one region)
     setdiff!(then_blocks, else_blocks)
 
-    # Merge = the block where all paths from `current` reconverge.
-    # Prefer the immediate post-dominator (structurally exact).
-    # Fall back to successor-candidate search when early returns prevent
-    # real post-dominance (ipdom = 0 = virtual exit).
-    merge = nothing
-    ipdom = ctx.postdomtree.idoms_bb[current]
-    if ipdom != 0 && ipdom ∈ region_blocks && ipdom ∉ then_blocks && ipdom ∉ else_blocks
-        merge = ipdom
-    else
-        candidates = Set{Int}()
-        for b in then_blocks
-            for s in ir.cfg.blocks[b].succs
-                s ∉ then_blocks && s != current && push!(candidates, s)
-            end
-        end
-        for b in else_blocks
-            for s in ir.cfg.blocks[b].succs
-                s ∉ else_blocks && s != current && push!(candidates, s)
-            end
-        end
-        if true_dest ∈ region_blocks && true_dest ∉ then_blocks
-            push!(candidates, true_dest)
-        end
-        if false_dest ∈ region_blocks && false_dest ∉ else_blocks
-            push!(candidates, false_dest)
-        end
-        for c in sort!(collect(candidates))
-            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
-                merge = c
-                break
-            end
-        end
-    end
+    # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
+    # merge is the single distinct target of the edges leaving `current ∪ then ∪
+    # else`. A unique target → that's the merge; zero targets → both arms diverge;
+    # multiple targets → a multi-entry continuation handled by the multiplexer.
+    entries, _ = branch_continuation(ctx, current, true_dest, false_dest,
+                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+    merge = length(entries) == 1 ? only(entries) : nothing
 
     return then_blocks, else_blocks, merge
 end
