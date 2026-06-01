@@ -89,15 +89,20 @@ include("structurize/loops.jl")
 =============================================================================#
 
 """
-    structurize(ir::IRCode, line_map) -> (Block, max_ssa, max_arg, line_map)
+    structurize(ir::IRCode, line_map; promote=true) -> (Block, max_ssa, max_arg, line_map)
 
 Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForOp.
+
+The core walk emits only the generic `LoopOp` (invariant I6); `WhileOp`/`ForOp`
+recognition lives entirely in the `promote_loops!` post-pass. Pass `promote=false`
+to get the pre-promotion form (every loop is a `LoopOp`) — used to test I6.
 """
-function structurize(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}())
+function structurize(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}();
+                     promote::Bool=true)
     check_irreducible(ir)
     ctx = StructurizeCtx(ir, line_map)
     all_blocks = Set(1:length(ir.cfg.blocks))
     entry = structurize_region!(ctx, 1, all_blocks)
-    promote_loops!(entry, ctx)
+    promote && promote_loops!(entry, ctx)
     return entry, ctx.next_ssa - 1, ctx.next_arg - 1, ctx.line_map
 end

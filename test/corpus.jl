@@ -287,6 +287,33 @@ end
     @test @roundtrip ((n::Int) -> (i = 0; while i <= n; i += 1; end; i))(4)
 end
 
+@testset "I6: the core walk emits only LoopOp (promotion is a post-pass)" begin
+    # With `promote=false`, every loop must be a generic LoopOp — no ForOp/WhileOp
+    # leaks from the core walk. (With promotion they become For/While; that path is
+    # exercised above.) Counted, step-range, and condition loops all qualify.
+    function no_forwhile(blk::Block)
+        for (_, e) in blk.body
+            (e.stmt isa ForOp || e.stmt isa WhileOp) && return false
+            if e.stmt isa ControlFlowOp
+                for b in IRStructurizer.blocks(e.stmt)
+                    no_forwhile(b) || return false
+                end
+            end
+        end
+        return true
+    end
+    for f in (n -> (acc = 0; for i in 1:n; acc += i; end; acc),
+              n -> (i = 0; while i < n; i += 1; end; i),
+              n -> (acc = 0; for i in 1:2:n; acc += i; end; acc))
+        ir, _ = only(code_ircode(f, Tuple{Int}))
+        sci_raw = StructuredIRCode(ir; promote=false)
+        @test no_forwhile(sci_raw.entry)
+        # ...and with promotion the same IR yields a counted ForOp somewhere.
+        sci_pro = StructuredIRCode(ir; promote=true)
+        @test !no_forwhile(sci_pro.entry)
+    end
+end
+
 @testset "I5: PiNode carry and :invoke closure" begin
     # A value used through a PiNode after the loop must be threaded out.
     function pi_carry(v::Vector{Any}, n::Int)
