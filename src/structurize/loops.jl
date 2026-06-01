@@ -193,8 +193,13 @@ function find_gated_body(ctx::StructurizeCtx, current::Int,
         (isempty(body_region) || body_entry ∉ body_region) && continue
 
         # closure: body preds from arms/body (single entry); succs to body/merge/
-        # return-like (throw/unreachable blocks stay nested in the body)
+        # region-exit. A region-exit (no-successor) successor — a throw/unreachable
+        # dead-end — stays nested in the body and is re-materialized when
+        # structurized, regardless of `region_blocks` membership (a bounds-check
+        # throw dead-ends OUT of an enclosing loop, so it isn't in loop_blocks).
         ok = true
+        exits = Int[]   # region-exit blocks to fold into the body (collected, not
+                        # pushed mid-iteration: body_region is a Set)
         for b in body_region
             b <= nblocks || (ok = false; break)
             for pred in ir.cfg.blocks[b].preds
@@ -206,10 +211,8 @@ function find_gated_body(ctx::StructurizeCtx, current::Int,
             ok || break
             for succ in ir.cfg.blocks[b].succs
                 (succ ∈ body_region || succ == merge) && continue
-                # return-like succ (throw/unreachable): keep it in the body
-                if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
-                   succ ∈ region_blocks
-                    push!(body_region, succ)
+                if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs)
+                    push!(exits, succ)
                     continue
                 end
                 ok = false; break
@@ -217,6 +220,7 @@ function find_gated_body(ctx::StructurizeCtx, current::Int,
             ok || break
         end
         ok || continue
+        union!(body_region, exits)
 
         # must be reached from an arm, and not a self-loop entry
         body_entry ∈ ir.cfg.blocks[body_entry].preds && continue

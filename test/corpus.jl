@@ -191,6 +191,51 @@ end
     end
 end
 
+@testset "D-dup: gated body with in-body region-exits and a loop-carried value" begin
+    # Regression (silent miscompile): a `||`-guarded body inside a loop whose body
+    # both (a) contains bounds-check throws — region-exits that dead-end OUT of the
+    # loop, so they aren't in loop_blocks — and (b) produces a value folded into a
+    # loop-carried accumulator. find_gated_body's closure check rejected the
+    # out-of-loop throw successors, so the multiplexer bailed and the diverge path
+    # silently dropped the whole body (the accumulator stayed 0). The closure check
+    # now treats any no-successor block as a region-exit kept in the body.
+    @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
+    function gated_loop_acc(c::Bool, v::Vector{Int}, n::Int)
+        s = 0
+        for k in 1:n
+            if opaque(c) || k > 2
+                s += (k == 1) ? v[k] : v[k] + 100
+            end
+        end
+        return s
+    end
+    sci, _ = code_structured(gated_loop_acc, Tuple{Bool, Vector{Int}, Int}) |> only
+    @test count_stmts(sci.entry, s -> iscall_to(s, :memoryrefget)) >= 1  # body present, not dropped
+    for (c, v, n) in ((false, [1,2,3], 3), (true, [1,2,3], 3),
+                      (false, [5,6,7,8], 4), (true, [1], 0))
+        @test execute(sci, c, v, n) == gated_loop_acc(c, v, n)
+    end
+
+    # A `||`-guarded body that itself early-returns (body has an internal
+    # region-exit reaching past the guard's continuation).
+    f_ret = (a::Bool, b::Bool, x::Int) -> (if opaque(a) || opaque(b); x > 0 && return x; end; -1)
+    sci_r, _ = code_structured(f_ret, Tuple{Bool, Bool, Int}) |> only
+    for (a, b, x) in ((true, false, 5), (true, false, -5), (false, false, 5))
+        @test execute(sci_r, a, b, x) == f_ret(a, b, x)
+    end
+
+    # Two sequential ||-guards threading a value through the shared merge.
+    function f_seq(a::Bool, b::Bool, n::Int)
+        if opaque(a) || opaque(b); t = n + 1; else; t = n - 1; end
+        if opaque(a) || opaque(b); return t * 2; end
+        return t
+    end
+    sci_s, _ = code_structured(f_seq, Tuple{Bool, Bool, Int}) |> only
+    for a in (false, true), b in (false, true)
+        @test execute(sci_s, a, b, 3) == f_seq(a, b, 3)
+    end
+end
+
 @testset "D-absorb: sequential ifs sharing a condition in a loop" begin
     @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
     @noinline sink(x) = (Base.donotdelete(x); nothing)
