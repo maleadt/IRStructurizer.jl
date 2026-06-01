@@ -61,6 +61,7 @@ end
     include("interface.jl")
     include("structurize.jl")
     include("corpus.jl")
+    include("multiplex.jl")
     include("ir.jl")
     include("unstructurize.jl")
     include("debuginfo.jl")
