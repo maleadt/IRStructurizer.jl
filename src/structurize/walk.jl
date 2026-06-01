@@ -24,6 +24,7 @@ struct LoopCtx
     loop_blocks::Set{Int}
     carried_values::Vector{IRValue}
     break_values::Vector{IRValue}
+    exit_dest::Union{Int, Nothing}   # the loop's primary exit (breaks normally)
 end
 
 """
@@ -116,14 +117,14 @@ function resolve_dest(dest, region_blocks::Set{Int},
                 (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
             return nothing
         elseif dest ∉ loop_ctx.loop_blocks
-            # A loop-exit edge to a dead-end throw/unreachable block (no successors,
-            # terminal type Union{}) is NOT a normal break: collapsing it to a
-            # BreakOp would discard the throw. Emit the block's statements in place
-            # and terminate with `unreachable` (`ReturnNode()`), matching the
-            # non-loop throw path (which keeps the throw call ::Union{}).
+            # A *secondary* region-exit edge (a `return`/`throw` dead-end that is
+            # not the loop's primary exit) is NOT a normal break: collapsing it to
+            # a BreakOp would discard the return value or the throw. Re-materialize
+            # it in place (invariant I8). The primary exit (`exit_dest`) always
+            # breaks — control leaves the loop and the outer walk continues there.
             if ctx !== nothing && block.terminator === nothing &&
-               is_throw_exit(ctx.ir, dest)
-                emit_throw_exit!(block, ctx, dest)
+               dest != loop_ctx.exit_dest && is_region_exit(ctx.ir, dest)
+                emit_region_exit!(block, ctx, dest)
                 return nothing
             end
             block.terminator === nothing &&
@@ -134,19 +135,27 @@ function resolve_dest(dest, region_blocks::Set{Int},
     dest ∈ region_blocks ? dest : nothing
 end
 
-"""A dead-end throw/unreachable block: no successors and terminal type `Union{}`."""
-function is_throw_exit(ir::IRCode, dest::Int)
+"""A region-exit block: no successors (MLIR's `isRegionExitBlock`,
+CFGToSCF.cpp:940). Either a `return` or a `throw`/unreachable dead-end. Reached
+from within a region, it is re-materialized in place rather than collapsed to a
+BreakOp — which would drop the return value or the throw (invariant I8)."""
+function is_region_exit(ir::IRCode, dest::Int)
     1 <= dest <= length(ir.cfg.blocks) || return false
-    bb = ir.cfg.blocks[dest]
-    isempty(bb.succs) || return false
-    return ir.stmts.type[last(bb.stmts)] === Union{}
+    return isempty(ir.cfg.blocks[dest].succs)
 end
 
-"""Emit a dead-end throw block's statements into `block` and set the `unreachable`
-(`ReturnNode()`) terminator — keeps the throw call instead of dropping it as a break."""
-function emit_throw_exit!(block::Block, ctx::StructurizeCtx, dest::Int)
+"""Emit a region-exit block's statements into `block` and set its terminator: the
+block's own `ReturnNode` (re-materialized, value remapped) if it has one, else
+`unreachable` (`ReturnNode()`) for a throw/dead-end."""
+function emit_region_exit!(block::Block, ctx::StructurizeCtx, dest::Int)
     emit_block_stmts!(block, ctx, dest)
-    block.terminator = ReturnNode()  # unreachable
+    term = find_terminator(ctx.ir, dest)
+    if term isa ReturnNode && isdefined(term, :val)
+        val = remap_ssa_ref(term.val, ctx.ssa_remap)
+        block.terminator = val === term.val ? term : ReturnNode(val)
+    else
+        block.terminator = ReturnNode()  # throw/unreachable dead-end
+    end
     return block
 end
 
@@ -462,10 +471,12 @@ function make_empty_branch_block(dest::Int, from::Int,
             b.terminator = ContinueOp(copy(loop_ctx.carried_values))
             return b
         elseif dest ∉ loop_ctx.loop_blocks
-            # Dead-end throw/unreachable exit: emit its statements + `unreachable`
-            # instead of collapsing to a BreakOp (which would drop the throw).
-            if is_throw_exit(ir, dest)
-                emit_throw_exit!(b, ctx, dest)
+            # Secondary region-exit (return/throw/unreachable, not the primary
+            # exit) reached from an empty branch arm: re-materialize it in place
+            # instead of collapsing to a BreakOp (which would drop the return
+            # value or the throw).
+            if dest != loop_ctx.exit_dest && is_region_exit(ir, dest)
+                emit_region_exit!(b, ctx, dest)
                 return b
             end
             b.terminator = BreakOp(copy(loop_ctx.break_values))

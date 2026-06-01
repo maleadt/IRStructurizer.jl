@@ -233,6 +233,53 @@ end
     @test_throws DomainError execute(sci2, -1)
 end
 
+@testset "I8: early return inside a loop (region-exit re-materialization)" begin
+    # A `return` block inside a loop is a region-exit (no successors), like a
+    # throw. Collapsing it to a bare BreakOp dropped the returned value (it failed
+    # to structurize at all — "SSA used but not defined"). It must be
+    # re-materialized in place, while the loop's *primary* exit still breaks.
+    function ret_in_loop(v::Vector{Int}, n::Int)
+        acc = 0
+        for i in 1:n
+            v[i] < 0 && return -i
+            acc += v[i]
+        end
+        return acc
+    end
+    sci, _ = code_structured(ret_in_loop, Tuple{Vector{Int}, Int}) |> only
+    for (v, n) in ((Int[1,2,3], 3), (Int[1,-2,3], 3), (Int[-1,2], 2), (Int[1,2], 0))
+        @test execute(sci, v, n) == ret_in_loop(v, n)
+    end
+
+    function ret_while(n::Int)
+        i = 0
+        while i < n
+            i += 1
+            i == 3 && return 100
+        end
+        return i
+    end
+    sci2, _ = code_structured(ret_while, Tuple{Int}) |> only
+    for n in (1, 5, 2, 0)
+        @test execute(sci2, n) == ret_while(n)
+    end
+
+    # return AND throw both inside the same loop — two distinct secondary exits.
+    function ret_and_throw(v::Vector{Int}, n::Int)
+        s = 0
+        for i in 1:n
+            v[i] == 0 && throw(DomainError(i))
+            v[i] < 0 && return -i
+            s += v[i]
+        end
+        return s
+    end
+    sci3, _ = code_structured(ret_and_throw, Tuple{Vector{Int}, Int}) |> only
+    @test execute(sci3, Int[1, 2, 3], 3) == 6
+    @test execute(sci3, Int[1, -2, 3], 3) == -2
+    @test_throws DomainError execute(sci3, Int[1, 0, 3], 3)
+end
+
 @testset "I6 / promote: counted for, step range, while" begin
     @test @roundtrip ((n::Int) -> (acc = 0; for i in 1:n; acc += i; end; acc))(5)
     @test @roundtrip ((n::Int) -> (i = 0; while i < n; i += 1; end; i))(5)
