@@ -510,10 +510,17 @@ end
 
 entry_index(mux::EdgeMux, e::Int) = findfirst(==(e), mux.entries)::Int - 1   # 0-based
 # Values the dispatch forwards to entry `e`. Empty under `absorb` (the entry has
-# no args; its body reads the mux's carries directly).
-slice_vals(mux::EdgeMux, e::Int) =
-    mux.absorb ? Any[] :
-    Any[SSAValue(mux.arg_ids[mux.offset[e] + k]) for k in 1:mux.nargs[e]]
+# no args; its body reads the mux's carries directly). `live` is the set of mux
+# arg positions that some redirected edge assigned a real (non-`Undef`) value; a
+# position absent from `live` is forwarded as `Undef` — its mux phi would be empty
+# (e.g. a value only the body defines, never the skipped continuation entry).
+function slice_vals(mux::EdgeMux, e::Int, live::Union{Nothing, Set{Int}})
+    mux.absorb && return Any[]
+    off = mux.offset[e]
+    # `Undef`'s type is discarded at emit (it becomes an unassigned phi slot).
+    return Any[(live === nothing || (off + k) in live) ?
+               SSAValue(mux.arg_ids[off + k]) : Undef(Any) for k in 1:mux.nargs[e]]
+end
 
 """Create a multiplexer block for the distinct targets of `entry_list`. Its
 arguments are the union of the entries' block arguments (each entry's slice
@@ -598,13 +605,15 @@ end
 """Emit the mux's dispatch: an integer compare-chain on the discriminator that
 branches to each entry (forwarding that entry's argument slice), the last entry
 serving as the default. Entries in `excluded` are left out (used by the latch,
-which dispatches them through a separate back edge)."""
-function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}())
+which dispatches them through a separate back edge). `live` (see `slice_vals`)
+restricts which slice positions are forwarded by value vs as `Undef`."""
+function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
+                   live::Union{Nothing, Set{Int}}=nothing)
     targets = [e for e in mux.entries if !(e in excluded)]
     @assert !isempty(targets) "dispatch has no targets"
 
     if length(targets) == 1
-        m.blocks[mux.mux_id].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1])))
+        m.blocks[mux.mux_id].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1], live)))
         return
     end
 
@@ -618,16 +627,29 @@ function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}())
         push!(m.blocks[cur].body,
               MStmt(cmp, Expr(:call, Core.:(===), SSAValue(disc), entry_index(mux, e)),
                     Bool, _NOLOC, UInt32(0)))
-        t_edge = MEdge(e, slice_vals(mux, e))
+        t_edge = MEdge(e, slice_vals(mux, e, live))
         if i < length(targets) - 1
             nxt = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC, Any))
             m.blocks[cur].term = MCondBr(SSAValue(cmp), t_edge, MEdge(nxt, Any[]))
             cur = nxt
         else
             last = targets[end]
-            m.blocks[cur].term = MCondBr(SSAValue(cmp), t_edge, MEdge(last, slice_vals(mux, last)))
+            m.blocks[cur].term = MCondBr(SSAValue(cmp), t_edge, MEdge(last, slice_vals(mux, last, live)))
         end
     end
+end
+
+# Mux arg positions that some incoming (redirected) edge assigned a real value.
+# A position never assigned is "dead" — its phi would be empty; the dispatch
+# forwards `Undef` for it instead of referencing the empty phi.
+function _live_positions(m::MCFG, mux::EdgeMux, refs::Vector{EdgeRef})
+    live = Set{Int}()
+    for r in refs
+        for (i, v) in enumerate(edge_of(m, r).args)
+            v isa Undef || push!(live, i)
+        end
+    end
+    return live
 end
 
 """Route every edge in `edge_refs_list` through a fresh mux for their distinct
@@ -648,7 +670,8 @@ function single_entry_mux!(m::MCFG, edge_refs_list::Vector{EdgeRef};
     for r in edge_refs_list
         redirect_edge!(m, mux, r; extra_vals=extra_for(r))
     end
-    dispatch!(m, mux; excluded)
+    live = _live_positions(m, mux, edge_refs_list)
+    dispatch!(m, mux; excluded, live)
     return mux
 end
 
@@ -752,7 +775,100 @@ lift only structurizes single-entry regions. Returns `ir` unchanged when it is
 already reducible/single-entry everywhere (the common case) — no perturbation.
 """
 function normalize_cf(ir::IRCode)
+    # Phase 1: irreducible (multi-entry) loop headers — MBlock-native mutation.
     m = ingest(ir)
-    normalize_cf!(m) || return ir
-    return emit(m)
+    normalize_cf!(m) && (ir = emit(m))
+    # Phase 2: multi-predecessor branch continuations (short-circuits, nested
+    # gated bodies) — reuses the lift's branch_continuation on the (now reducible)
+    # IRCode.
+    return normalize_continuations(ir)
+end
+
+#=============================================================================
+ Continuation multiplexer.
+
+ A conditional whose two arms reconverge at MORE THAN ONE block (the short-circuit
+ shape `if a||b { body }`: `body` is reached from both arms, and so is the merge)
+ has a multi-entry continuation. Route every edge into that continuation through
+ one mux so the continuation becomes single-entry; the lift then structurizes it
+ with the ordinary IfOp path (no shape-matching). This reuses the lift's own
+ `branch_continuation` exclusion analysis (loop-aware), run on the current IRCode.
+=============================================================================#
+
+# The two successors of a conditional block: false = GotoIfNot.dest, true = the
+# other CFG successor (mirrors emit_branch!).
+function _condbr_dests(ir::IRCode, E::Int)
+    g = find_terminator(ir, E)::GotoIfNot
+    false_dest = g.dest
+    succs = ir.cfg.blocks[E].succs
+    true_dest = length(succs) == 1 ? only(succs) : first(s for s in succs if s != false_dest)
+    return true_dest, false_dest
+end
+
+# Minimal LoopCtx for the innermost loop enclosing `E` — `branch_continuation`
+# uses only `header`/`loop_blocks` (to skip the loop's back edge and exit edges,
+# which are not part of a branch's forward continuation).
+function _enclosing_loop_ctx(ctx::StructurizeCtx, E::Int)
+    best_h = 0; best_body = nothing; best_size = typemax(Int)
+    for (h, body) in ctx.loop_map
+        if E in body && length(body) < best_size
+            best_h = h; best_body = body; best_size = length(body)
+        end
+    end
+    best_body === nothing && return nothing
+    return LoopCtx(best_h, best_body, IRValue[], IRValue[], nothing)
+end
+
+# Find one conditional with a multi-entry continuation; return (E, entries) or
+# nothing. `entries` are the distinct continuation blocks (>1).
+function _find_multientry_continuation(ctx::StructurizeCtx)
+    ir = ctx.ir
+    all_blocks = Set(1:length(ir.cfg.blocks))
+    for E in 1:length(ir.cfg.blocks)
+        find_terminator(ir, E) isa GotoIfNot || continue
+        lctx = _enclosing_loop_ctx(ctx, E)
+        true_dest, false_dest = _condbr_dests(ir, E)
+        then_blocks, else_blocks, _ =
+            find_branch_regions(ctx, E, true_dest, false_dest, all_blocks, lctx)
+        entries, notcont = branch_continuation(ctx, E, true_dest, false_dest,
+                                               then_blocks, else_blocks, all_blocks, lctx)
+        length(entries) > 1 && return (E, entries, notcont)
+    end
+    return nothing
+end
+
+"""
+    normalize_continuations(ir::IRCode) -> IRCode
+
+Collapse every multi-predecessor branch continuation to single-entry with an edge
+multiplexer (MLIR `createSingleEntryBlock` for the continuation), to a fixpoint.
+Returns `ir` unchanged when no conditional has a multi-entry continuation. After
+this, `find_branch_regions` always finds a singleton merge, so the lift's ordinary
+IfOp path handles short-circuits, N-way merges, and nested gated bodies uniformly.
+"""
+function normalize_continuations(ir::IRCode)
+    guard = 0
+    while true
+        ctx = StructurizeCtx(ir)
+        found = _find_multientry_continuation(ctx)
+        found === nothing && return ir
+        E, entries, notcont = found
+
+        # The continuation edges: every edge from a branch-region block (notcont)
+        # into a continuation entry. Routing them through one mux makes the
+        # continuation single-entry. Entries keep their phis (a merge may also be
+        # reached from inside the continuation), so absorb=false.
+        entryset = Set(entries)
+        refs = EdgeRef[]
+        m = ingest(ir)
+        for b in notcont, succ in ir.cfg.blocks[b].succs
+            succ in entryset && append!(refs, edge_refs(m, b, succ))
+        end
+        single_entry_mux!(m, refs)
+        ir = emit(m)
+
+        guard += 1
+        guard > length(ir.cfg.blocks) + 64 &&
+            error("normalize_continuations failed to converge (likely a mux bug)")
+    end
 end

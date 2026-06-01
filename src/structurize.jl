@@ -40,17 +40,6 @@ end
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
 alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 
-"""Record the structural type of a (possibly freshly allocated) SSA index.
-`ctx.types` is sized to the original IR; grow it so synthesized indices (e.g. a
-materialized short-circuit discriminator) are addressable like original ones."""
-function set_ssa_type!(ctx::StructurizeCtx, ssa_idx::Int, @nospecialize(T))
-    if ssa_idx > length(ctx.types)
-        resize!(ctx.types, ssa_idx)
-    end
-    ctx.types[ssa_idx] = T
-    return T
-end
-
 """Map a synthesized SSA index to the same source location as an existing SSA index."""
 function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
     haskey(ctx.line_map, source_ssa) || return

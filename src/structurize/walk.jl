@@ -224,6 +224,18 @@ end
  Branch Lifting (IfOp)
 =============================================================================#
 
+"""True iff the branch at `current` has no continuation edges — both arms
+diverge (return/throw/break/continue). The only legitimate reason
+`find_branch_regions` returns `merge === nothing` once continuations are
+single-entry (post `normalize_cf`)."""
+function _both_arms_diverge(ctx::StructurizeCtx, current::Int, true_dest::Int,
+                            false_dest::Int, then_blocks::Set{Int}, else_blocks::Set{Int},
+                            region_blocks::Set{Int}, loop_ctx::Union{Nothing, LoopCtx})
+    entries, _ = branch_continuation(ctx, current, true_dest, false_dest,
+                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+    return isempty(entries)
+end
+
 """
     emit_branch!(block, ctx, current, gotoifnot, region_blocks, outer_merge_phis) -> next
 
@@ -245,23 +257,19 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
                 first(s for s in bb_succs if s != false_dest)
     cond = remap_ssa_ref(gotoifnot.cond, ctx.ssa_remap)
 
-    # Determine branch regions and merge block using dominance + exclusion
+    # Determine branch regions and merge block using dominance + exclusion.
+    # A multi-entry continuation (the short-circuit shape `if a||b { body }`,
+    # nested gated bodies, N-way merges) is collapsed to a single entry upstream
+    # by `normalize_cf`'s continuation multiplexer, so by here the continuation is
+    # always single-entry: `merge` is the unique entry, or `nothing` iff both arms
+    # diverge (zero continuation edges). The lift therefore has one branch path —
+    # no shape-matching (`find_gated_body` is gone; invariant I4).
     then_blocks, else_blocks, merge = find_branch_regions(
         ctx, current, true_dest, false_dest, region_blocks, loop_ctx)
-
-    # Short-circuit-guarded body (`if a || b { body }`, `a && b`, value forms):
-    # the body is the multi-entry continuation reached from BOTH arms, so it falls
-    # into neither then/else region. Materialize the combined predicate as a
-    # boolean region selector and emit the body ONCE under `scf.if` — MLIR's
-    # transformCFGToSCF edge multiplexer, no body duplication.
-    gated = find_gated_body(ctx, current, true_dest, false_dest,
-                            then_blocks, else_blocks, region_blocks, loop_ctx)
-    if gated !== nothing
-        body_entry, body_region, gate_merge = gated
-        return emit_gated_branch!(block, ctx, current, cond, true_dest, false_dest,
-                                  then_blocks, else_blocks, body_entry, body_region,
-                                  gate_merge, region_blocks, loop_ctx)
-    end
+    @assert merge !== nothing || _both_arms_diverge(ctx, current, true_dest, false_dest,
+                                                    then_blocks, else_blocks, region_blocks, loop_ctx) """
+        multi-entry continuation reached the lift at BB$current — normalize_cf's \
+        continuation multiplexer should have collapsed it (internal error)"""
 
     # If merge exists and is in region, extract its phis.
     # Skip phis at loop headers — UNLESS the header has multiple non-loop predecessors
@@ -371,111 +379,6 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     end
 end
 
-"""
-    emit_gated_branch!(...) -> next
-
-Emit a short-circuit-guarded body (`if a || b { body }; rest`) as MLIR's
-`transformCFGToSCF` edge multiplexer — the body is structured ONCE, never
-duplicated.
-
-The continuation has two entry blocks (`body`, `rest=merge`). The multiplexer
-specializes to:
-
-1. An entry `IfOp(cond)` that materializes a boolean region selector — the
-   combined predicate `a || b` — as block result `disc`. Reusing the merge-phi
-   machinery this is a synthetic phi `disc = φ(reaches-body => true, reaches-rest
-   => false)`; the recursive walk routes each arm leaf to the right constant, so
-   nested branches (`a || b || c`) become nested IfOps yielding `disc`. When the
-   continuation carries values (a value-producing `||`/`&&`), the multiplexer
-   also yields, per merge phi, the value on the skip-body (arm→merge) edges as
-   additional block results.
-2. A single `scf.if disc { body } { skip }` that runs the body ONCE. Its results
-   are the merge phi values: the body arm yields the body→merge values; the skip
-   arm forwards the values the entry IfOp produced for the skip path.
-3. The walk continues at `merge`, where the original phi SSAs are now defined by
-   the gated IfOp's results.
-"""
-# MLIR edge multiplexer for a short-circuit-guarded body (CFGToSCF.cpp
-# `EdgeMultiplexer`: https://github.com/llvm/llvm-project/blob/cabad14763b27802296b44b3b5e507f6a4f7a3c5/mlir/lib/Transforms/Utils/CFGToSCF.cpp):
-# the entry IfOp yields a boolean selector (the combined predicate) + skip-path
-# merge values, then one `scf.if selector { body }` runs the body once.
-function emit_gated_branch!(block::Block, ctx::StructurizeCtx, current::Int,
-                            cond, true_dest::Int, false_dest::Int,
-                            then_blocks::Set{Int}, else_blocks::Set{Int},
-                            body_entry::Int, body_region::Set{Int},
-                            merge::Int, region_blocks::Set{Int},
-                            loop_ctx::Union{Nothing, LoopCtx})
-    ir = ctx.ir
-    branch_anchor = last(ir.cfg.blocks[current].stmts)
-
-    # merge phis (only if `merge` is in this region; an outer-merge nested body
-    # has no escaping value). skip_preds = arm→merge edges (not in the body).
-    mp = merge ∈ region_blocks ? extract_merge_phis(ir, merge, region_blocks) : MergePhiInfo[]
-    skip_preds = Int[p for p in ir.cfg.blocks[merge].preds if p ∉ body_region]
-
-    # --- 1. Entry IfOp: yield the selector + skip-path values ---
-    # Selector phi: true on body-reaching arms, false on skip arms; skip phis
-    # forward each merge phi's skip-edge value (Undef on the body edge).
-    disc_ssa = alloc_ssa!(ctx)
-    set_ssa_type!(ctx, disc_ssa, Bool)
-    disc_ev = Dict{Int,Any}(body_entry => true)
-    for p in skip_preds; disc_ev[p] = false; end
-    disc_phis = MergePhiInfo[MergePhiInfo(disc_ssa, disc_ev)]
-
-    skip_ssas = Int[]   # entry-IfOp result holding each phi's skip-path value
-    for phi in mp
-        s = alloc_ssa!(ctx)
-        set_ssa_type!(ctx, s, ctx.types[phi.ssa_idx])
-        push!(skip_ssas, s)
-        ev = Dict{Int,Any}(body_entry => Undef(ctx.types[phi.ssa_idx]))
-        for p in skip_preds
-            ev[p] = get(phi.edge_values, p, Undef(ctx.types[phi.ssa_idx]))
-        end
-        push!(disc_phis, MergePhiInfo(s, ev))
-    end
-
-    then_blk = if !isempty(then_blocks)
-        structurize_region!(ctx, true_dest, then_blocks; merge_phis=disc_phis, loop_ctx=loop_ctx)
-    else
-        make_empty_branch_block(true_dest, current, disc_phis, loop_ctx, ir, ctx)
-    end
-    else_blk = if !isempty(else_blocks)
-        structurize_region!(ctx, false_dest, else_blocks; merge_phis=disc_phis, loop_ctx=loop_ctx)
-    else
-        make_empty_branch_block(false_dest, current, disc_phis, loop_ctx, ir, ctx)
-    end
-    set_branch_yields!(then_blk, disc_phis, then_blocks, current, ir, block, ctx)
-    set_branch_yields!(else_blk, disc_phis, else_blocks, current, ir, block, ctx)
-
-    disc_if = IfOp(cond, then_blk, else_blk)
-    disc_indices = Int[p.ssa_idx for p in disc_phis]
-    disc_types = Any[ctx.types[i] for i in disc_indices]
-    emit_ifop_result!(block, disc_if, disc_indices, disc_types, ctx, branch_anchor)
-
-    # --- 2. Structurize the body ONCE, yielding its merge-phi contributions ---
-    body_merge_phis = isempty(mp) ? nothing : mp
-    body_blk = structurize_region!(ctx, body_entry, body_region;
-                                   merge_phis=body_merge_phis, loop_ctx=loop_ctx)
-    set_yield_if_needed!(body_blk)
-
-    # --- 3. Gate it: scf.if disc { body } { forward skip values } ---
-    skip_blk = Block()
-    skip_blk.terminator = YieldOp(IRValue[SSAValue(s) for s in skip_ssas])
-    body_if = IfOp(SSAValue(disc_ssa), body_blk, skip_blk)
-    if isempty(mp)
-        if_ssa = alloc_ssa!(ctx)
-        push!(block, if_ssa, body_if, Tuple{})
-        anchor_line!(ctx, if_ssa, branch_anchor)
-    else
-        phi_indices = Int[p.ssa_idx for p in mp]
-        phi_types = Any[ctx.types[p.ssa_idx] for p in mp]
-        emit_ifop_result!(block, body_if, phi_indices, phi_types, ctx, branch_anchor)
-    end
-
-    # --- 4. Continue at merge ---
-    return merge
-end
-
 """Set yield terminator on a branch block for merge phis, if not already set."""
 function set_branch_yields!(blk::Block, merge_phis::Vector{MergePhiInfo},
                             branch_blocks::Set{Int}, branch_entry::Int,
@@ -519,8 +422,8 @@ function make_empty_branch_block(dest::Int, from::Int,
     # Merge phis? Use reachability from dest to find the right phi-edge value and
     # yield it directly. Multi-entry continuations (the short-circuit `&&`/`||`
     # shape, where a value is defined in a block between the arms and the merge)
-    # are handled upstream by the `emit_gated_branch!` edge multiplexer, so the
-    # value is always visible here — no tail duplication needed.
+    # were collapsed to single-entry upstream by `normalize_cf`'s continuation
+    # multiplexer, so the value is always visible here — no tail duplication.
     if merge_phis !== nothing && !isempty(merge_phis)
         pred = find_exit_predecessor(merge_phis, Set{Int}([dest]), from, ir)
         b.terminator = make_yield_for_edge(ir, merge_phis, pred, b, ctx)
@@ -599,8 +502,8 @@ end
 """
 Set a region's exit terminator on `blk`: resolve which phi-edge predecessor this
 region reaches and yield that value. Multi-entry continuations (short-circuit
-`&&`/`||`) are handled upstream by the `emit_gated_branch!` edge multiplexer, so
-the yield value is always visible — no tail duplication.
+`&&`/`||`) were collapsed to single-entry upstream by `normalize_cf`, so the
+yield value is always visible — no tail duplication.
 """
 function set_exit_yield!(blk::Block, ir::IRCode, ctx::StructurizeCtx,
                           merge_phis::Vector{MergePhiInfo}, last_block::Int)

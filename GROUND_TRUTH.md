@@ -11,12 +11,15 @@ Roadmap and current status: `PLAN.md`. This file is the checklist you apply to a
 > **edge multiplexer** handles every multi-entry / multi-predecessor situation. No pattern
 > templates, no block-numbering heuristics, no node duplication.
 
-> **Realized vs. target (read this before judging a PR).** Three of the four pillars hold:
-> continuation-by-exclusion ✓, layout independence ✓, no node duplication ✓. The fourth — *a
-> single edge multiplexer* (I4) — does **not** hold yet: it exists only as a 2-entry
-> short-circuit handler (`find_gated_body`), which is itself a shape template with corner
-> cases, and irreducible CFGs are **rejected**. Closing that gap (§3) is the work that takes
-> us from "mostly principled" to "principled". A PR is on the right track when it shrinks §3.
+> **Realized vs. target (read this before judging a PR).** All four pillars now hold:
+> continuation-by-exclusion ✓, layout independence ✓, no node duplication ✓, and *a single
+> edge multiplexer* (I4) ✓ — `normalize_cf` (mutate-then-lift, `src/structurize/multiplex.jl`)
+> collapses every multi-entry/-predecessor situation (irreducible loop headers AND
+> multi-predecessor branch continuations) to single-entry with one `EdgeMultiplexer` *before*
+> the lift runs, so the recursive walk only ever structurizes single-entry regions.
+> `find_gated_body` and the irreducible rejection are gone. The remaining §3 row is the minor
+> multi-exit-latch cleanup (M4). A PR is on the right track when it keeps §3 empty and does not
+> reintroduce inline multi-entry handling in the lift.
 
 ---
 
@@ -29,15 +32,16 @@ Properties the algorithm and its output must satisfy. Most can be made into an a
 | **I1** | **Layout independence.** Output depends only on CFG + (post)dominance, never on block *numbering*. | No `sort!` over block indices in a control decision; permute non-semantic block order → identical structure. | **Holds.** The `sort!` merge tie-break is gone; guarded by the Q2 two-layout test. |
 | **I2** | **No node duplication.** Each source statement appears once (a fresh `ssa_remap` index is a *rename*, not a copy). Reducible CFGs never require duplication. | Count emitted occurrences of each source SSA def. | **Holds.** `tail_duplicate_branch!` was deleted (#48); guarded by the Q3 "body once" test. |
 | **I3** | **Continuation by exclusion.** The `IfOp` merge is the single distinct target of edges leaving the branch, never picked from a list by order. | Merge selection has no block-index tie-break. | **Holds.** `find_branch_regions` uses `branch_continuation`. |
-| **I4** | **One mechanism for many predecessors.** Multi-entry loops, multi-exit loops, and multi-predecessor merges all go through *the edge multiplexer*, not per-shape guards. | Each "merge"-flavored case routes through one multiplexer. | **PARTIAL — the open invariant.** Realized only for 2-entry short-circuits (`find_gated_body`); irreducible rejected; nested gated bodies unsupported. |
+| **I4** | **One mechanism for many predecessors.** Multi-entry loops, multi-exit loops, and multi-predecessor merges all go through *the edge multiplexer*, not per-shape guards. | Each "merge"-flavored case routes through one multiplexer. | **Holds** (except the minor multi-exit latch, M4). `normalize_cf`'s one `EdgeMultiplexer` handles irreducible headers and multi-pred continuations; `find_gated_body` deleted; nested gated bodies work; the lift sees only single-entry regions. Guarded by the D-mux, nested-gated, and fuzz corpus testsets. |
 | **I5** | **Reduce form captures escapees uniformly.** Every value defined in a region and used outside becomes a carry/yield via one escape sweep — no per-use-site casing. | New "value escapes" cases extend the *enumeration* (`stmt_ssa_uses`, `find_extra_exit_values`), not a branch. | **Holds.** Single sweep; `PiNode`/`:invoke` are enumeration entries, not paths. |
 | **I6** | **Core emits only generic loops.** `WhileOp`/`ForOp` recognition lives entirely in `promote_loops!`; the core walk never inspects counting/condition patterns. | No condition/step/`iterate` matching in `walk.jl`/`loops.jl`. | **Holds.** Guarded by the `promote=false` test. |
 | **I7** | **Semantics preservation (empirical).** structurize → unstructurize → execute equals direct execution, for every corpus function. | `@roundtrip` (`test/corpus.jl`, `test/runtests.jl`). | **Holds** for the corpus. The hard stop. |
 | **I8** | **No silent control-flow loss.** Every edge/terminator (throws, early returns, dead-ends) is represented or provably equivalent; nothing is dropped to make a region fit. | Validators + roundtrip on throw/early-return cases. | **Holds** for known shapes; region-exits (return *and* throw) are re-materialized uniformly. |
 
 I7 is the executable ground truth. I1–I6, I8 are the structural ground truth that explain
-*why* a roundtrip can pass today yet break on the next CFG shape. **I4 is where the remaining
-risk lives** — a green corpus does not prove a new multi-entry shape is handled.
+*why* a roundtrip can pass today yet break on the next CFG shape. I4 now holds via the
+upfront `EdgeMultiplexer` normalization; a green corpus still does not *prove* a new
+multi-entry shape is handled, so fuzz exec-vs-direct before trusting it (§4).
 
 ---
 
@@ -91,30 +95,33 @@ A PR should *shrink* this section; growing or adding a row is debt (note it) or 
   `isRegionExitBlock`) reached as a *secondary* exit is re-materialized in place, not dropped
   to a bare break (I8). `is_region_exit`, not the old `Union{}`-only `is_throw_exit`.
   *Was D-throw (closure side).*
-- **Irreducible CFGs lifted, not rejected (D-mux)** — `normalize_cf` (mutate-then-lift,
-  `src/structurize/multiplex.jl`) inserts one `EdgeMultiplexer` per multi-entry SCC: the entry
-  blocks collapse to a single loop header that dispatches on a discriminator carry, and a latch
-  unifies the back edges, yielding a plain reducible `LoopOp`. `check_irreducible` is now a
-  backstop (should never fire), not a rejection. Guarded by the D-mux corpus testset (the `@goto`
-  examples, N=2 and N=3 entries). *Was D-mux.* **This is the first half of I4** (one mechanism for
-  many predecessors); the continuation half (`find_gated_body`) is still open below.
+- **One edge multiplexer for all multi-entry situations (I4)** — `normalize_cf` (mutate-then-lift,
+  `src/structurize/multiplex.jl`) inserts one `EdgeMultiplexer` per multi-entry situation, *before*
+  the lift, so the recursive walk only structurizes single-entry regions:
+  - **Irreducible (multi-entry) loop headers (D-mux)** — the entry blocks collapse to a single
+    loop header that dispatches on a discriminator carry, and a latch unifies the back edges,
+    yielding a plain reducible `LoopOp`. `check_irreducible` is now a backstop, not a rejection.
+  - **Multi-predecessor branch continuations** — short-circuits, N-way merges, and *nested* gated
+    bodies are routed through the same mux so the continuation is single-entry; the ordinary IfOp
+    lift then handles them. `find_gated_body`/`emit_gated_branch!` and the 2-entry shape template
+    are **deleted**. For N=2 the body is still emitted once (no duplication, I2).
+
+  Guarded by the D-mux, nested-gated, body-once (Q3), and fuzz exec-vs-direct corpus testsets. The
+  lift has one branch path and one loop path with no shape-keyed `if` — the litmus now *inverts*
+  (a future PR adding `if <CFG shape>` to the lift is a clear regression). *Was the open I4 gap.*
 
 **Open — the remaining ad-hoc surface, in priority order:**
 
 | Gap | Where | What's ad-hoc | Principled end state | At risk |
 |-----|-------|---------------|----------------------|---------|
-| **The multiplexer's continuation case is a 2-entry shape-matcher** | `find_gated_body` (`loops.jl`) | Identifies a gateable body by explicit dominance + closure + single-escape conditions. Fails on shapes it can't pattern-match — **nested gated bodies in a loop are unsupported** (fail loudly via SSA validation). | Route multi-pred continuations through the *same* `EdgeMultiplexer` (now built — `multiplex.jl`) upfront, so the lift sees single-entry continuations and `find_gated_body` is deleted. | **I4** |
 | **Primary loop-exit selection** | `find_loop_exit`, `find_extra_exit_values` (`loops.jl`) | The primary exit is the back-edge-adjacent exit (topology + dominance only, layout-independent); the escape sweep seeds from it. A residual preference for *which* exit is primary remains (no exit is dropped — I8-safe). | Single-exiting latch via the multiplexer over all exit edges (no "primary" choice). | I4 (minor, M4) |
 
-The first two collapse into **one** change — a uniform N-entry edge multiplexer (MLIR's
-`EdgeMultiplexer`) — which would delete `find_gated_body`, fix nested gated bodies, and lift
-irreducible CFGs together. It is the single highest-leverage convergence left. In the current
-*recursive-walk* architecture (we build structured ops directly over an immutable `IRCode`),
-realizing it likely means one of: (a) a **CFG-mutation pre-pass** that inserts mux blocks and
-redirects entry edges, MLIR-style, so the walk then sees only single-entry regions; or (b)
-generalizing `find_gated_body`'s discriminator-as-yield trick to N entries *within* the walk.
-Which is tractable is an open **design** question (see PLAN.md / §"research" below), not a
-literature gap.
+The architecture is **mutate-then-lift** (`normalize_cf`): physically insert mux/latch/dispatch
+blocks and redirect edges so the CFG is single-entry everywhere, then run a lift that never sees a
+multi-entry region. Do **not** reintroduce inline multi-entry handling in the lift — that is the
+divergence this closed. The one remaining row (M4) folds `find_loop_exit`'s primary-exit preference
+into a single-exiting latch over all exit edges; current handling is correct (I8-safe), so it is
+cleanup, not a correctness gap.
 
 ---
 

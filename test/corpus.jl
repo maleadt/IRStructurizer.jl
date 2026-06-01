@@ -432,4 +432,99 @@ end
     @test s1 == s2
 end
 
+@testset "I4: nested gated bodies (continuation multiplexer)" begin
+    # The canonical case the continuation multiplexer fixes. A `||`-guarded body
+    # whose body is ITSELF a `||`-guarded body, inside a loop carrying an
+    # accumulator. On the #48 baseline this silently miscompiled; on the rework
+    # baseline (2-entry `find_gated_body`) it failed loudly via SSA validation.
+    # Now every multi-pred continuation is collapsed to single-entry upstream, so
+    # the ordinary IfOp lift handles arbitrary nesting (invariant I4).
+    @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
+    function nested_gated(a::Bool, b::Bool, n::Int)
+        s = 0
+        for k in 1:n
+            if opaque(a) || k > 1
+                if opaque(b) || k > 2
+                    s += k
+                end
+            end
+        end
+        return s
+    end
+    sci, _ = code_structured(nested_gated, Tuple{Bool, Bool, Int}) |> only  # must not throw
+    # The innermost guarded write `s += k` (a memoryref-free add into the carry)
+    # is emitted once, not duplicated per guard arm (invariant I2).
+    @test count_stmts(sci.entry, s -> iscall_to(s, :add_int)) == 2   # `s += k` and the IV `k += 1`
+    for a in (false, true), b in (false, true), n in (0, 1, 3, 5)
+        @test execute(sci, a, b, n) == nested_gated(a, b, n)
+    end
+
+    # Three-deep nesting, value-producing (each level contributes to the result).
+    function nest3(a::Bool, b::Bool, c::Bool, x::Int)
+        r = 0
+        if opaque(a) || x > 0
+            if opaque(b) || x > 1
+                if opaque(c) || x > 2
+                    r = x * 10
+                end
+            end
+        end
+        return r
+    end
+    sci3, _ = code_structured(nest3, Tuple{Bool, Bool, Bool, Int}) |> only
+    for a in (false, true), b in (false, true), c in (false, true), x in (-1, 0, 1, 2, 3)
+        @test execute(sci3, a, b, c, x) == nest3(a, b, c, x)
+    end
+end
+
+@testset "fuzz: multi-entry shapes, exec vs direct" begin
+    # The corpus families' two latent silent miscompiles were both found by
+    # fuzzing with exec-vs-direct, not by a green structural net. Enumerate
+    # short-circuit / nested-guard / guard-in-loop / guard-with-early-exit shapes
+    # and assert structurize→unstructurize→execute == direct for every input.
+    @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
+
+    fns = Any[
+        # mixed &&/|| chains
+        (x::Int, y::Int, z::Int) -> ((opaque(x > 0) || y > 0) && z > 0) ? 1 : 2,
+        (x::Int, y::Int, z::Int) -> (opaque(x > 0) && (y > 0 || z > 0)) ? 1 : 2,
+        (x::Int, y::Int, z::Int) -> (x > 0 || y > 0 || z > 0) ? 1 : 2,
+        (x::Int, y::Int, z::Int) -> (x > 0 && y > 0 && z > 0) ? 1 : 2,
+        # guard in a loop feeding a carried accumulator
+        (a::Bool, n::Int) -> (s = 0; for k in 1:n; if opaque(a) || k > 2; s += k; end; end; s),
+        # nested guards in a loop
+        (a::Bool, b::Bool, n::Int) -> (s = 0; for k in 1:n
+            if opaque(a) || k > 1; if opaque(b) || k > 2; s += k * k; end; end; end; s),
+        # guard whose body early-returns
+        (a::Bool, b::Bool, x::Int) -> (if opaque(a) || opaque(b); x > 0 && return x; end; -1),
+        # value defined in one guard, used in a later guard (undef phi slot)
+        (c1::Bool, c2::Bool, n::Int) -> (local t; if c1 || c2; t = n + 1; end;
+                                         s = 0; if c1 || c2; s = t; end; s),
+        # sequential guards threading a value through the shared merge
+        (a::Bool, b::Bool, n::Int) -> (if opaque(a) || opaque(b); t = n + 1; else; t = n - 1; end;
+                                       if opaque(a) || opaque(b); return t * 2; end; t),
+    ]
+    args_for(nparams) = nparams == 2 ? [(false, 5), (true, 5), (false, 0), (true, 3)] :
+        nparams == 3 ? Iterators.product((false, true), (false, true), (-1, 0, 1, 2)) |> collect |> vec :
+        []
+    nfuzz = 0
+    for f in fns
+        m = only(methods(f))
+        nparams = m.nargs - 1
+        # Build the type signature and the input set from parameter kinds.
+        ms = code_structured(f) |> only
+        sci = ms.first
+        # Infer inputs: enumerate booleans for Bool params, small ints otherwise.
+        ptypes = [fieldtype(Base.tuple_type_tail(m.sig), i) for i in 1:nparams]
+        choices = [pt === Bool ? (false, true) : (-1, 0, 1, 2, 5) for pt in ptypes]
+        for combo in Iterators.product(choices...)
+            exp = f(combo...)
+            got = execute(sci, combo...)
+            @test got == exp
+            nfuzz += 1
+        end
+    end
+    @test nfuzz > 100   # sanity: the fuzz actually ran a meaningful number of cases
+end
+
 end  # golden corpus
