@@ -401,10 +401,10 @@ function _assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges, or
     n = length(all_stmts)
     nb = length(bb_ranges)
     bb_blocks = BasicBlock[]
-    cfg_index = Int[]
-    for r in bb_ranges
+    cfg_index = Int[]                       # first stmt of blocks 2..nb (length nb-1)
+    for (i, r) in enumerate(bb_ranges)
         push!(bb_blocks, BasicBlock(StmtRange(first(r), last(r)), Int[], Int[]))
-        push!(cfg_index, first(r))
+        i > 1 && push!(cfg_index, first(r))
     end
     for (i, r) in enumerate(bb_ranges)
         last_s = all_stmts[last(r)]

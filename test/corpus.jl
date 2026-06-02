@@ -557,6 +557,25 @@ end
     for a in (false, true), b in (false, true), n in (0, 1, 3)
         @test execute(sci2, a, b, n) == shared_ret(a, b, n)
     end
+
+    # A shared exit path that itself contains a branch (the returned value is a
+    # ternary), reached from both `||` arms — re-materialized once per arm, its
+    # internal merge must get fresh SSA (not defined twice). Found by review.
+    function shared_branch_exit(a::Bool, b::Bool, c::Bool, n::Int)
+        acc = 0
+        for k in 1:n
+            if opaque(a) || opaque(b)
+                r = opaque(c) ? acc + 100 : acc + 200
+                return r + k
+            end
+            acc += k
+        end
+        return acc
+    end
+    sci4, _ = code_structured(shared_branch_exit, Tuple{Bool, Bool, Bool, Int}) |> only
+    for a in (false, true), b in (false, true), c in (false, true), n in (0, 1, 3)
+        @test execute(sci4, a, b, c, n) == shared_branch_exit(a, b, c, n)
+    end
 end
 
 @testset "fuzz: multi-entry shapes, exec vs direct" begin

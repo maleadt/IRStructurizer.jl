@@ -422,6 +422,13 @@ function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     exits = sort!(collect(find_loop_exits(ir, loop_blocks)))
     isempty(exits) && return nothing
     length(exits) == 1 && return exits[1]
+    # The header's post-dominator is THE continuation when it resolves: every
+    # non-early-exit path reaches it. (It is 0/virtual only when every path
+    # returns/throws early — the irreducible / all-early-exit case handled below.)
+    ipdom = ctx.postdomtree.idoms_bb[header]
+    ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
+    # No post-dominating continuation: pick the back-edge-adjacent exit (the
+    # loop's iteration-exit decision), or `nothing` if every exit is early.
     latches = Set{Int}(b for b in loop_blocks if header in ir.cfg.blocks[b].succs)
     backedge_adjacent(b) = header in ir.cfg.blocks[b].succs ||
                            any(s -> s in latches, ir.cfg.blocks[b].succs)
@@ -429,8 +436,6 @@ function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
                    if any(b -> e in ir.cfg.blocks[b].succs && backedge_adjacent(b), loop_blocks)])
     isempty(cands) && return nothing
     length(cands) == 1 && return cands[1]
-    ipdom = ctx.postdomtree.idoms_bb[header]
-    ipdom != 0 && ipdom in cands && return ipdom
     return first(cands)
 end
 

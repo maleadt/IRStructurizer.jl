@@ -198,12 +198,17 @@ function emit_exit_path!(block::Block, ctx::StructurizeCtx, dest::Int, loop_ctx:
         end
     end
 
+    # Fresh-rename every SSA definition in the path — body statements AND the
+    # results of internal merges (phi nodes, which the lift re-materializes as
+    # `getfield`s keyed on the phi's index). Without renaming the phis too, a path
+    # with an internal branch re-materialized in several arms would define the
+    # merge's index in more than one block.
     saved_remap = copy(ctx.ssa_remap)
     for b in region
         bb = ir.cfg.blocks[b]
         for si in first(bb.stmts):last(bb.stmts)
             s = ir.stmts.stmt[si]
-            (s isa PhiNode || s isa GotoNode || s isa GotoIfNot || s isa ReturnNode) && continue
+            (s isa GotoNode || s isa GotoIfNot || s isa ReturnNode) && continue
             fresh = alloc_ssa!(ctx)
             ctx.ssa_remap[si] = fresh
             anchor_line!(ctx, fresh, si)

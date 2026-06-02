@@ -101,6 +101,17 @@ end
     end
 end
 
+@testset "emit produces a well-formed CFG index" begin
+    # `CFG.index` lists the first statement of blocks 2..n (length n-1), excluding
+    # block 1 — an off-by-one here makes `block_for_inst` mis-map every statement.
+    for (f, args) in _corpus_cases()
+        ir, _ = only(code_ircode(f, Tuple{map(typeof, args)...}))
+        ir2 = emit(ingest(ir))
+        @test length(ir2.cfg.index) == length(ir2.cfg.blocks) - 1
+        @test ir2.cfg.index == [first(b.stmts) for b in ir2.cfg.blocks[2:end]]
+    end
+end
+
 # Structurize a muxed IRCode and execute it (build_ir comes from corpus.jl).
 mux_exec(m, args...) = exec_ir(CCx.IRCode(StructuredIRCode(emit(m))), args...)
 
