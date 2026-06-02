@@ -91,10 +91,16 @@ A PR should *shrink* this section; growing or adding a row is debt (note it) or 
   Guarded by the Q1 test. *Was D-split.*
 - **Shared-tail duplication** — gone; the 2-entry multiplexer emits the tail once (I2).
   Guarded by the Q3 test. *Was D-dup.*
-- **Region exits** — a `return` or `throw` block (`numSuccessors == 0`, MLIR's
-  `isRegionExitBlock`) reached as a *secondary* exit is re-materialized in place, not dropped
-  to a bare break (I8). `is_region_exit`, not the old `Union{}`-only `is_throw_exit`.
-  *Was D-throw (closure side).*
+- **Region exits / region-exit paths** — a *secondary* loop exit that leads only to
+  return-like dead-ends (`numSuccessors == 0`, MLIR's `isRegionExitBlock`) is re-materialized
+  in place, not dropped to a bare break (I8). This covers a region-exit block reached directly
+  AND a multi-block exit *path* to one (e.g. an `||`-short-circuit whose exit edge lands on a
+  `goto #ret` pass-through, not the `return` itself) — `resolve_loop_exit!`/`emit_exit_path!`
+  walk the path and re-materialize it (renaming its body to fresh SSA so a return shared by
+  several arms isn't defined twice). `exit_reaches_primary` distinguishes such a path (returns
+  independently) from one that rejoins the continuation (a break). *Was D-throw; the path
+  generalization fixed silent miscompiles present even on the pre-PLAN2 baseline, found by
+  fuzzing.*
 - **One edge multiplexer for all multi-entry situations (I4)** — `normalize_cf` (mutate-then-lift,
   `src/structurize/multiplex.jl`) inserts one `EdgeMultiplexer` per multi-entry situation, *before*
   the lift, so the recursive walk only structurizes single-entry regions:

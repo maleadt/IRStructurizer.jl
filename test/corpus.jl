@@ -68,6 +68,11 @@ iscall_to(stmt, fname::Symbol) =
     stmt isa Expr && stmt.head === :call && !isempty(stmt.args) &&
     (c = stmt.args[1]; c isa GlobalRef && c.name === fname)
 
+# Module-level opaque barrier so functions built by `eval` in the generative
+# fuzz (which run in module scope) can reference it (a testset-local `opaque`
+# would be invisible to them).
+@noinline fuzz_opaque(b::Bool) = Base.compilerbarrier(:type, b)::Bool
+
 @testset "golden corpus" begin
 
 #=============================================================================
@@ -566,6 +571,49 @@ end
         end
     end
     @test nfuzz > 100   # sanity: the fuzz actually ran a meaningful number of cases
+end
+
+@testset "fuzz: generated nested guards (no silent miscompile)" begin
+    # Generative fuzz over the shape space the edge multiplexer targets: random
+    # nested ||/&& guards, value-through-merge ternaries, and early returns, all
+    # inside a counted loop carrying an accumulator. structurize→unstructurize→
+    # execute must equal direct, for every input. This generator is exactly how
+    # the ||-guarded-return-in-loop miscompile (now fixed) was caught — a green
+    # hand-written corpus did not. Seeded + bounded for reproducibility.
+    rng = Ref(0x2c9277b5_1f8e3a07 % UInt64)
+    nextu() = (rng[] = rng[] * 0x5851f42d4c957f2d + 0x14057b7ef767814f; rng[] >> 33)
+    ri(n) = Int(nextu() % n)
+    pick(xs) = xs[ri(length(xs)) + 1]
+    function gcond(d)
+        atoms = ["fuzz_opaque(p$(ri(3)+1))", "k > $(ri(4))", "p$(ri(3)+1)"]
+        (d <= 0 || ri(3) == 0) && return pick(atoms)
+        "($(gcond(d-1)) $(pick(["||","&&"])) $(gcond(d-1)))"
+    end
+    function gbody(d, ind)
+        pad = "    "^ind; lines = String[]
+        for _ in 1:(ri(3)+1)
+            c = ri(d <= 0 ? 2 : 4)
+            if c == 0; push!(lines, "$(pad)s += k")
+            elseif c == 1; push!(lines, "$(pad)s += $(ri(9)+1)")
+            elseif c == 2
+                push!(lines, "$(pad)if $(gcond(2))"); append!(lines, gbody(d-1, ind+1)); push!(lines, "$(pad)end")
+            else; push!(lines, "$(pad)if $(gcond(1)); return s + $(ri(5)); end")
+            end
+        end
+        lines
+    end
+    nchecks = 0
+    for i in 1:40
+        src = "function _ff$(i)(p1::Bool,p2::Bool,p3::Bool,n::Int)\n s=0\n for k in 1:n\n" *
+              join(gbody(3, 1), "\n") * "\n end\n return s\nend"
+        f = eval(Meta.parse(src))
+        sci = (code_structured(f, Tuple{Bool,Bool,Bool,Int}) |> only).first   # must not throw
+        for p1 in (false,true), p2 in (false,true), p3 in (false,true), n in (0,1,2,4)
+            @test execute(sci, p1, p2, p3, n) == Base.invokelatest(f, p1, p2, p3, n)
+            nchecks += 1
+        end
+    end
+    @test nchecks > 500
 end
 
 end  # golden corpus
