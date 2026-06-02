@@ -1600,20 +1600,22 @@ end
 
 end
 
-@testset "for-in-range whose loop var escapes is not a buggy ForOp" begin
+@testset "for-in-range whose loop var escapes is a kept-carry ForOp" begin
     # `for i in 1:n; last = i; end; return last` copies the loop variable into
-    # `last`. For a `1:n` range the iterate protocol makes `last` a *shadow* of the
-    # loop state (value == state), and `last` is read after the loop. Promoting to
-    # a ForOp aliased that shadow to the range's upper bound, returning `n+1`
-    # instead of `n` — a silent miscompile (`forlast(1) → 2`) that had NO execution
-    # check, so it went unnoticed (the ISSUES.md #3 root cause via the direct
-    # iterate-protocol path). The IV-escape gate keeps it a LoopOp, carrying `last`
-    # correctly. A for-in-range with a true accumulator still promotes (see the
-    # "Julia for-in-range (1:n) produces ForOp" testset above).
+    # `last`. For a `1:n` range the iterate protocol makes `last` a value#1 *shadow*
+    # of the loop state, and `last` is read after the loop. An earlier promotion
+    # aliased that shadow to the range's upper bound, returning `n+1` instead of `n`
+    # — a silent miscompile (`forlast(1) → 2`) that had NO execution check, so it
+    # went unnoticed (the ISSUES.md #3 root cause via the direct iterate-protocol
+    # path). It now promotes to a ForOp that *keeps* `last` as an ordinary carried
+    # value whose continue is the induction variable (PLAN7 Phase 2 §3 — NOT the
+    # lifted continue, which is the advanced `iv+step` = the bound): the last value
+    # is the last in-body IV (= n), and the empty range is guarded by the outer
+    # `if` so the init (0) is returned for n < 1.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             last = 0
-            @check "loop"
+            @check "for"
             for i in 1:n
                 last = i
             end
@@ -1628,11 +1630,41 @@ end
         end
         return last
     end |> only
-    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
 
     forlast(n) = (last = 0; for i in 1:n; last = i; end; last)
-    for n in (-3, 0, 1, 3, 5)
+    for n in (-3, 0, 1, 2, 3, 5, 50, 200)
         @test execute(sci, n) == forlast(n)   # empty → 0; else → n (was n+1 when buggy)
+    end
+
+    # Step ≠ 1 (`1:2:n`): the last in-body odd ≤ n. Empty → init 0.
+    forlast2(n) = (last = 0; for i in 1:2:n; last = i; end; last)
+    sci2, _ = code_structured(Tuple{Int}) do n
+        last = 0
+        for i in 1:2:n
+            last = i
+        end
+        return last
+    end |> only
+    @test count_stmts(sci2.entry, x -> x isa ForOp) == 1
+    for n in (-3, 0, 1, 2, 4, 5, 6, 50, 200)
+        @test execute(sci2, n) == forlast2(n)
+    end
+
+    # Escaping index-capture shadow read *in-body* alongside a real accumulator
+    # (the shadow's in-body uses must resolve to the IV, not the write-only carry).
+    forboth(n) = (last = 0; acc = 0; for i in 1:n; acc += i; last = i; end; last + acc)
+    sci3, _ = code_structured(Tuple{Int}) do n
+        last = 0; acc = 0
+        for i in 1:n
+            acc += i
+            last = i
+        end
+        return last + acc
+    end |> only
+    @test count_stmts(sci3.entry, x -> x isa ForOp) == 1
+    for n in (-3, 0, 1, 2, 5, 50, 200)
+        @test execute(sci3, n) == forboth(n)
     end
 end
 

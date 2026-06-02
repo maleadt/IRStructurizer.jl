@@ -93,6 +93,11 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                     push!(new_body, (idx, new_gf, entry.type, entry.flag))
                 else
+                    # `upper` alias for a removed IV/shadow position. Since PLAN7
+                    # keeps every *escaping* removed position as a real carry, this
+                    # branch is reachable only for a provably-dead getfield (the
+                    # IV-escape gate returned false), so the alias is never observed.
+                    @assert !_ssa_used_in_block(SSAValue(idx), idx, block) "escaping removed position aliased to upper (PLAN7 invariant violated)"
                     push!(new_body, (idx, for_op.upper, entry.type, entry.flag))
                 end
             else
@@ -465,15 +470,19 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         _ssa_used_in_block(SSAValue(gf_idx), gf_idx, parent_block) && return (loop, Int[], Dict{Int,Int}())
     end
 
-    # IV-escape gate (ISSUES.md #3): removed positions (the IV and its shadows) are
-    # aliased to `upper` post-loop — wrong for an empty loop, whose final IV is the
-    # init. If any such position (one that aliases to `upper`, i.e. not a duplicate
-    # carry redirected to a real carry) is read after the loop, keep the LoopOp.
-    # A genuine `for i in lo:hi` never reads its IV afterwards, so this stays inert.
+    # IV-escape gate (ISSUES.md #3 / PLAN7 Phase 2): removed positions (the IV and
+    # its value#1 shadows) would otherwise be aliased to `upper` post-loop — wrong
+    # for an empty loop, whose final IV is the init. Rather than decline the whole
+    # promotion, *partition* `removed`: any escaping position becomes a real kept
+    # carry (read back normally), while the rest stay removed (their `upper` alias
+    # is then provably dead). Duplicate-carry redirects stay removed (an Undef-init
+    # dup is not a meaningful escaping value; it is folded into its survivor).
+    kept = Int[]
     for r in removed
         haskey(carry_redirect, r) && continue
-        loop_result_pos_escapes(idx, r, parent_block) && return (loop, Int[], Dict{Int,Int}())
+        loop_result_pos_escapes(idx, r, parent_block) && push!(kept, r)
     end
+    removed = setdiff(removed, kept)   # run before any count(p<…, removed)/carry_types
 
     # --- Build ForOp ---
     lower = loop.init_values[iv_pos]
@@ -489,19 +498,24 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     for_body = Block()
     arg_remap = Dict{Int, BlockArgument}()
 
-    # Map IV and shadow IVs to ForOp's iv_arg (skip duplicate carries)
+    # Map (still-)removed IV / shadow IVs to ForOp's iv_arg (skip duplicate carries)
     for r in removed
         haskey(carry_redirect, r) && continue
         arg_remap[body.args[r].id] = iv_arg
     end
 
-    # Non-IV, non-shadow, non-duplicate args get fresh BlockArguments
+    # Retained carries — genuine carries AND kept escaping IV/shadows (no longer in
+    # `removed`) — get fresh BlockArguments in original index order, each with its
+    # own init. A kept escaping IV/shadow is the current IV *in-body* (e.g. the same
+    # value an `acc += i` reads), so its in-body uses must resolve to `iv_arg`; its
+    # fresh for-arg is then a write-only carry slot that only exposes the post-loop
+    # result. A genuine carry maps its body uses to its own for-arg as usual.
     non_iv_inits = IRValue[]
     for (i, arg) in enumerate(body.args)
         i ∈ removed && continue
         for_arg = BlockArgument(alloc_arg!(ctx), arg.type)
         push!(for_body.args, for_arg)
-        arg_remap[arg.id] = for_arg
+        arg_remap[arg.id] = (i ∈ kept) ? iv_arg : for_arg
         push!(non_iv_inits, loop.init_values[i])
     end
 
@@ -510,23 +524,53 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         arg_remap[body.args[dup_pos].id] = arg_remap[body.args[surv_pos].id]
     end
 
-    # Body: stmts before the exit IfOp + continue branch stmts (minus IV increment)
+    # ContinueOp values. A kept escaping position must carry `iv_arg` itself — NOT
+    # its lifted continue, which is the *advanced* value `iv+step` (the iterate
+    # protocol advances before re-checking, so that continue equals `upper`, the
+    # post-loop bound). Carrying `iv_arg` makes the kept carry's last value the last
+    # in-body IV (`upper − step`), matching the LoopOp's break (the pre-advance
+    # current value); the empty range is guarded by the outer `if`, so the init is
+    # only read when the loop ran (PLAN7 §3 — the research answer is wrong here).
+    cont_values = IRValue[]
+    for (i, v) in enumerate(continue_op.values)
+        i ∈ removed && continue
+        push!(cont_values, i ∈ kept ? iv_arg : v)
+    end
+
+    # The IV increment (`step_ssa = iv + step`) is implicit in the range. Kept
+    # carries reference `iv_arg`, not the increment, so the statement is needed only
+    # if some other retained body stmt or surviving carried value reads it. Keep it
+    # iff referenced — a dead increment is harmless, a missing one dangles.
     last_idx = body.body.ssa_idxes[end]
+    incr_used = false
+    if step_ssa !== nothing
+        for v in cont_values
+            v isa SSAValue && v.id == step_ssa && (incr_used = true; break)
+        end
+        if !incr_used
+            for (sidx, sentry) in body.body
+                sidx == last_idx && break
+                _refs_ssa_deep(sentry.stmt, SSAValue(step_ssa)) && (incr_used = true; break)
+            end
+        end
+        if !incr_used
+            for (sidx, sentry) in cont_region.body
+                sidx == step_ssa && continue
+                _refs_ssa_deep(sentry.stmt, SSAValue(step_ssa)) && (incr_used = true; break)
+            end
+        end
+    end
+
+    # Body: stmts before the exit IfOp + continue branch stmts (minus dead increment)
     for (sidx, sentry) in body.body
         sidx == last_idx && break
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     for (sidx, sentry) in cont_region.body
-        step_ssa !== nothing && sidx == step_ssa && continue  # skip IV increment
+        step_ssa !== nothing && sidx == step_ssa && !incr_used && continue  # drop dead IV increment
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
-    # ContinueOp with non-IV, non-shadow values
-    cont_values = IRValue[]
-    for (i, v) in enumerate(continue_op.values)
-        i ∈ removed && continue
-        push!(cont_values, v)
-    end
     for_body.terminator = ContinueOp(cont_values)
 
     remap_block_args!(for_body, arg_remap)
