@@ -20,78 +20,10 @@
 # reducible IRCode that the existing lift handles with no new concepts; for N=2
 # the chain is a single `GotoIfNot` → one `IfOp`.
 
-#=============================================================================
- Explicit-edge mutable CFG
-=============================================================================#
-
-"""An edge to a target block, carrying the operands for the target's block
-arguments (one per arg, in order). Operands are `SSAValue`/`Argument`/constant/
-`Undef`. `Undef` becomes an unassigned phi slot at `emit`."""
-mutable struct MEdge
-    target::Int            # MBlock id
-    args::Vector{Any}      # successor operands, parallel to target's block args
-end
-MEdge(target::Int) = MEdge(target, Any[])
-
-# Terminators with explicit edges (no fallthrough reliance).
-struct MGoto;   edge::MEdge;                       end
-struct MCondBr; cond::Any; t::MEdge; f::MEdge;      end   # GotoIfNot: true=t, false=f
-struct MReturn; val::Any; has_val::Bool;           end    # ReturnNode(val) / ReturnNode()
-const MTerm = Union{MGoto, MCondBr, MReturn}
-
-MReturn() = MReturn(nothing, false)        # unreachable / throw dead-end
-
-"""A statement in a block body: stable id, statement, type, debug codeloc, and
-the `IR_FLAG_*` bitmask carried over from the source IRCode."""
-struct MStmt
-    id::Int
-    stmt::Any
-    type::Any
-    codeloc::NTuple{3, Int32}
-    flag::UInt32
-end
-
-"""A basic block in explicit-edge form: block arguments (the SSA ids that were
-phi nodes), body statements, and a terminator with explicit edges.
-`term_codeloc` is the debug location to attach to the emitted terminator."""
-mutable struct MBlock
-    args::Vector{Int}      # stable ids of block arguments (were phi results)
-    body::Vector{MStmt}
-    term::MTerm
-    term_codeloc::NTuple{3, Int32}
-    term_type::Any         # terminator's type; `Union{}` marks an unreachable/throw dead-end
-end
-MBlock() = MBlock(Int[], MStmt[], MReturn(), (Int32(0), Int32(0), Int32(0)), Any)
-
-"""The whole mutable CFG. Blocks are indexed by id == position in `blocks`; the
-vector only ever grows (mux/trampoline blocks appended), so ids are stable.
-`types`/`codelocs` cover block-argument and synthesized ids; body-statement
-types/codelocs live in the `MStmt`s."""
-mutable struct MCFG
-    blocks::Vector{MBlock}
-    entry::Int
-    order::Vector{Int}                 # logical block order (preserved across emit)
-    types::Dict{Int, Any}              # id → type (block args + synthesized stmts)
-    codelocs::Dict{Int, NTuple{3, Int32}}  # id → codeloc (block args + synthesized)
-    flags::Dict{Int, UInt32}           # id → IR_FLAG_* bitmask (block args)
-    next_id::Int                       # next fresh stable id
-    # carried through for emit
-    argtypes::Vector{Any}
-    sptypes::Vector{Any}
-    debuginfo::Any
-    valid_worlds::Any
-end
-
-alloc_id!(m::MCFG) = (id = m.next_id; m.next_id += 1; id)
-
-"""Append a new block, returning its id. Placed last in the logical order unless
-`order=false` (used for fallthrough trampolines, which `emit` places inline)."""
-function add_block!(m::MCFG, b::MBlock; order::Bool=true)
-    push!(m.blocks, b)
-    id = length(m.blocks)
-    order && push!(m.order, id)
-    return id
-end
+# The `MBlock`/`MCFG` type definitions live in `structurize/mcfg.jl` (included
+# before the lift so its method signatures can name them). This file holds the
+# operations: `ingest`/`emit` (the IRCode boundary), the `EdgeMultiplexer`, and
+# the `normalize_cf!` mutate fixpoint.
 
 #=============================================================================
  ingest: IRCode → MCFG  (phi → block-arg + edge-operands)
@@ -99,10 +31,14 @@ end
 
 const _NOLOC = (Int32(0), Int32(0), Int32(0))
 
+# Per-statement debug location, captured at ingest into each `MStmt.codeloc`.
+# 1.12+: the `(line, inlined_at, ?)` triple from the `DebugInfoStream`. 1.11: the
+# single linetable index `stmts.line[pc]` stashed in slot 1 (slots 2/3 unused),
+# so `capture_debuginfo` can rebuild the SCI line map without a dense round-trip.
 @static if VERSION >= v"1.12-"
-    _codeloc(di, pc::Int) = CC.getdebugidx(di, pc)::NTuple{3, Int32}
+    _codeloc(ir::IRCode, pc::Int) = CC.getdebugidx(ir.debuginfo, pc)::NTuple{3, Int32}
 else
-    _codeloc(di, pc::Int) = _NOLOC
+    _codeloc(ir::IRCode, pc::Int) = (Int32(ir.stmts.line[pc]), Int32(0), Int32(0))
 end
 
 """
@@ -118,7 +54,6 @@ function ingest(ir::IRCode)
     blocks = [MBlock() for _ in 1:nb]
     types = Dict{Int, Any}()
     codelocs = Dict{Int, NTuple{3, Int32}}()
-    flags = Dict{Int, UInt32}()
 
     # Per block: parallel to args, the phi's (pred_bb → value) map. Transient,
     # consumed below to fill edge operands.
@@ -133,13 +68,12 @@ function ingest(ir::IRCode)
         last_loc = _NOLOC
         for si in first(bb.stmts):last(bb.stmts)
             stmt = ir.stmts.stmt[si]
-            loc = _codeloc(di, si)
+            loc = _codeloc(ir, si)
             last_loc = loc
             if stmt isa PhiNode
                 push!(mb.args, si)
                 types[si] = ir.stmts.type[si]
                 codelocs[si] = loc
-                flags[si] = ir.stmts.flag[si]
                 ev = Dict{Int, Any}()
                 for (k, edge) in enumerate(stmt.edges)
                     if isassigned(stmt.values, k)
@@ -150,14 +84,12 @@ function ingest(ir::IRCode)
             elseif stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode
                 term_stmt = stmt
                 mb.term_codeloc = loc
-                mb.term_type = ir.stmts.type[si]
             else
                 push!(mb.body, MStmt(si, stmt, ir.stmts.type[si], loc, ir.stmts.flag[si]))
             end
         end
-        if term_stmt === nothing            # fallthrough block
-            mb.term_codeloc = last_loc
-            mb.term_type = i < nb ? Any : Union{}   # goto-next, or unreachable dead-end
+        if term_stmt === nothing            # fallthrough block: goto-next, or
+            mb.term_codeloc = last_loc      # unreachable dead-end if last (MReturn)
         end
         mb.term = _ingest_term(term_stmt, i, bb, nb)
     end
@@ -168,7 +100,7 @@ function ingest(ir::IRCode)
     end
 
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
-    return MCFG(blocks, 1, collect(1:nb), types, codelocs, flags,
+    return MCFG(blocks, 1, types, codelocs,
                 length(ir.stmts.stmt) + 1,
                 copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
 end
@@ -213,13 +145,62 @@ function _fill_edge!(e::MEdge, src::Int, blocks, phivals, types)
 end
 
 #=============================================================================
- emit: MCFG → IRCode  (block-arg + edge-operands → phi)
+ capture_debuginfo: MCFG → (debuginfo table, line_map)
+
+ The SCI resolves a statement's source location by `line_map[ssa_idx]` (negative =
+ direct PC into the table; positive = anchor to another id to follow) + the table.
+ Build both from the `MBlock` codelocs: each statement keeps its location at its
+ own stable id, so there is no dense round-trip. The dual of `emit`'s debug-info
+ rebuild — but the lift reads `MBlock` directly, so this is all that survives.
+=============================================================================#
+
+@static if VERSION >= v"1.12-"
+    function capture_debuginfo(m::MCFG)
+        maxid = m.next_id - 1
+        line = fill(Int32(0), max(maxid, 0) * 3)
+        line_map = Dict{Int, Int}()
+        setloc!(id, loc) = (off = 3 * (id - 1);
+                            line[off + 1] = loc[1]; line[off + 2] = loc[2]; line[off + 3] = loc[3])
+        for b in m.blocks
+            for s in b.body
+                setloc!(s.id, s.codeloc); line_map[s.id] = -s.id
+            end
+            for a in b.args
+                setloc!(a, get(m.codelocs, a, _NOLOC)); line_map[a] = -a
+            end
+        end
+        di = CC.DebugInfoStream(line)
+        if m.debuginfo isa CC.DebugInfoStream
+            di.def = m.debuginfo.def
+            di.linetable = m.debuginfo.linetable
+            di.edges = copy(m.debuginfo.edges)
+        end
+        return di, line_map
+    end
+else
+    function capture_debuginfo(m::MCFG)
+        line_map = Dict{Int, Int}()
+        for b in m.blocks
+            for s in b.body
+                li = Int(s.codeloc[1]); li != 0 && (line_map[s.id] = -li)
+            end
+            for a in b.args
+                li = Int(get(m.codelocs, a, _NOLOC)[1]); li != 0 && (line_map[a] = -li)
+            end
+        end
+        debuginfo_table = m.debuginfo isa Vector ? copy(m.debuginfo) : Core.LineInfoNode[]
+        return debuginfo_table, line_map
+    end
+end
+
+#=============================================================================
+ Duplicate-edge split (run by `lift_mcfg` before the lift)
 =============================================================================#
 
 """A trampoline block `Tr: goto target(args)`. Reached only by an explicit
-`GotoNode`/`GotoIfNot`-dest edge (never fallthrough), so its placement is free."""
+`GotoNode`/`GotoIfNot`-dest edge, so it has a single predecessor."""
 _new_trampoline(target::Int, args::Vector{Any}) =
-    MBlock(Int[], MStmt[], MGoto(MEdge(target, args)), _NOLOC, Any)
+    MBlock(Int[], MStmt[], MGoto(MEdge(target, args)), _NOLOC)
 
 """Split any `GotoIfNot` whose two edges target the same block: route the false
 edge through a trampoline so the target has two distinct predecessor blocks (a
@@ -235,153 +216,6 @@ function split_duplicate_edges!(m::MCFG)
         end
     end
 end
-
-"""Build the emit order from `m.order`, preserving it exactly and inserting a
-fallthrough trampoline only where a `GotoIfNot`'s true target is not already the
-next block (Julia's `GotoIfNot` falls through to the next block on `true`). On
-un-mutated input the original order is fallthrough-correct, so this is identity;
-mutation (mux/redirect) is the only source of trampolines."""
-function layout!(m::MCFG)
-    seq = Int[]
-    base = m.order
-    for (idx, id) in enumerate(base)
-        push!(seq, id)
-        t = m.blocks[id].term
-        t isa MCondBr || continue
-        next_id = idx < length(base) ? base[idx + 1] : 0
-        if t.t.target != next_id
-            e = t.t                     # reroute true edge through a trampoline
-            tr = add_block!(m, _new_trampoline(e.target, copy(e.args)); order=false)
-            e.target = tr; empty!(e.args)
-            push!(seq, tr)
-        end
-    end
-    return seq
-end
-
-# All (predecessor id, edge operands) pairs targeting each block, in placed order.
-function _incoming_edges(m::MCFG, order::Vector{Int})
-    incoming = Dict{Int, Vector{Tuple{Int, Vector{Any}}}}()
-    for id in order
-        t = m.blocks[id].term
-        if t isa MGoto
-            push!(get!(Vector{Tuple{Int, Vector{Any}}}, incoming, t.edge.target), (id, t.edge.args))
-        elseif t isa MCondBr
-            push!(get!(Vector{Tuple{Int, Vector{Any}}}, incoming, t.t.target), (id, t.t.args))
-            push!(get!(Vector{Tuple{Int, Vector{Any}}}, incoming, t.f.target), (id, t.f.args))
-        end
-    end
-    return incoming
-end
-
-# A shallow-enough copy for emit: duplicate the mutable spine (blocks, their
-# terminators and edges, the order) so emit's trampoline insertion/redirection
-# doesn't touch the caller's MCFG. The id→type/codeloc/flag dicts are read-only
-# during emit and are shared.
-_copy_edge(e::MEdge) = MEdge(e.target, copy(e.args))
-_copy_term(t::MGoto) = MGoto(_copy_edge(t.edge))
-_copy_term(t::MCondBr) = MCondBr(t.cond, _copy_edge(t.t), _copy_edge(t.f))
-_copy_term(t::MReturn) = t
-_copy_block(b::MBlock) = MBlock(copy(b.args), copy(b.body), _copy_term(b.term),
-                                b.term_codeloc, b.term_type)
-function _copy_for_emit(m::MCFG)
-    MCFG(MBlock[_copy_block(b) for b in m.blocks], m.entry, copy(m.order),
-         m.types, m.codelocs, m.flags, m.next_id,
-         m.argtypes, m.sptypes, m.debuginfo, m.valid_worlds)
-end
-
-"""
-    emit(m::MCFG) -> IRCode
-
-Rebuild a dense `IRCode` from the mutable form. Chooses a fallthrough-preserving
-block order (inserting trampolines as needed), reconstructs phi nodes from block
-arguments + per-edge operands, remaps stable ids to dense positions, and rebuilds
-the CFG and debug info. Non-mutating: operates on a private copy of `m`.
-"""
-function emit(m_in::MCFG)
-    m = _copy_for_emit(m_in)
-    split_duplicate_edges!(m)
-    order = layout!(m)
-    incoming = _incoming_edges(m, order)
-
-    # Dense position assignment: per block, [args (phis)..., body..., terminator].
-    bb_of = Dict{Int, Int}()       # mblock id → final BB index
-    pos_of = Dict{Int, Int}()      # stable id → dense position
-    nstmts = 0
-    for (bi, id) in enumerate(order)
-        bb_of[id] = bi
-        b = m.blocks[id]
-        for a in b.args; nstmts += 1; pos_of[a] = nstmts; end
-        for s in b.body; nstmts += 1; pos_of[s.id] = nstmts; end
-        nstmts += 1                # terminator
-    end
-
-    remap_val(@nospecialize(v)) = v isa SSAValue ? SSAValue(pos_of[v.id]) : v
-    remap_stmt(@nospecialize(s)) = remap_ssa(s, remap_val)
-
-    all_stmts = Vector{Any}(undef, nstmts)
-    all_types = Vector{Any}(undef, nstmts)
-    all_flags = fill(UInt32(0), nstmts)
-    line = fill(Int32(0), nstmts * 3)
-    bb_ranges = UnitRange{Int}[]
-
-    pos = 0
-    setloc!(p, loc) = (off = 3*(p-1); line[off+1] = loc[1]; line[off+2] = loc[2]; line[off+3] = loc[3])
-    for id in order
-        b = m.blocks[id]
-        start = pos + 1
-        # Phis from block arguments. A predecessor whose operand is `Undef` is
-        # omitted (an unlisted phi edge = undef on that path), reproducing the
-        # original phi's edge set; the discriminator guarantees no live path reads
-        # an omitted slot.
-        for (j, a) in enumerate(b.args)
-            phi = PhiNode(Int32[], Any[])
-            for (src, ops) in get(incoming, id, Tuple{Int, Vector{Any}}[])
-                ops[j] isa Undef && continue
-                push!(phi.edges, Int32(bb_of[src]))
-                push!(phi.values, remap_val(ops[j]))
-            end
-            pos += 1
-            all_stmts[pos] = phi
-            all_types[pos] = get(m.types, a, Any)
-            all_flags[pos] = get(m.flags, a, UInt32(0))
-            setloc!(pos, get(m.codelocs, a, _NOLOC))
-        end
-        # Body.
-        for s in b.body
-            pos += 1
-            all_stmts[pos] = remap_stmt(s.stmt)
-            all_types[pos] = s.type
-            all_flags[pos] = s.flag
-            setloc!(pos, s.codeloc)
-        end
-        # Terminator.
-        pos += 1
-        all_stmts[pos] = _emit_term(b.term, bb_of, remap_val)
-        all_types[pos] = b.term_type
-        setloc!(pos, b.term_codeloc)
-        push!(bb_ranges, start:pos)
-    end
-
-    return _assemble(m, all_stmts, all_types, all_flags, line, bb_ranges)
-end
-
-# Reconstruct a terminator statement from the explicit-edge form. A CondBr's true
-# target is guaranteed (by layout!) to be the next block → GotoIfNot fallthrough.
-function _emit_term(t::MTerm, bb_of, remap_val)
-    if t isa MGoto
-        return GotoNode(bb_of[t.edge.target])
-    elseif t isa MCondBr
-        return GotoIfNot(remap_val(t.cond), bb_of[t.f.target])
-    else  # MReturn
-        return t.has_val ? ReturnNode(remap_val(t.val)) : ReturnNode()
-    end
-end
-
-# Build the CFG (preds/succs) and IRCode from the flat statement arrays.
-_assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges) =
-    build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
-                       argtypes=m.argtypes, sptypes=m.sptypes, debuginfo=m.debuginfo)
 
 #=============================================================================
  EdgeMultiplexer  (port of CFGToSCF.cpp EdgeMultiplexer::create/redirectEdge/
@@ -505,7 +339,7 @@ function create_mux!(m::MCFG, entry_list::Vector{Int}; absorb::Bool=false,
         push!(extra_ids, id)
     end
 
-    mux_id = add_block!(m, MBlock(copy(arg_ids), MStmt[], MReturn(), _NOLOC, Any))
+    mux_id = add_block!(m, MBlock(copy(arg_ids), MStmt[], MReturn(), _NOLOC))
     return EdgeMux(mux_id, entries, offset, nargs, arg_ids, disc_id, extra_ids, absorb)
 end
 
@@ -562,7 +396,7 @@ function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
                     Bool, _NOLOC, UInt32(0)))
         t_edge = MEdge(e, slice_vals(mux, e, live))
         if i < length(targets) - 1
-            nxt = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC, Any))
+            nxt = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC))
             m.blocks[cur].term = MCondBr(SSAValue(cmp), t_edge, MEdge(nxt, Any[]))
             cur = nxt
         else
@@ -741,7 +575,7 @@ function single_exiting_latch!(m::MCFG, header::Int,
     push!(m.blocks[latch].body,
           MStmt(cmp, Expr(:call, Core.:(===), SSAValue(sr_id), 1), Bool, _NOLOC, UInt32(0)))
     header_edge = MEdge(header, slice_vals(mux, header, live))
-    exitblk = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC, Any))
+    exitblk = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC))
     m.blocks[latch].term = MCondBr(SSAValue(cmp), header_edge, MEdge(exitblk, Any[]))
 
     if isempty(exit_targets)
@@ -879,41 +713,6 @@ function normalize_one_loop_latch!(m::MCFG)
     return false
 end
 
-"""Mutate `m` until no multi-entry situation remains. Each mux strictly reduces
-the count (the mux block is single-entry by construction), so this terminates."""
-function normalize_cf!(m::MCFG)
-    changed = false
-    guard = 0
-    limit = length(m.blocks) + 16
-    # Each step collapses one multi-entry header (irreducible) or one multi-exit
-    # loop (the single-exiting latch + reduce form) — both strictly reduce the
-    # remaining count, so this terminates.
-    while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m)
-        changed = true
-        guard += 1
-        guard > 4 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
-    end
-    return changed
-end
-
-"""
-    normalize_cf(ir::IRCode) -> IRCode
-
-Collapse every multi-entry CFG situation (irreducible loop headers; later,
-multi-predecessor continuations) to single-entry via edge multiplexers, so the
-lift only structurizes single-entry regions. Returns `ir` unchanged when it is
-already reducible/single-entry everywhere (the common case) — no perturbation.
-"""
-function normalize_cf(ir::IRCode)
-    # Phase 1: irreducible (multi-entry) loop headers — MBlock-native mutation.
-    m = ingest(ir)
-    normalize_cf!(m) && (ir = emit(m))
-    # Phase 2: multi-predecessor branch continuations (short-circuits, nested
-    # gated bodies) — reuses the lift's branch_continuation on the (now reducible)
-    # IRCode.
-    return normalize_continuations(ir)
-end
-
 #=============================================================================
  Continuation multiplexer.
 
@@ -921,26 +720,16 @@ end
  shape `if a||b { body }`: `body` is reached from both arms, and so is the merge)
  has a multi-entry continuation. Route every edge into that continuation through
  one mux so the continuation becomes single-entry; the lift then structurizes it
- with the ordinary IfOp path (no shape-matching). This reuses the lift's own
- `branch_continuation` exclusion analysis (loop-aware), run on the current IRCode.
+ with the ordinary IfOp path (no shape-matching). Reuses the lift's own
+ `branch_continuation` exclusion analysis (loop-aware) directly on the MBlock CFG.
 =============================================================================#
-
-# The two successors of a conditional block: false = GotoIfNot.dest, true = the
-# other CFG successor (mirrors emit_branch!).
-function _condbr_dests(ir::IRCode, E::Int)
-    g = find_terminator(ir, E)::GotoIfNot
-    false_dest = g.dest
-    succs = ir.cfg.blocks[E].succs
-    true_dest = length(succs) == 1 ? only(succs) : first(s for s in succs if s != false_dest)
-    return true_dest, false_dest
-end
 
 # Minimal LoopCtx for the innermost loop enclosing `E` — `branch_continuation`
 # uses only `header`/`loop_blocks` (to skip the loop's back edge and exit edges,
 # which are not part of a branch's forward continuation).
-function _enclosing_loop_ctx(ctx::StructurizeCtx, E::Int)
+function enclosing_loop_ctx(loops::Dict{Int, Set{Int}}, E::Int)
     best_h = 0; best_body = nothing; best_size = typemax(Int)
-    for (h, body) in ctx.loop_map
+    for (h, body) in loops
         if E in body && length(body) < best_size
             best_h = h; best_body = body; best_size = length(body)
         end
@@ -949,56 +738,152 @@ function _enclosing_loop_ctx(ctx::StructurizeCtx, E::Int)
     return LoopCtx(best_h, best_body, IRValue[], IRValue[])
 end
 
-# Find one conditional with a multi-entry continuation; return (E, entries) or
-# nothing. `entries` are the distinct continuation blocks (>1).
-function _find_multientry_continuation(ctx::StructurizeCtx)
-    ir = ctx.ir
-    all_blocks = Set(1:length(ir.cfg.blocks))
-    for E in 1:length(ir.cfg.blocks)
-        find_terminator(ir, E) isa GotoIfNot || continue
-        lctx = _enclosing_loop_ctx(ctx, E)
-        true_dest, false_dest = _condbr_dests(ir, E)
+"""Find one conditional with a multi-entry continuation and route every edge into
+that continuation through one mux (MLIR `createSingleEntryBlock` for the
+continuation), making it single-entry. Returns `true` if it muxed one. After this
+the lift's ordinary IfOp path handles short-circuits, N-way merges, and nested
+gated bodies uniformly — `find_branch_regions` always finds a singleton merge."""
+function normalize_one_continuation!(m::MCFG)
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    loops = natural_loops_m(m)
+    all_blocks = Set(1:length(m.blocks))
+    for E in 1:length(m.blocks)
+        t = m.blocks[E].term
+        t isa MCondBr || continue
+        true_dest, false_dest = t.t.target, t.f.target
+        lctx = enclosing_loop_ctx(loops, E)
         then_blocks, else_blocks, _ =
-            find_branch_regions(ctx, E, true_dest, false_dest, all_blocks, lctx)
-        entries, notcont = branch_continuation(ctx, E, true_dest, false_dest,
+            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx)
+        entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
                                                then_blocks, else_blocks, all_blocks, lctx)
-        length(entries) > 1 && return (E, entries, notcont)
-    end
-    return nothing
-end
-
-"""
-    normalize_continuations(ir::IRCode) -> IRCode
-
-Collapse every multi-predecessor branch continuation to single-entry with an edge
-multiplexer (MLIR `createSingleEntryBlock` for the continuation), to a fixpoint.
-Returns `ir` unchanged when no conditional has a multi-entry continuation. After
-this, `find_branch_regions` always finds a singleton merge, so the lift's ordinary
-IfOp path handles short-circuits, N-way merges, and nested gated bodies uniformly.
-"""
-function normalize_continuations(ir::IRCode)
-    guard = 0
-    while true
-        ctx = StructurizeCtx(ir)
-        found = _find_multientry_continuation(ctx)
-        found === nothing && return ir
-        E, entries, notcont = found
+        length(entries) > 1 || continue
 
         # The continuation edges: every edge from a branch-region block (notcont)
         # into a continuation entry. Routing them through one mux makes the
-        # continuation single-entry. Entries keep their phis (a merge may also be
+        # continuation single-entry. Entries keep their args (a merge may also be
         # reached from inside the continuation), so absorb=false.
         entryset = Set(entries)
         refs = EdgeRef[]
-        m = ingest(ir)
-        for b in notcont, succ in ir.cfg.blocks[b].succs
+        for b in sort!(collect(notcont)), succ in cfg.blocks[b].succs
             succ in entryset && append!(refs, edge_refs(m, b, succ))
         end
         single_entry_mux!(m, refs)
-        ir = emit(m)
-
-        guard += 1
-        guard > length(ir.cfg.blocks) + 64 &&
-            error("normalize_continuations failed to converge (likely a mux bug)")
+        return true
     end
+    return false
+end
+
+#=============================================================================
+ Loop pre-header.
+
+ A loop header reached by more than one entry edge (an `if/else` before the loop,
+ or the absorbed entry-dispatch of an irreducible loop) is *also* a branch merge.
+ Route those entry edges through one pre-header so the header gains a single
+ non-back predecessor — MLIR's `newLoopParentBlock` (`CFGToSCF.cpp:854`), built
+ here in the mutate phase rather than during the lift.
+=============================================================================#
+
+"""Find one loop header with ≥2 entry edges and route them through a single
+pre-header, leaving the back edge on the header. MLIR fires its entry mux on
+`entryEdges.size() > 1` (`CFGToSCF.cpp:821`, per-edge), covering a reducible
+header with several outside predecessors as well as an irreducible one.
+
+Making the header single-entry-from-outside is what lets the lift treat the
+branch's continuation as the *pre-header* (whose args receive the merged entry
+values — an `if`/`else` selection, or an irreducible discriminator — and feed the
+loop init) while the loop *results* stay on the header's own args. Keeping the two
+distinct is what removes the lift's "merge that is a loop header" special case and
+fixes the entry-value-returned-as-result miscompile (ISSUES.md #2).
+
+`absorb=false`, entry edges only: the pre-header forwards into the header's
+existing args, and the single-exiting latch still owns back/exit unification
+(RESEARCH_ANSWER_3 §C4 — no collision). Runs after irreducible + latch so it sees
+the final (mux) header."""
+function normalize_one_preheader!(m::MCFG)
+    loops = natural_loops_m(m)
+    cfg = build_cfg(m)
+    for h in sort!(collect(keys(loops)))
+        body = loops[h]
+        entry_refs = EdgeRef[]
+        for p in sort!(collect(cfg.blocks[h].preds))
+            p ∈ body && continue                      # back edge stays on the header
+            append!(entry_refs, edge_refs(m, p, h))
+        end
+        length(entry_refs) > 1 || continue
+        single_entry_mux!(m, entry_refs)              # absorb=false: a pure pre-header
+        return true
+    end
+    return false
+end
+
+"""Mutate `m` until no multi-entry situation remains. Each step collapses one
+multi-entry header (irreducible), one multi-exit loop (the single-exiting latch +
+reduce form), one multi-predecessor branch continuation, or one multi-entry loop
+header (the pre-header) — all strictly reduce the remaining count (the mux block is
+single-entry by construction), so this terminates. The lift then only ever
+structurizes single-entry regions."""
+function normalize_cf!(m::MCFG)
+    changed = false
+    guard = 0
+    limit = length(m.blocks) + 16
+    while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m) ||
+          normalize_one_continuation!(m) || normalize_one_preheader!(m)
+        changed = true
+        guard += 1
+        guard > 8 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
+    end
+    return changed
+end
+
+"""
+    normalize_cf(ir::IRCode) -> MCFG
+
+Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
+loops, multi-predecessor continuations) to single-entry via edge multiplexers, so
+the lift only structurizes single-entry regions. One `ingest`, one mutate fixpoint
+over the `MCFG`, no dense round-trip — the lift (`lift_mcfg`) reads the returned
+`MCFG` directly.
+"""
+function normalize_cf(ir::IRCode)
+    m = ingest(ir)
+    normalize_cf!(m)
+    return m
+end
+
+"""
+    lift_mcfg(m::MCFG; validate=true, promote=true) -> StructuredIRCode
+
+Lift a normalized `MCFG` to a `StructuredIRCode`. `split_duplicate_edges!` first
+routes any `GotoIfNot` whose two edges target the same block through a trampoline,
+so every predecessor reaches a block by at most one edge (the lift reads "what
+predecessor P contributes" as a single edge operand; a `cond ? a : b` shape needs
+the two predecessors distinct). Debug info comes from the `MBlock` codelocs.
+"""
+function lift_mcfg(m::MCFG; validate::Bool=true, promote::Bool=true)
+    split_duplicate_edges!(m)
+    debuginfo_table, line_map = capture_debuginfo(m)
+    valid_worlds = m.valid_worlds isa WorldRange ? m.valid_worlds :
+                   WorldRange(typemin(UInt), typemax(UInt))
+    sci = StructuredIRCode(copy(m.argtypes), copy(m.sptypes), Block(), 0, 0,
+                           debuginfo_table, line_map, valid_worlds)
+    entry, max_ssa, max_arg, updated_line_map = structurize(m, line_map; promote)
+    sci.entry = entry
+    sci.max_ssa_idx = max_ssa
+    sci.max_arg_idx = max_arg
+    merge!(sci.line_map, updated_line_map)
+
+    # Parent chain (entry → SCI, sub-blocks → containing block) after structurize +
+    # promote, since promote_loops! replaces block.body without going through push!.
+    sci.entry.parent = sci
+    fix_parents!(sci.entry)
+
+    if validate
+        validate_scf(sci.entry)
+        validate_no_phis(sci.entry)
+        validate_terminators(sci)
+        validate_ssa_defs(sci)
+        validate_ssa_uniqueness(sci)
+    end
+    return sci
 end

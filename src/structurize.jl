@@ -12,29 +12,44 @@
 =============================================================================#
 
 mutable struct StructurizeCtx
-    ir::IRCode
+    m::Any                       # the MCFG (untyped: MCFG is defined in multiplex.jl,
+                                 # included after this file; annotate `ctx.m::MCFG` locally)
+    cfg::CFG                     # build_cfg(m), cached (block index == MBlock id)
     domtree::DomTree
-    postdomtree::PostDomTree
     # header → set of block indices in the natural loop
     loop_map::Dict{Int, Set{Int}}
     next_ssa::Int
     next_arg::Int
-    types::Vector{Any}
+    types::Dict{Int, Any}       # ssa id → widened type (block args + body stmts + synthesized)
+    def_block::Dict{Int, Int}   # ssa id → defining MBlock id (block args + body stmts)
     ssa_remap::Dict{Int, Int}   # original → fresh (for inner defs)
     line_map::Dict{Int, Int}    # ssa_idx → anchor PC/linetable index
 end
 
-function StructurizeCtx(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}())
-    domtree = construct_domtree(ir)
-    postdomtree = construct_postdomtree(ir)
-    loops = compute_natural_loops(ir, domtree)
-    n = length(ir.stmts.stmt)
-    # `ctx.types` feeds only structural positions (op result / block-arg / Undef
-    # types), which must be concrete `Type`s. Widen so a lattice element (e.g.
-    # `Core.Const` on a phi with one literal edge) can't land there; statement
-    # types copied verbatim by the walk keep their original `ir.stmts.type`.
-    types = Any[widenconst(t) for t in ir.stmts.type]
-    StructurizeCtx(ir, domtree, postdomtree, loops, n + 1, 1, types, Dict{Int,Int}(), line_map)
+function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    loops = natural_loops_m(m)
+    # `ctx.types` feeds structural positions (op result / block-arg / Undef types),
+    # which must be concrete `Type`s. Widen so a lattice element (e.g. `Core.Const`
+    # on a single-literal-edge arg) can't land there. Block-arg / synthesized types
+    # live in `m.types`; body-statement types live in each `MStmt`.
+    types = Dict{Int, Any}()
+    def_block = Dict{Int, Int}()
+    for (id, t) in m.types
+        types[id] = widenconst(t)
+    end
+    for (bid, b) in enumerate(m.blocks)
+        for a in b.args
+            def_block[a] = bid
+        end
+        for s in b.body
+            types[s.id] = widenconst(s.type)
+            def_block[s.id] = bid
+        end
+    end
+    StructurizeCtx(m, cfg, domtree, loops, m.next_id, 1, types, def_block,
+                   Dict{Int,Int}(), line_map)
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
@@ -100,20 +115,22 @@ include("structurize/loops.jl")
 =============================================================================#
 
 """
-    structurize(ir::IRCode, line_map; promote=true) -> (Block, max_ssa, max_arg, line_map)
+    structurize(m::MCFG, line_map; promote=true) -> (Block, max_ssa, max_arg, line_map)
 
-Convert flat IRCode into a structured Block with nested IfOp/LoopOp/WhileOp/ForOp.
+Convert the (already-normalized) explicit-edge `MCFG` into a structured Block with
+nested IfOp/LoopOp/WhileOp/ForOp. The lift reads the `MBlock` form directly — block
+arguments + per-edge operands replace Julia phi nodes — so there is no dense
+round-trip.
 
 The core walk emits only the generic `LoopOp` (invariant I6); `WhileOp`/`ForOp`
 recognition lives entirely in the `promote_loops!` post-pass. Pass `promote=false`
 to get the pre-promotion form (every loop is a `LoopOp`) — used to test I6.
 """
-function structurize(ir::IRCode, line_map::Dict{Int, Int}=Dict{Int, Int}();
+function structurize(m, line_map::Dict{Int, Int}=Dict{Int, Int}();
                      promote::Bool=true)
-    check_irreducible(ir)
-    ctx = StructurizeCtx(ir, line_map)
-    all_blocks = Set(1:length(ir.cfg.blocks))
-    entry = structurize_region!(ctx, 1, all_blocks)
+    ctx = StructurizeCtx(m, line_map)
+    all_blocks = Set(1:length(ctx.m.blocks))
+    entry = structurize_region!(ctx, ctx.m.entry, all_blocks)
     promote && promote_loops!(entry, ctx)
     return entry, ctx.next_ssa - 1, ctx.next_arg - 1, ctx.line_map
 end

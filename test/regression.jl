@@ -36,10 +36,10 @@
     end
 
     ir = q1_ir()
-    ctx = IRStructurizer.StructurizeCtx(ir)
+    domtree = Core.Compiler.construct_domtree(ir)
     region = Set(1:length(ir.cfg.blocks))
     then_blocks, else_blocks, merge =
-        IRStructurizer.find_branch_regions(ctx, 1, 2, 3, region)  # E: true=BB2, false=BB3
+        IRStructurizer.find_branch_regions(ir.cfg, domtree, 1, 2, 3, region)  # E: true=BB2, false=BB3
     @test merge == 2                       # T is the continuation
     @test !(2 in then_blocks)              # ...not swallowed into an arm
     @test !(2 in else_blocks)
@@ -83,10 +83,10 @@ end
 
     for m_first in (false, true)
         ir, m_bb = q2_ir(; m_first)
-        ctx = IRStructurizer.StructurizeCtx(ir)
+        domtree = Core.Compiler.construct_domtree(ir)
         region = Set(1:length(ir.cfg.blocks))
         fdest = (ir.stmts.stmt[ir.cfg.blocks[1].stmts[end]]::GotoIfNot).dest
-        _, _, merge = IRStructurizer.find_branch_regions(ctx, 1, 2, fdest, region)
+        _, _, merge = IRStructurizer.find_branch_regions(ir.cfg, domtree, 1, 2, fdest, region)
         @test merge == m_bb                # M chosen regardless of its index
 
         sci = StructuredIRCode(q2_ir(; m_first)[1])
@@ -634,6 +634,52 @@ end
     sci3, _ = code_structured(inner_break, Tuple{Bool, Int}) |> only
     for p in (false, true), n in (0, 1, 3, 5)
         @test execute(sci3, p, n) == inner_break(p, n)
+    end
+end
+
+@testset "branch-selected init read after the loop (pre-header)" begin
+    # An if/else (not a ternary) writes a variable whose SSA phi sits at the loop
+    # header — the branch's merge block *is* the loop header — and the variable is
+    # read after the loop. Without the pre-header (normalize_one_preheader!) the
+    # read saw the *entry* value (the branch selection), not the loop result: the
+    # IfOp parked the entry value at the header phi id and the loop result at a
+    # fresh id, but post-loop uses still referenced the header phi id. The
+    # pre-header routes the entry edges through a separate block so the IfOp yields
+    # into the pre-header args (the loop init) while the loop result stays on the
+    # header arg — the value `return`ed. Silent miscompile before the fix
+    # (ISSUES.md #2, "meh1"); the standing fuzzers use ternary inits and missed it.
+    function meh1(c::Bool, n::Int)
+        if c; x = 10; else; x = 100; end   # if-merge coincides with the while header
+        while x < n; x += 1; end
+        return x
+    end
+    # The pre-header fix lives in the core lift, so assert it there across every n —
+    # including the empty-loop cases (init already ≥ bound) where the result is the
+    # branch selection (10/100) itself. (A separate, pre-existing *promotion* bug
+    # miscompiles an empty counted while-loop, returning the bound instead of the
+    # init — ISSUES.md #3 — so the empty case is asserted at promote=false here.)
+    ir_np, _ = only(code_ircode(meh1, Tuple{Bool, Int}))
+    sci_np = StructuredIRCode(ir_np; promote=false)
+    for c in (false, true), n in (0, 5, 50, 200)
+        @test execute(sci_np, c, n) == meh1(c, n)
+    end
+    # The literal ISSUES.md #2 repro through the full pipeline: at n=200 the loop
+    # runs for both arms, so the result is the loop output (200), not the entry
+    # value (10/100) — the miscompile the pre-header closed.
+    sci, _ = code_structured(meh1, Tuple{Bool, Int}) |> only
+    @test execute(sci, true, 200) == 200
+    @test execute(sci, false, 200) == 200
+
+    # Counted-for outer loop carrying a branch-selected accumulator (the loop runs
+    # `1:n` independent of the init, so promotion is well-behaved here).
+    function meh_for(c::Bool, n::Int)
+        if c; s = 10; else; s = 100; end
+        for _ in 1:n; s += 1; end
+        return s
+    end
+    sci2, _ = code_structured(meh_for, Tuple{Bool, Int}) |> only
+    for c in (false, true), n in (0, 1, 5)
+        @test execute(sci2, c, n) == meh_for(c, n)
     end
 end
 

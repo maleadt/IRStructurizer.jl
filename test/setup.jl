@@ -10,7 +10,7 @@ function build_ir(blocks::Vector, argtypes::Vector)
     # Build the InstructionStream from flat vectors via its bulk constructor.
     # The per-statement `Instruction` proxy with `inst[:field] = ...` only exists
     # on 1.12+, whereas this constructor (and the 3-per-stmt packed `line`) is
-    # shared, matching production `_assemble`.
+    # shared, matching production `build_dense_ircode`.
     all_stmts = Vector{Any}(undef, nstmts)
     all_types = Vector{Any}(undef, nstmts)
     all_flags = fill(CC.IR_FLAGS_EFFECTS, nstmts)

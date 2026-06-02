@@ -666,24 +666,28 @@ validates that no unstructured control flow remains.
 """
 function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
                           promote::Bool=true)
-    # Mutate-then-lift: collapse every multi-entry CFG situation (irreducible
-    # loop headers; multi-predecessor continuations) to single-entry with edge
-    # multiplexers *before* capturing debug info, so all downstream views use the
-    # normalized IR. A no-op (returns `ir` untouched) for already-reducible CFGs.
+    # Mutate-then-lift: collapse every multi-entry CFG situation (irreducible loop
+    # headers, multi-exit loops, multi-predecessor continuations) to single-entry
+    # with edge multiplexers, then lift the resulting `MCFG` directly (block args +
+    # per-edge operands replace phi nodes) — no dense round-trip. `lift_mcfg`
+    # captures debug info from the `MBlock` codelocs and runs the structurize walk.
     if structurize && !isempty(ir.stmts.stmt)
-        ir = normalize_cf(ir)
+        return lift_mcfg(normalize_cf(ir); validate, promote)
     end
+
+    # Flat view (structurize=false, or empty IR): the raw IRCode statements in a
+    # single block, no normalization. Negative line_map = direct PC ref.
     argtypes = copy(ir.argtypes)
     sptypes = copy(ir.sptypes)
+    @static if VERSION >= v"1.12-"
+        valid_worlds = ir.valid_worlds
+    else
+        valid_worlds = WorldRange(typemin(UInt), typemax(UInt))
+    end
     stmts = ir.stmts.stmt
     types = ir.stmts.type
-    # Per-statement IR_FLAG_* bitmask (see Compiler/src/optimize.jl). Inference
-    # and the inliner populate this with effect-freeness, nothrow, etc.; we
-    # carry it through so SCI passes can consult effects without re-deriving.
-    flags = ir.stmts.flag
+    flags = ir.stmts.flag      # per-statement IR_FLAG_* bitmask (effects, nothrow, …)
     n = length(stmts)
-
-    # Capture debug info: negative values = direct reference into table
     @static if VERSION >= v"1.12-"
         debuginfo_table = ir.debuginfo
         line_map = Dict{Int, Int}()
@@ -698,8 +702,6 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
             li != 0 && (line_map[i] = -li)  # linetable index
         end
     end
-
-    # Build flat entry block
     entry = Block()
     for i in 1:n
         stmt = stmts[i]
@@ -709,35 +711,10 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
             push!(entry, i, stmt, types[i], flags[i])
         end
     end
-
-    # Carry the IR's world-age range (1.12+; 1.11 doesn't have the field
-    # and also doesn't enforce binding-access world warnings, so the
-    # unbounded default is fine).
-    @static if VERSION >= v"1.12-"
-        valid_worlds = ir.valid_worlds
-    else
-        valid_worlds = WorldRange(typemin(UInt), typemax(UInt))
-    end
-
     sci = StructuredIRCode(argtypes, sptypes, entry, n, 0,
                            debuginfo_table, line_map, valid_worlds)
-
-    if structurize && n > 0
-        entry, max_ssa, max_arg, updated_line_map =
-            IRStructurizer.structurize(ir, line_map; promote)
-        sci.entry = entry
-        sci.max_ssa_idx = max_ssa
-        sci.max_arg_idx = max_arg
-        # line_map was mutated in-place by structurize, but merge any extras
-        merge!(sci.line_map, updated_line_map)
-    end
-
-    # Set parent chain: entry → SCI, sub-blocks → containing block.
-    # Must be done after structurize+promote since promote_loops! replaces
-    # block.body without going through push! (which normally sets parents).
     sci.entry.parent = sci
     fix_parents!(sci.entry)
-
     if validate
         validate_scf(sci.entry)
         validate_no_phis(sci.entry)
@@ -745,7 +722,6 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
         validate_ssa_defs(sci)
         validate_ssa_uniqueness(sci)
     end
-
     return sci
 end
 
