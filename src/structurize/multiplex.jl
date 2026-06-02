@@ -113,7 +113,7 @@ each block become block arguments; the values they carry per predecessor become
 that predecessor edge's operands. Stable ids == original SSA positions.
 """
 function ingest(ir::IRCode)
-    di = ir.debuginfo
+    di = @static VERSION >= v"1.12-" ? ir.debuginfo : ir.linetable
     nb = length(ir.cfg.blocks)
     blocks = [MBlock() for _ in 1:nb]
     types = Dict{Int, Any}()
@@ -706,7 +706,10 @@ function normalize_one_irreducible!(m::MCFG)
 
     by_scc = Dict{Int, Vector{Int}}()
     for bb in 1:nb
-        reach.irreducible[bb] && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
+        # `reach.irreducible` is a compiler-internal BitArray on 1.11 whose
+        # `getindex` is only visible inside `Core.Compiler`; index it through CC
+        # (works on 1.12's plain BitVector too).
+        CC.getindex(reach.irreducible, bb) && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
     end
     isempty(by_scc) && return false
 
