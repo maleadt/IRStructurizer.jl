@@ -661,8 +661,18 @@ validates that no unstructured control flow remains.
 - `structurize`: If true (default), convert GotoNode/GotoIfNot to structured ops
 - `validate`: If true (default), throw `UnstructuredControlFlowError` if unstructured
   control flow remains after structurization
+- `promote`: If true (default), run the `LoopOp`→`WhileOp`/`ForOp` promotion post-pass.
+  Pass `false` to keep the core's generic `LoopOp` form (invariant I6).
 """
-function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true)
+function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
+                          promote::Bool=true)
+    # Mutate-then-lift: collapse every multi-entry CFG situation (irreducible
+    # loop headers; multi-predecessor continuations) to single-entry with edge
+    # multiplexers *before* capturing debug info, so all downstream views use the
+    # normalized IR. A no-op (returns `ir` untouched) for already-reducible CFGs.
+    if structurize && !isempty(ir.stmts.stmt)
+        ir = normalize_cf(ir)
+    end
     argtypes = copy(ir.argtypes)
     sptypes = copy(ir.sptypes)
     stmts = ir.stmts.stmt
@@ -714,7 +724,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
 
     if structurize && n > 0
         entry, max_ssa, max_arg, updated_line_map =
-            IRStructurizer.structurize(ir, line_map)
+            IRStructurizer.structurize(ir, line_map; promote)
         sci.entry = entry
         sci.max_ssa_idx = max_ssa
         sci.max_arg_idx = max_arg

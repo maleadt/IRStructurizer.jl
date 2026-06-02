@@ -3,16 +3,27 @@
 =============================================================================#
 
 """
-    find_branch_regions(ctx, current, true_dest, false_dest, region_blocks)
+    find_branch_regions(ctx, current, true_dest, false_dest, region_blocks, loop_ctx)
         -> (then_blocks, else_blocks, merge)
 
-Split region_blocks into then/else regions using dominance.
-A successor with a single predecessor gets all blocks it dominates.
-A successor with multiple predecessors is a merge block (empty region).
+Split region_blocks into then/else regions using dominance, and select the merge
+(continuation) block by exclusion (`branch_continuation`).
+
+A successor with a single non-backedge predecessor gets all blocks it dominates
+(MLIR's edge-domination test, `CFGToSCF.cpp:981`). A successor with multiple
+predecessors is a merge block (empty arm region).
+
+The merge is the *single* common target of the edges leaving the branch — i.e.
+`branch_continuation` returning exactly one entry. When the continuation is
+absent (both arms diverge) or has more than one entry (a multi-entry
+continuation that needs the edge multiplexer), `merge` is `nothing` and the
+caller routes accordingly. Post-dominance never enters as an ordering key, so
+the result depends only on CFG topology + dominance (invariant I1).
 """
 function find_branch_regions(ctx::StructurizeCtx, current::Int,
                               true_dest::Int, false_dest::Int,
-                              region_blocks::Set{Int})
+                              region_blocks::Set{Int},
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
     ir = ctx.ir
     nblocks = length(ir.cfg.blocks)
 
@@ -37,39 +48,13 @@ function find_branch_regions(ctx::StructurizeCtx, current::Int,
     # (a block should only be in one region)
     setdiff!(then_blocks, else_blocks)
 
-    # Merge = the block where all paths from `current` reconverge.
-    # Prefer the immediate post-dominator (structurally exact).
-    # Fall back to successor-candidate search when early returns prevent
-    # real post-dominance (ipdom = 0 = virtual exit).
-    merge = nothing
-    ipdom = ctx.postdomtree.idoms_bb[current]
-    if ipdom != 0 && ipdom ∈ region_blocks && ipdom ∉ then_blocks && ipdom ∉ else_blocks
-        merge = ipdom
-    else
-        candidates = Set{Int}()
-        for b in then_blocks
-            for s in ir.cfg.blocks[b].succs
-                s ∉ then_blocks && s != current && push!(candidates, s)
-            end
-        end
-        for b in else_blocks
-            for s in ir.cfg.blocks[b].succs
-                s ∉ else_blocks && s != current && push!(candidates, s)
-            end
-        end
-        if true_dest ∈ region_blocks && true_dest ∉ then_blocks
-            push!(candidates, true_dest)
-        end
-        if false_dest ∈ region_blocks && false_dest ∉ else_blocks
-            push!(candidates, false_dest)
-        end
-        for c in sort!(collect(candidates))
-            if c ∈ region_blocks && c ∉ then_blocks && c ∉ else_blocks
-                merge = c
-                break
-            end
-        end
-    end
+    # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
+    # merge is the single distinct target of the edges leaving `current ∪ then ∪
+    # else`. A unique target → that's the merge; zero targets → both arms diverge;
+    # multiple targets → a multi-entry continuation handled by the multiplexer.
+    entries, _ = branch_continuation(ctx, current, true_dest, false_dest,
+                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+    merge = length(entries) == 1 ? only(entries) : nothing
 
     return then_blocks, else_blocks, merge
 end
@@ -146,136 +131,6 @@ function branch_continuation(ctx::StructurizeCtx, current::Int,
         end
     end
     return entries, notContinuation
-end
-
-"""
-    find_gated_body(...) -> (body_entry, body_region, merge) | nothing
-
-A short-circuit-guarded body (`if a||b { body }`, `&&`, value forms): the body is
-reached from BOTH arms, so it lands in neither then/else region and the branch
-continuation has TWO entries. Returns the gated body, its region, and the merge
-it exits to; `nothing` if the shape doesn't match (→ ordinary IfOp path).
-
-The continuation is computed MLIR-style (`branch_continuation`), not via `ipdom`
-— robust to virtual exits and to a body that fans into `merge` at several
-internal points. `emit_gated_branch!` then gates the body under one `scf.if` via
-the edge multiplexer, structurized ONCE (no duplication).
-
-Requires: exactly 2 continuation entries; the `body` (dominated by `current`)
-exits only to `merge` (which may sit outside `region_blocks` — a nested gated
-body's shared outer merge); the body region is fully enclosed (preds from
-arms/body, succs to body/merge/return-like); no body value escapes except a phi
-value at `merge` (threaded out as a multiplexer result).
-"""
-function find_gated_body(ctx::StructurizeCtx, current::Int,
-                          true_dest::Int, false_dest::Int,
-                          then_blocks::Set{Int}, else_blocks::Set{Int},
-                          region_blocks::Set{Int},
-                          loop_ctx::Union{Nothing, LoopCtx}=nothing)
-    ir = ctx.ir
-    nblocks = length(ir.cfg.blocks)
-
-    entries, _notContinuation = branch_continuation(
-        ctx, current, true_dest, false_dest, then_blocks, else_blocks,
-        region_blocks, loop_ctx)
-
-    # Only a 2-entry continuation needs the multiplexer (else: ordinary IfOp path).
-    length(entries) == 2 || return nothing
-
-    # arms the selector fans into (incl. `current` for the `&&` shape, where
-    # false_dest is the body reached directly from current)
-    arms = union(then_blocks, else_blocks)
-    push!(arms, true_dest); push!(arms, false_dest); push!(arms, current)
-
-    # 2-entry case: gate the `body` (dominated by current, exits only to `merge`),
-    # then fall through to `merge`.
-    A, B = entries[1], entries[2]
-    for (body_entry, merge) in ((A, B), (B, A))
-        body_entry == merge && continue
-        dominates(ctx.domtree, current, body_entry) || continue
-        merge <= nblocks || continue
-
-        # body region = body_entry's dominator subtree, up to (not incl.) `merge`
-        dominated = Set{Int}()
-        collect_dominated!(dominated, ctx.domtree, body_entry, region_blocks)
-        body_region = Set{Int}()
-        ok = true
-        for b in dominated
-            b == merge && continue
-            dominates(ctx.domtree, merge, b) && continue
-            push!(body_region, b)
-        end
-        (isempty(body_region) || body_entry ∉ body_region) && continue
-
-        # closure: body preds from arms/body (single entry); succs to body/merge/
-        # return-like (throw/unreachable blocks stay nested in the body)
-        ok = true
-        for b in body_region
-            b <= nblocks || (ok = false; break)
-            for pred in ir.cfg.blocks[b].preds
-                pred ∈ body_region && continue
-                if !(b == body_entry && pred ∈ arms)
-                    ok = false; break
-                end
-            end
-            ok || break
-            for succ in ir.cfg.blocks[b].succs
-                (succ ∈ body_region || succ == merge) && continue
-                # return-like succ (throw/unreachable): keep it in the body
-                if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
-                   succ ∈ region_blocks
-                    push!(body_region, succ)
-                    continue
-                end
-                ok = false; break
-            end
-            ok || break
-        end
-        ok || continue
-
-        # must be reached from an arm, and not a self-loop entry
-        body_entry ∈ ir.cfg.blocks[body_entry].preds && continue
-        any(p -> p ∈ arms, ir.cfg.blocks[body_entry].preds) || continue
-
-        # a body value may escape only as a phi value at `merge` (threaded out as a
-        # multiplexer result, so def and use share scope); else it'd be stranded → bail
-        merge_in_region = merge ∈ region_blocks
-        body_defs = Set{Int}()
-        for b in body_region, si in first(ir.cfg.blocks[b].stmts):last(ir.cfg.blocks[b].stmts)
-            push!(body_defs, si)
-        end
-        escapes = false
-        for blk_idx in 1:nblocks
-            blk_idx ∈ body_region && continue
-            bb = ir.cfg.blocks[blk_idx]
-            for si in first(bb.stmts):last(bb.stmts)
-                stmt = ir.stmts.stmt[si]
-                if stmt isa PhiNode
-                    for k in eachindex(stmt.values)
-                        isassigned(stmt.values, k) || continue   # undef phi slot
-                        v = stmt.values[k]
-                        v isa SSAValue && v.id ∈ body_defs || continue
-                        if !(merge_in_region && blk_idx == merge &&
-                             Int(stmt.edges[k]) ∈ body_region)
-                            escapes = true; break
-                        end
-                    end
-                else
-                    for u in stmt_ssa_uses(stmt)
-                        if u.id ∈ body_defs
-                            escapes = true; break
-                        end
-                    end
-                end
-                escapes && break
-            end
-            escapes && break
-        end
-        escapes && continue
-
-        return body_entry, body_region, merge
-    end
-    return nothing
 end
 
 """Count predecessors of `block` in `region` that are not loop backedges to `block`."""
@@ -380,7 +235,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
 
     # 3. Find extra exit values (loop-internal SSAs used outside)
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
-    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported)
+    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported, exit_dest)
 
     # 4. Build init/carried values and block arguments
     init_values = IRValue[]
@@ -432,7 +287,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     end
 
     # 5. Build loop body
-    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs, exit_dest)
 
     # Restore remap (scoped to loop body)
     ctx.ssa_remap = saved_remap
@@ -473,7 +328,8 @@ The LoopCtx makes the region walk loop-aware: back-edges → ContinueOp, exits �
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, carried_values::Vector{IRValue},
-                           subs::Dict{Int, BlockArgument})
+                           subs::Dict{Int, BlockArgument},
+                           exit_dest::Union{Int, Nothing})
     break_values = IRValue[arg for arg in body.args]
     # Extra exits (beyond header phis) must carry the current iteration's
     # computed value, not the stale block arg from the previous iteration.
@@ -481,7 +337,7 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
     for i in (n_header_phis + 1):length(break_values)
         break_values[i] = carried_values[i]
     end
-    lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
+    lctx = LoopCtx(header, loop_blocks, carried_values, break_values, exit_dest)
 
     # Use structurize_region! with loop context for the entire loop body
     content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)
@@ -544,36 +400,43 @@ function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
 end
 
 """
-Find the primary exit destination of a loop.
+Find the loop's *primary* exit: where control goes when the loop stops iterating
+normally — the continuation. The loop breaks to it and its loop values are
+threaded out as results. A *secondary* exit (an early `return`/`throw` reached
+mid-body) is re-materialized in place instead (invariant I8).
 
-Prefers the immediate post-dominator of the header (the structurally correct
-continuation point). Falls back to any exit with successors (non-dead-end),
-then any exit at all.
+The primary exit is taken at the loop's "keep iterating?" decision, so its source
+block is adjacent to the back edge: it branches to the exit on one side and, on
+the other, to the loop header or a latch (a back-edge source). An irreducible
+loop's mux header dispatches *into* the loop and its latch only loops back, so no
+block is both an exit source and back-edge-adjacent → there is no primary exit
+(`nothing`): every escape is an early return, re-materialized, and the loop has
+no break/result.
+
+Layout-independent (invariant I1): candidates are sorted and the header's
+post-dominator is preferred; nothing keys on raw block order. (MLIR's
+single-exiting latch removes this choice entirely — the M4 cleanup.)
 """
 function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     ir = ctx.ir
-    nblocks = length(ir.cfg.blocks)
-    exits = Int[]
-    for b in loop_blocks
-        for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks && succ ∉ exits && push!(exits, succ)
-        end
-    end
+    exits = sort!(collect(find_loop_exits(ir, loop_blocks)))
     isempty(exits) && return nothing
     length(exits) == 1 && return exits[1]
-    # Prefer post-dominator of header (the natural continuation)
+    # The header's post-dominator is THE continuation when it resolves: every
+    # non-early-exit path reaches it. (It is 0/virtual only when every path
+    # returns/throws early — the irreducible / all-early-exit case handled below.)
     ipdom = ctx.postdomtree.idoms_bb[header]
     ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
-    # Fall back: prefer exits with successors, then non-throw dead-ends
-    for e in exits
-        e <= nblocks && !isempty(ir.cfg.blocks[e].succs) && return e
-    end
-    for e in exits
-        if e <= nblocks && isempty(ir.cfg.blocks[e].succs)
-            ir.stmts.type[last(ir.cfg.blocks[e].stmts)] !== Union{} && return e
-        end
-    end
-    return first(exits)
+    # No post-dominating continuation: pick the back-edge-adjacent exit (the
+    # loop's iteration-exit decision), or `nothing` if every exit is early.
+    latches = Set{Int}(b for b in loop_blocks if header in ir.cfg.blocks[b].succs)
+    backedge_adjacent(b) = header in ir.cfg.blocks[b].succs ||
+                           any(s -> s in latches, ir.cfg.blocks[b].succs)
+    cands = sort!([e for e in exits
+                   if any(b -> e in ir.cfg.blocks[b].succs && backedge_adjacent(b), loop_blocks)])
+    isempty(cands) && return nothing
+    length(cands) == 1 && return cands[1]
+    return first(cands)
 end
 
 """Find all blocks outside `loop_blocks` that are successors of loop blocks."""
@@ -590,34 +453,25 @@ end
 """
 Find loop-internal SSA values referenced outside the loop.
 
-Scans blocks reachable from loop exit edges (not the entire IR). This is more
-precise than scanning all non-loop blocks: it excludes blocks before the loop
-or on branches that bypass it. Values escape through exit-block phis, direct
-references at downstream blocks, or as operands of sequential loops.
+Scans the post-loop region reachable from the *primary* exit (`exit_dest`), not
+every exit edge: a value only needs threading out if it is read at the loop's
+continuation. Secondary region-exits (early `return`/`throw`) are re-materialized
+in place and read their loop values directly, so they are not scanned — and a
+loop with no primary exit (`exit_dest === nothing`, e.g. an irreducible loop that
+escapes only via early returns) has no escaping values at all. Values escape
+through the continuation's exit-block phis, direct references downstream, or as
+operands of a sequential loop.
 """
 function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
-                                 already_exported::Set{Int})
+                                 already_exported::Set{Int},
+                                 exit_dest::Union{Int, Nothing})
     result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
     seen = Set{Int}()
 
-    # Collect non-loop blocks reachable from loop exit edges.
-    # Skip throw/unreachable blocks (terminal type Union{}): these are error
-    # paths whose values don't need threading because find_loop_exit prefers
-    # non-throw continuations, so throw blocks are not walked after the loop.
+    # Seed from the primary exit only; BFS its successors gives the post-loop
+    # region where loop values may be read.
     reachable = Set{Int}()
-    worklist = Int[]
-    nblocks = length(ir.cfg.blocks)
-    for b in loop_blocks
-        for succ in ir.cfg.blocks[b].succs
-            succ ∉ loop_blocks || continue
-            # Skip throw/unreachable blocks
-            if succ <= nblocks && isempty(ir.cfg.blocks[succ].succs) &&
-               ir.stmts.type[last(ir.cfg.blocks[succ].stmts)] === Union{}
-                continue
-            end
-            push!(worklist, succ)
-        end
-    end
+    worklist = exit_dest === nothing ? Int[] : Int[exit_dest]
     while !isempty(worklist)
         b = pop!(worklist)
         b ∈ reachable && continue

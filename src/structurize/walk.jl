@@ -24,6 +24,7 @@ struct LoopCtx
     loop_blocks::Set{Int}
     carried_values::Vector{IRValue}
     break_values::Vector{IRValue}
+    exit_dest::Union{Int, Nothing}   # the loop's primary exit (breaks normally)
 end
 
 """
@@ -45,8 +46,9 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
 
     # Advance the walker toward `target`, resolving loop boundaries
     # (back-edge → ContinueOp, exit → BreakOp); returns nothing if `target`
-    # leaves the region.
-    advance = target -> resolve_dest(target, region_blocks, loop_ctx, block, ctx)
+    # leaves the region. `source` is the block we are leaving — used to resolve
+    # an exit block's phis when re-materializing a region-exit.
+    advance = (target, source) -> resolve_dest(target, region_blocks, loop_ctx, block, ctx, source)
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
@@ -57,12 +59,13 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             if loop_body !== nothing
                 loop_exit = emit_loop!(block, ctx, current, loop_body, region_blocks)
                 # Update last_block to the loop's exit predecessor (for merge phi lookup)
+                exit_src = current
                 if loop_exit !== nothing
                     for b in loop_body
-                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b)
+                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b; exit_src = b)
                     end
                 end
-                current = advance(loop_exit)
+                current = advance(loop_exit, exit_src)
                 continue
             end
         end
@@ -82,15 +85,15 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             end
             return block
         elseif term isa GotoNode
-            current = advance(term.label)
+            current = advance(term.label, current)
         elseif term isa GotoIfNot
             next = emit_branch!(block, ctx, current, term, region_blocks, merge_phis, loop_ctx)
             next === nothing && return block
-            current = advance(next)
+            current = advance(next, current)
         else
             # Fallthrough
             next = current + 1
-            current = advance(next <= nblocks ? next : nothing)
+            current = advance(next <= nblocks ? next : nothing, current)
         end
     end
 
@@ -108,46 +111,167 @@ Returns the dest to continue walking, or nothing if it's a loop exit/back-edge.
 """
 function resolve_dest(dest, region_blocks::Set{Int},
                        loop_ctx::Union{Nothing, LoopCtx}, block::Block,
-                       ctx::Union{Nothing, StructurizeCtx}=nothing)
+                       ctx::Union{Nothing, StructurizeCtx}=nothing,
+                       source::Int=0)
     dest === nothing && return nothing
-    if loop_ctx !== nothing
-        if dest == loop_ctx.header
-            block.terminator === nothing &&
-                (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
-            return nothing
-        elseif dest ∉ loop_ctx.loop_blocks
-            # A loop-exit edge to a dead-end throw/unreachable block (no successors,
-            # terminal type Union{}) is NOT a normal break: collapsing it to a
-            # BreakOp would discard the throw. Emit the block's statements in place
-            # and terminate with `unreachable` (`ReturnNode()`), matching the
-            # non-loop throw path (which keeps the throw call ::Union{}).
-            if ctx !== nothing && block.terminator === nothing &&
-               is_throw_exit(ctx.ir, dest)
-                emit_throw_exit!(block, ctx, dest)
-                return nothing
-            end
-            block.terminator === nothing &&
-                (block.terminator = BreakOp(copy(loop_ctx.break_values)))
-            return nothing
-        end
+    if loop_ctx !== nothing && ctx !== nothing &&
+       resolve_loop_exit!(block, ctx, dest, source, loop_ctx)
+        return nothing
     end
     dest ∈ region_blocks ? dest : nothing
 end
 
-"""A dead-end throw/unreachable block: no successors and terminal type `Union{}`."""
-function is_throw_exit(ir::IRCode, dest::Int)
-    1 <= dest <= length(ir.cfg.blocks) || return false
-    bb = ir.cfg.blocks[dest]
-    isempty(bb.succs) || return false
-    return ir.stmts.type[last(bb.stmts)] === Union{}
+"""Resolve a loop boundary on the edge to `dest` (from `source`), setting `block`'s
+terminator. Returns `true` if `dest` is a loop boundary (handled), `false` if it
+is inside the loop (a normal forward edge). The four boundary cases:
+
+- back edge to the header → `ContinueOp`;
+- the loop's primary exit → `BreakOp` (control leaves; results carried);
+- a *secondary* exit that leads only to region-exits (return/throw), never to the
+  primary → re-materialize that exit path in place (invariant I8: don't drop the
+  return/throw to a bare break). A direct region-exit block is the trivial case;
+- any other secondary exit (it rejoins the primary continuation) → `BreakOp`."""
+function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
+                            source::Int, loop_ctx::LoopCtx)
+    if dest == loop_ctx.header
+        block.terminator === nothing &&
+            (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
+        return true
+    elseif dest ∉ loop_ctx.loop_blocks
+        if block.terminator === nothing && dest != loop_ctx.exit_dest
+            if is_region_exit(ctx.ir, dest)
+                emit_region_exit!(block, ctx, dest, source)
+                return true
+            elseif !exit_reaches_primary(ctx.ir, dest, loop_ctx.exit_dest, loop_ctx.loop_blocks)
+                emit_exit_path!(block, ctx, dest, loop_ctx)
+                return true
+            end
+        end
+        block.terminator === nothing &&
+            (block.terminator = BreakOp(copy(loop_ctx.break_values)))
+        return true
+    end
+    return false
 end
 
-"""Emit a dead-end throw block's statements into `block` and set the `unreachable`
-(`ReturnNode()`) terminator — keeps the throw call instead of dropping it as a break."""
-function emit_throw_exit!(block::Block, ctx::StructurizeCtx, dest::Int)
-    emit_block_stmts!(block, ctx, dest)
-    block.terminator = ReturnNode()  # unreachable
+"""Does the path leaving the loop at `dest` reach the loop's primary exit (without
+re-entering the loop)? If not, the path returns/throws independently and is
+re-materialized; if so, it rejoins the continuation and is a break."""
+function exit_reaches_primary(ir::IRCode, dest::Int, primary::Union{Int, Nothing},
+                              loop_blocks::Set{Int})
+    primary === nothing && return false
+    seen = Set{Int}()
+    worklist = Int[dest]
+    while !isempty(worklist)
+        b = pop!(worklist)
+        b == primary && return true
+        (b in seen || b in loop_blocks) && continue
+        push!(seen, b)
+        for s in ir.cfg.blocks[b].succs
+            (s in seen || s in loop_blocks) || push!(worklist, s)
+        end
+    end
+    return false
+end
+
+"""Re-materialize a secondary loop-exit path (a `return`/`throw` reached from
+within the loop, possibly through pass-through blocks like `goto #ret`) into
+`block`. Structurizes the path as an ordinary single-entry region — the loop's
+block-arg substitutions are in scope (`ctx.ssa_remap`), so loop-carried values
+resolve — and splices it in. The path provably leads only to region-exits (see
+`exit_reaches_primary`), so the recursive walk needs no loop context.
+
+A shared exit path (one return reached from several arms) is re-materialized once
+per arm. Its body definitions are renamed to fresh SSA indices (scoped via a
+saved/restored `ssa_remap`) so the copies don't define the same index twice —
+the same defined-in-loop / used-in-arm rename the reduce-form pass uses."""
+function emit_exit_path!(block::Block, ctx::StructurizeCtx, dest::Int, loop_ctx::LoopCtx)
+    ir = ctx.ir
+    region = Set{Int}()
+    worklist = Int[dest]
+    while !isempty(worklist)
+        b = pop!(worklist)
+        (b in region || b in loop_ctx.loop_blocks || b == loop_ctx.exit_dest) && continue
+        push!(region, b)
+        for s in ir.cfg.blocks[b].succs
+            push!(worklist, s)
+        end
+    end
+
+    # Fresh-rename every SSA definition in the path — body statements AND the
+    # results of internal merges (phi nodes, which the lift re-materializes as
+    # `getfield`s keyed on the phi's index). Without renaming the phis too, a path
+    # with an internal branch re-materialized in several arms would define the
+    # merge's index in more than one block.
+    saved_remap = copy(ctx.ssa_remap)
+    for b in region
+        bb = ir.cfg.blocks[b]
+        for si in first(bb.stmts):last(bb.stmts)
+            s = ir.stmts.stmt[si]
+            (s isa GotoNode || s isa GotoIfNot || s isa ReturnNode) && continue
+            fresh = alloc_ssa!(ctx)
+            ctx.ssa_remap[si] = fresh
+            anchor_line!(ctx, fresh, si)
+        end
+    end
+    sub = structurize_region!(ctx, dest, region; loop_ctx=nothing)
+    ctx.ssa_remap = saved_remap
+    merge_block_into!(block, sub)
     return block
+end
+
+"""A region-exit block: no successors (MLIR's `isRegionExitBlock`,
+CFGToSCF.cpp:940). Either a `return` or a `throw`/unreachable dead-end. Reached
+from within a region, it is re-materialized in place rather than collapsed to a
+BreakOp — which would drop the return value or the throw (invariant I8)."""
+function is_region_exit(ir::IRCode, dest::Int)
+    1 <= dest <= length(ir.cfg.blocks) || return false
+    return isempty(ir.cfg.blocks[dest].succs)
+end
+
+"""Emit a region-exit block's statements into `block` and set its terminator: the
+block's own `ReturnNode` (re-materialized, value remapped) if it has one, else
+`unreachable` (`ReturnNode()`) for a throw/dead-end. If the returned value is a
+phi of `dest` (e.g. a loop-exit `return acc` whose phi merges the loop value),
+it is resolved to the value on the edge from `source` — the block we re-
+materialize this exit from — so the return reads an in-scope value, not the
+phi (which the walk skips) or the loop's own result."""
+function emit_region_exit!(block::Block, ctx::StructurizeCtx, dest::Int, source::Int=0)
+    emit_block_stmts!(block, ctx, dest)
+    term = find_terminator(ctx.ir, dest)
+    if term isa ReturnNode && isdefined(term, :val)
+        val = resolve_region_exit_value(ctx, dest, source, term.val)
+        block.terminator = val === term.val ? term : ReturnNode(val)
+    else
+        block.terminator = ReturnNode()  # throw/unreachable dead-end
+    end
+    return block
+end
+
+"""Resolve a region-exit's return value. If `val` is a phi defined in `dest`,
+return the value that phi carries on the edge from `source` (remapped); else
+remap `val` normally."""
+function resolve_region_exit_value(ctx::StructurizeCtx, dest::Int, source::Int,
+                                   @nospecialize(val))
+    if val isa SSAValue && source != 0
+        ev = phi_edge_value(ctx.ir, dest, val.id, source)
+        ev !== nothing && return remap_ssa_ref(ev, ctx.ssa_remap)
+    end
+    return remap_ssa_ref(val, ctx.ssa_remap)
+end
+
+"""If `ssa` is a phi in block `dest`, return the value it carries on the edge
+from predecessor `source`, or `nothing` if `ssa` is not such a phi / has no
+assigned value for that edge."""
+function phi_edge_value(ir::IRCode, dest::Int, ssa::Int, source::Int)
+    bb = ir.cfg.blocks[dest]
+    ssa in first(bb.stmts):last(bb.stmts) || return nothing
+    stmt = ir.stmts.stmt[ssa]
+    stmt isa PhiNode || return nothing
+    for (k, edge) in enumerate(stmt.edges)
+        Int(edge) == source && isassigned(stmt.values, k) && return stmt.values[k]
+    end
+    return nothing
 end
 
 #=============================================================================
@@ -182,6 +306,18 @@ end
  Branch Lifting (IfOp)
 =============================================================================#
 
+"""True iff the branch at `current` has no continuation edges — both arms
+diverge (return/throw/break/continue). The only legitimate reason
+`find_branch_regions` returns `merge === nothing` once continuations are
+single-entry (post `normalize_cf`)."""
+function _both_arms_diverge(ctx::StructurizeCtx, current::Int, true_dest::Int,
+                            false_dest::Int, then_blocks::Set{Int}, else_blocks::Set{Int},
+                            region_blocks::Set{Int}, loop_ctx::Union{Nothing, LoopCtx})
+    entries, _ = branch_continuation(ctx, current, true_dest, false_dest,
+                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+    return isempty(entries)
+end
+
 """
     emit_branch!(block, ctx, current, gotoifnot, region_blocks, outer_merge_phis) -> next
 
@@ -203,23 +339,19 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
                 first(s for s in bb_succs if s != false_dest)
     cond = remap_ssa_ref(gotoifnot.cond, ctx.ssa_remap)
 
-    # Determine branch regions and merge block using dominance
+    # Determine branch regions and merge block using dominance + exclusion.
+    # A multi-entry continuation (the short-circuit shape `if a||b { body }`,
+    # nested gated bodies, N-way merges) is collapsed to a single entry upstream
+    # by `normalize_cf`'s continuation multiplexer, so by here the continuation is
+    # always single-entry: `merge` is the unique entry, or `nothing` iff both arms
+    # diverge (zero continuation edges). The lift therefore has one branch path —
+    # no shape-matching (`find_gated_body` is gone; invariant I4).
     then_blocks, else_blocks, merge = find_branch_regions(
-        ctx, current, true_dest, false_dest, region_blocks)
-
-    # Short-circuit-guarded body (`if a || b { body }`, `a && b`, value forms):
-    # the body is the multi-entry continuation reached from BOTH arms, so it falls
-    # into neither then/else region. Materialize the combined predicate as a
-    # boolean region selector and emit the body ONCE under `scf.if` — MLIR's
-    # transformCFGToSCF edge multiplexer, no body duplication.
-    gated = find_gated_body(ctx, current, true_dest, false_dest,
-                            then_blocks, else_blocks, region_blocks, loop_ctx)
-    if gated !== nothing
-        body_entry, body_region, gate_merge = gated
-        return emit_gated_branch!(block, ctx, current, cond, true_dest, false_dest,
-                                  then_blocks, else_blocks, body_entry, body_region,
-                                  gate_merge, region_blocks, loop_ctx)
-    end
+        ctx, current, true_dest, false_dest, region_blocks, loop_ctx)
+    @assert merge !== nothing || _both_arms_diverge(ctx, current, true_dest, false_dest,
+                                                    then_blocks, else_blocks, region_blocks, loop_ctx) """
+        multi-entry continuation reached the lift at BB$current — normalize_cf's \
+        continuation multiplexer should have collapsed it (internal error)"""
 
     # If merge exists and is in region, extract its phis.
     # Skip phis at loop headers — UNLESS the header has multiple non-loop predecessors
@@ -233,27 +365,13 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     else
         false
     end
+    # Continuation-by-exclusion finds the *real* merge directly, so a phi-free
+    # merge is genuinely phi-free: the walk continues through it without a
+    # separate pass-through "absorption" step (D-absorb retired). A no-phi merge
+    # yields `nothing` here → the "merge exists but no phis" path below.
     merge_phis = if merge !== nothing && merge ∈ region_blocks &&
                    (!haskey(ctx.loop_map, merge) || is_multi_entry_header)
         phis = extract_merge_phis(ir, merge, region_blocks)
-        # No phis: absorb a genuine pass-through (no-phi block forwarding
-        # unconditionally) and use its successor's phis — the || pattern. Gate on
-        # a single successor: a multi-successor merge is itself a branch (e.g. a
-        # sequential `if` sharing the condition) and must not be absorbed.
-        if isempty(phis) && length(ir.cfg.blocks[merge].succs) == 1
-            for succ in ir.cfg.blocks[merge].succs
-                if succ ∈ region_blocks && !haskey(ctx.loop_map, succ)
-                    succ_phis = extract_merge_phis(ir, succ, region_blocks)
-                    if !isempty(succ_phis)
-                        # Absorb the pass-through block into the branch regions
-                        # and use the successor as the real merge
-                        merge = succ
-                        phis = succ_phis
-                        break
-                    end
-                end
-            end
-        end
         isempty(phis) ? nothing : phis
     else
         nothing
@@ -343,111 +461,6 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     end
 end
 
-"""
-    emit_gated_branch!(...) -> next
-
-Emit a short-circuit-guarded body (`if a || b { body }; rest`) as MLIR's
-`transformCFGToSCF` edge multiplexer — the body is structured ONCE, never
-duplicated.
-
-The continuation has two entry blocks (`body`, `rest=merge`). The multiplexer
-specializes to:
-
-1. An entry `IfOp(cond)` that materializes a boolean region selector — the
-   combined predicate `a || b` — as block result `disc`. Reusing the merge-phi
-   machinery this is a synthetic phi `disc = φ(reaches-body => true, reaches-rest
-   => false)`; the recursive walk routes each arm leaf to the right constant, so
-   nested branches (`a || b || c`) become nested IfOps yielding `disc`. When the
-   continuation carries values (a value-producing `||`/`&&`), the multiplexer
-   also yields, per merge phi, the value on the skip-body (arm→merge) edges as
-   additional block results.
-2. A single `scf.if disc { body } { skip }` that runs the body ONCE. Its results
-   are the merge phi values: the body arm yields the body→merge values; the skip
-   arm forwards the values the entry IfOp produced for the skip path.
-3. The walk continues at `merge`, where the original phi SSAs are now defined by
-   the gated IfOp's results.
-"""
-# MLIR edge multiplexer for a short-circuit-guarded body (CFGToSCF.cpp
-# `EdgeMultiplexer`: https://github.com/llvm/llvm-project/blob/cabad14763b27802296b44b3b5e507f6a4f7a3c5/mlir/lib/Transforms/Utils/CFGToSCF.cpp):
-# the entry IfOp yields a boolean selector (the combined predicate) + skip-path
-# merge values, then one `scf.if selector { body }` runs the body once.
-function emit_gated_branch!(block::Block, ctx::StructurizeCtx, current::Int,
-                            cond, true_dest::Int, false_dest::Int,
-                            then_blocks::Set{Int}, else_blocks::Set{Int},
-                            body_entry::Int, body_region::Set{Int},
-                            merge::Int, region_blocks::Set{Int},
-                            loop_ctx::Union{Nothing, LoopCtx})
-    ir = ctx.ir
-    branch_anchor = last(ir.cfg.blocks[current].stmts)
-
-    # merge phis (only if `merge` is in this region; an outer-merge nested body
-    # has no escaping value). skip_preds = arm→merge edges (not in the body).
-    mp = merge ∈ region_blocks ? extract_merge_phis(ir, merge, region_blocks) : MergePhiInfo[]
-    skip_preds = Int[p for p in ir.cfg.blocks[merge].preds if p ∉ body_region]
-
-    # --- 1. Entry IfOp: yield the selector + skip-path values ---
-    # Selector phi: true on body-reaching arms, false on skip arms; skip phis
-    # forward each merge phi's skip-edge value (Undef on the body edge).
-    disc_ssa = alloc_ssa!(ctx)
-    set_ssa_type!(ctx, disc_ssa, Bool)
-    disc_ev = Dict{Int,Any}(body_entry => true)
-    for p in skip_preds; disc_ev[p] = false; end
-    disc_phis = MergePhiInfo[MergePhiInfo(disc_ssa, disc_ev)]
-
-    skip_ssas = Int[]   # entry-IfOp result holding each phi's skip-path value
-    for phi in mp
-        s = alloc_ssa!(ctx)
-        set_ssa_type!(ctx, s, ctx.types[phi.ssa_idx])
-        push!(skip_ssas, s)
-        ev = Dict{Int,Any}(body_entry => Undef(ctx.types[phi.ssa_idx]))
-        for p in skip_preds
-            ev[p] = get(phi.edge_values, p, Undef(ctx.types[phi.ssa_idx]))
-        end
-        push!(disc_phis, MergePhiInfo(s, ev))
-    end
-
-    then_blk = if !isempty(then_blocks)
-        structurize_region!(ctx, true_dest, then_blocks; merge_phis=disc_phis, loop_ctx=loop_ctx)
-    else
-        make_empty_branch_block(true_dest, current, disc_phis, loop_ctx, ir, ctx)
-    end
-    else_blk = if !isempty(else_blocks)
-        structurize_region!(ctx, false_dest, else_blocks; merge_phis=disc_phis, loop_ctx=loop_ctx)
-    else
-        make_empty_branch_block(false_dest, current, disc_phis, loop_ctx, ir, ctx)
-    end
-    set_branch_yields!(then_blk, disc_phis, then_blocks, current, ir, block, ctx)
-    set_branch_yields!(else_blk, disc_phis, else_blocks, current, ir, block, ctx)
-
-    disc_if = IfOp(cond, then_blk, else_blk)
-    disc_indices = Int[p.ssa_idx for p in disc_phis]
-    disc_types = Any[ctx.types[i] for i in disc_indices]
-    emit_ifop_result!(block, disc_if, disc_indices, disc_types, ctx, branch_anchor)
-
-    # --- 2. Structurize the body ONCE, yielding its merge-phi contributions ---
-    body_merge_phis = isempty(mp) ? nothing : mp
-    body_blk = structurize_region!(ctx, body_entry, body_region;
-                                   merge_phis=body_merge_phis, loop_ctx=loop_ctx)
-    set_yield_if_needed!(body_blk)
-
-    # --- 3. Gate it: scf.if disc { body } { forward skip values } ---
-    skip_blk = Block()
-    skip_blk.terminator = YieldOp(IRValue[SSAValue(s) for s in skip_ssas])
-    body_if = IfOp(SSAValue(disc_ssa), body_blk, skip_blk)
-    if isempty(mp)
-        if_ssa = alloc_ssa!(ctx)
-        push!(block, if_ssa, body_if, Tuple{})
-        anchor_line!(ctx, if_ssa, branch_anchor)
-    else
-        phi_indices = Int[p.ssa_idx for p in mp]
-        phi_types = Any[ctx.types[p.ssa_idx] for p in mp]
-        emit_ifop_result!(block, body_if, phi_indices, phi_types, ctx, branch_anchor)
-    end
-
-    # --- 4. Continue at merge ---
-    return merge
-end
-
 """Set yield terminator on a branch block for merge phis, if not already set."""
 function set_branch_yields!(blk::Block, merge_phis::Vector{MergePhiInfo},
                             branch_blocks::Set{Int}, branch_entry::Int,
@@ -470,27 +483,15 @@ function make_empty_branch_block(dest::Int, from::Int,
                                   loop_ctx::Union{Nothing, LoopCtx},
                                   ir::IRCode, ctx::StructurizeCtx)
     b = Block()
-    # Loop boundary?
-    if loop_ctx !== nothing
-        if dest == loop_ctx.header
-            b.terminator = ContinueOp(copy(loop_ctx.carried_values))
-            return b
-        elseif dest ∉ loop_ctx.loop_blocks
-            # Dead-end throw/unreachable exit: emit its statements + `unreachable`
-            # instead of collapsing to a BreakOp (which would drop the throw).
-            if is_throw_exit(ir, dest)
-                emit_throw_exit!(b, ctx, dest)
-                return b
-            end
-            b.terminator = BreakOp(copy(loop_ctx.break_values))
-            return b
-        end
+    # Loop boundary (continue / break / re-materialized exit path)?
+    if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, from, loop_ctx)
+        return b
     end
     # Merge phis? Use reachability from dest to find the right phi-edge value and
     # yield it directly. Multi-entry continuations (the short-circuit `&&`/`||`
     # shape, where a value is defined in a block between the arms and the merge)
-    # are handled upstream by the `emit_gated_branch!` edge multiplexer, so the
-    # value is always visible here — no tail duplication needed.
+    # were collapsed to single-entry upstream by `normalize_cf`'s continuation
+    # multiplexer, so the value is always visible here — no tail duplication.
     if merge_phis !== nothing && !isempty(merge_phis)
         pred = find_exit_predecessor(merge_phis, Set{Int}([dest]), from, ir)
         b.terminator = make_yield_for_edge(ir, merge_phis, pred, b, ctx)
@@ -569,8 +570,8 @@ end
 """
 Set a region's exit terminator on `blk`: resolve which phi-edge predecessor this
 region reaches and yield that value. Multi-entry continuations (short-circuit
-`&&`/`||`) are handled upstream by the `emit_gated_branch!` edge multiplexer, so
-the yield value is always visible — no tail duplication.
+`&&`/`||`) were collapsed to single-entry upstream by `normalize_cf`, so the
+yield value is always visible — no tail duplication.
 """
 function set_exit_yield!(blk::Block, ir::IRCode, ctx::StructurizeCtx,
                           merge_phis::Vector{MergePhiInfo}, last_block::Int)

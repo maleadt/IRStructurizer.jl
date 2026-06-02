@@ -29,6 +29,9 @@ include("ir/validation.jl")
 # unstructurize: StructuredIRCode → IRCode
 include("unstructurize.jl")
 
+# mutate-then-lift CFG normalization (EdgeMultiplexer)
+include("structurize/multiplex.jl")
+
 # public API
 include("interface.jl")
 include("precompile.jl")

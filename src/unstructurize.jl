@@ -628,14 +628,16 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
     flag = fill(UInt32(0), n)
     stmts = InstructionStream(all_stmts, all_types, info, line, flag)
 
-    # Build CFG
+    # Build CFG. `cfg.index` lists the first statement of blocks 2..n (length
+    # n-1), excluding block 1 — including block 1's start makes `block_for_inst`
+    # mis-map every statement and fails `verify_ir`.
     bb_blocks = BasicBlock[]
     cfg_index = Int[]
     offset = 0
     for (i, bb) in enumerate(ctx.bbs)
         len = length(bb.stmts)
         push!(bb_blocks, BasicBlock(StmtRange(offset + 1, offset + len), Int[], Int[]))
-        push!(cfg_index, offset + 1)
+        i > 1 && push!(cfg_index, offset + 1)
         offset += len
     end
 

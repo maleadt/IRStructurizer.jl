@@ -47,9 +47,12 @@ end
 """
     check_irreducible(ir::IRCode)
 
-Detect irreducible control flow (multi-entry SCCs) and throw
-`UnstructuredControlFlowError` if found. Julia IR is almost always reducible;
-irreducible CFGs arise only from `@goto`.
+Backstop assertion that the IR is reducible by the time the lift runs. Irreducible
+(multi-entry) SCCs — from `@goto` — are normalized away upstream by `normalize_cf`
+(an entry multiplexer collapses each to a single-entry loop). This should
+therefore never fire; if it does, normalization failed to apply, and throwing
+`UnstructuredControlFlowError` is far better than letting the recursive walk spin
+on a multi-entry cycle.
 """
 function check_irreducible(ir::IRCode)
     domtree = construct_domtree(ir)
@@ -57,8 +60,8 @@ function check_irreducible(ir::IRCode)
     for bb in 1:length(ir.cfg.blocks)
         if bb_in_irreducible_loop(reach, bb)
             throw(UnstructuredControlFlowError(
-                "irreducible control flow detected at BB$bb — " *
-                "multi-entry cycles (e.g. from @goto) are not supported"))
+                "irreducible control flow remains at BB$bb after normalization — " *
+                "this is an internal error in normalize_cf (the entry multiplexer)"))
         end
     end
 end
