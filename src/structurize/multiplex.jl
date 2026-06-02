@@ -93,16 +93,6 @@ function add_block!(m::MCFG, b::MBlock; order::Bool=true)
     return id
 end
 
-"""Type of any value reference (for undef-fill / arg typing)."""
-function id_type(m::MCFG, id::Int)
-    haskey(m.types, id) && return m.types[id]
-    # body statement?
-    for b in m.blocks, s in b.body
-        s.id == id && return s.type
-    end
-    return Any
-end
-
 #=============================================================================
  ingest: IRCode → MCFG  (phi → block-arg + edge-operands)
 =============================================================================#
