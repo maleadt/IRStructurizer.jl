@@ -13,6 +13,22 @@
  Top-Level Promotion Pass
 =============================================================================#
 
+"""Count `BreakOp` terminators reachable inside this loop body, descending into
+`IfOp` arms but NOT into nested loops (whose breaks are their own). A counted/
+condition loop has exactly one — its iteration-exit break; a second one is a
+*secondary* dynamic exit (an early `break`/`return` reached mid-body) that `ForOp`/
+`WhileOp` cannot represent (their iteration is fixed), so such a loop must stay a
+`LoopOp`. Promoting it produced a `ForOp` body with a stray `BreakOp` whose exit
+placeholder leaked at unstructurize — a crash; this guard prevents it."""
+function count_breaks(block::Block)
+    n = block.terminator isa BreakOp ? 1 : 0
+    for (_, e) in block.body
+        e.stmt isa IfOp || continue
+        n += count_breaks(e.stmt.then_region) + count_breaks(e.stmt.else_region)
+    end
+    return n
+end
+
 """
 Post-pass: walk the structured IR and promote LoopOps to WhileOp/ForOp
 where the pattern matches.
@@ -24,7 +40,12 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
 
     for (idx, entry) in block.body
         stmt = entry.stmt
-        if stmt isa LoopOp
+        if stmt isa LoopOp && count_breaks(stmt.body) > 1
+            # Secondary dynamic exit (e.g. an early break/return alongside the
+            # iteration-exit break): only the general LoopOp can represent it.
+            promote_loops!(stmt.body, ctx)
+            push!(new_body, (idx, stmt, entry.type, entry.flag))
+        elseif stmt isa LoopOp
             # Recursively promote inner loops first
             promote_loops!(stmt.body, ctx)
             # Try direct LoopOp → ForOp (handles iteration protocol patterns)

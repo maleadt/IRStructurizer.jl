@@ -482,6 +482,42 @@ end
     end
 end
 
+@testset "I6/promote: a counted loop with a break stays a LoopOp" begin
+    # A `break` inside a `for`/`while` is a dynamic exit a counted ForOp / a
+    # condition WhileOp can't represent: promoting it left a stray BreakOp in the
+    # promoted body whose exit placeholder leaked at unstructurize (a crash).
+    # promote_loops! now keeps such a loop a LoopOp (count_breaks > 1).
+    @noinline opaque(b::Bool) = Base.compilerbarrier(:type, b)::Bool
+    function for_break(p::Bool, n::Int)
+        s = 0
+        for k in 1:n
+            s += k
+            if opaque(p) && k > 3; break; end
+        end
+        return s
+    end
+    sci, _ = code_structured(for_break, Tuple{Bool, Int}) |> only
+    @test count_stmts(sci.entry, s -> s isa ForOp) == 0   # not promoted
+    @test count_stmts(sci.entry, s -> s isa LoopOp) == 1
+    for p in (false, true), n in (0, 2, 4, 6)
+        @test execute(sci, p, n) == for_break(p, n)
+    end
+
+    function while_break(n::Int)
+        i = 0; acc = 0
+        while i < n
+            i += 1
+            i == 4 && break
+            acc += i
+        end
+        return acc
+    end
+    sci2, _ = code_structured(while_break, Tuple{Int}) |> only
+    for n in (0, 2, 4, 6, 10)
+        @test execute(sci2, n) == while_break(n)
+    end
+end
+
 @testset "I8: secondary loop exits through a pass-through block" begin
     # A loop whose only escape is an early `return`/`throw` reached via the `||`
     # short-circuit — the exit edge lands on a `goto #ret` pass-through, not the
