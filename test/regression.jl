@@ -277,6 +277,28 @@ end
     @test @roundtrip ((n::Int) -> (i = 0; while i <= n; i += 1; end; i))(4)
 end
 
+@testset "while loop carrying a counter + accumulator promotes to a ForOp" begin
+    # Regression: `while k<n; k+=1; s+=k; end` carries two values. WhileOp→ForOp
+    # promotion folds the induction increment into `0:1:n`, but `s += k` reads the
+    # post-increment value `k`; dropping that increment statement left the read
+    # dangling ("SSA used but not defined"). The increment now survives — remapped
+    # to the induction variable — whenever something other than the IV carry reads
+    # it. (Found by `res/fuzz.jl`'s `while`-outer-loop coverage.)
+    wacc(n::Int) = (s = 0; k = 0; while k < n; k += 1; s += k; end; s)
+    sci, _ = code_structured(wacc, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, s -> s isa ForOp) == 1     # promotes (the bug threw before this)
+    for n in (0, 1, 2, 3, 5, 10)
+        @test execute(sci, n) == wacc(n)
+    end
+    # Accumulating the *pre*-increment counter (the IV is read directly, not via
+    # the increment) — the sibling shape, must also stay correct.
+    wacc2(n::Int) = (s = 0; k = 0; while k < n; s += k; k += 1; end; s)
+    sci2, _ = code_structured(wacc2, Tuple{Int}) |> only
+    for n in (0, 1, 3, 6, 10)
+        @test execute(sci2, n) == wacc2(n)
+    end
+end
+
 @testset "the core walk emits only LoopOp (promotion is a post-pass)" begin
     # With `promote=false`, every loop must be a generic LoopOp — no ForOp/WhileOp
     # leaks from the core walk. (With promotion they become For/While; that path is
