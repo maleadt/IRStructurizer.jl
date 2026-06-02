@@ -58,6 +58,7 @@ macro roundtrip(call_expr)
 end
 
 @testset "IRStructurizer" verbose=true begin
+    include("setup.jl")
     include("interface.jl")
     include("structurize.jl")
     include("multiplex.jl")
