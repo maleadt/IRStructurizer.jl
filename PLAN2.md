@@ -318,3 +318,40 @@ uniform mechanism. Current handling is correct (I8-safe); do this only to finish
 - Branch: this work continues on `rework` (5 commits past the #48 baseline `9d84ca9`). The
   prior work — merge-by-exclusion, region-exit rule, corpus, I6 guard, two latent-miscompile
   fixes — is committed; build on it, don't redo it.
+
+## 10. Implementation status (done)
+
+**I4 is closed.** Mutate-then-lift is implemented in `src/structurize/multiplex.jl`
+(`normalize_cf`), wired into `StructuredIRCode` before debug-info capture; the lift only ever
+structurizes single-entry regions.
+
+- **M1 — done.** `ingest`/`emit` (dense `IRCode` ↔ explicit-edge `MBlock` = block-args +
+  per-edge operands; `emit` is non-mutating, preserves block order/flags/types/debuginfo, and
+  inserts trampolines for `GotoIfNot` fallthrough + duplicate successors). `EdgeMultiplexer`
+  (`create_mux!`/`redirect_edge!`/`dispatch!`/`single_entry_mux!`): union args + integer
+  discriminator + undef-fill; dispatch is a `GotoIfNot` compare-chain (Julia has no switch);
+  `absorb` reuses the entries' arg ids for the loop-header case; dead (all-undef) mux args are
+  forwarded as `Undef`. Round-trip-identity + mux unit tests in `test/multiplex.jl`.
+- **M2 — done.** Irreducible (multi-entry SCC) headers collapse to one entry mux (`absorb`) + a
+  latch unifying the back edges → a plain reducible `LoopOp`. `check_irreducible` is a backstop.
+  `@goto` corpus tests (N=2, N=3).
+- **M3 — done.** Multi-predecessor continuations (short-circuits, N-way merges, nested gated
+  bodies) route through the same mux upfront; **`find_gated_body`/`emit_gated_branch!` deleted**.
+  `emit_branch!` has one path and asserts the continuation is single-entry. Nested-gated +
+  generative-fuzz corpus tests.
+
+**Fuzzing found and fixed silent miscompiles a green corpus missed** (and that the pre-PLAN2
+baseline also had): the I8 region-exit rule was generalized from a region-exit *block* to a
+region-exit *path* (`resolve_loop_exit!`/`emit_exit_path!`), and `promote_loops!` now keeps a
+loop with a secondary `break` as a `LoopOp`. Vs baseline (extended fuzz, 200 generated fns):
+silent miscompiles **0** (was 36), loud crashes ~416 (was 1192), structured 187/200 (was 160).
+
+**Remaining (pre-existing, out of scope, loud not silent):**
+- **M4 (the §3 minor row)** — the single-exiting latch that would replace `find_loop_exit`'s
+  back-edge-adjacent heuristic. The heuristic is correct now (fuzzer-clean), so M4 is optional
+  cleanup, not a correctness fix.
+- **Nested-loop fragility** — a `break` in an *inner* nested loop fails to structurize (loud:
+  "SSA used but not defined"), *identically on the pre-PLAN2 baseline*. This is the nested-loop
+  extra-exit threading (`find_extra_exit_values`/`emit_loop!`), orthogonal to the branch mux —
+  a separate loop-handling robustness effort. The generative fuzz net (`test/corpus.jl`) is the
+  tool to drive it; it asserts no silent miscompile and exercises these shapes.

@@ -129,6 +129,15 @@ divergence this closed. The one remaining row (M4) folds `find_loop_exit`'s prim
 into a single-exiting latch over all exit edges; current handling is correct (I8-safe), so it is
 cleanup, not a correctness gap.
 
+**Known limitation (pre-PLAN2, loud, separate effort — not a divergence).** A `break` in an
+*inner* nested loop fails to structurize (loud `SSA used but not defined`, *identical on the
+pre-PLAN2 baseline*). This is nested-loop extra-exit threading (`find_extra_exit_values`/
+`emit_loop!`), orthogonal to the branch multiplexer. It is **loud** (the validators reject it),
+never a silent miscompile. The generative fuzz net in `test/corpus.jl` (random nested guards +
+breaks/returns in loops, exec-vs-direct) is the tool to drive this — it asserts **no silent
+miscompile** and exercises these shapes; fuzzing eliminated the silent miscompiles the baseline
+had (36 → 0 on a 200-function extended run) and is the standing guard against new ones.
+
 ---
 
 ## 4. The executable corpus
