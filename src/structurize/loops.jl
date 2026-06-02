@@ -160,33 +160,28 @@ function collect_dominated!(result::Set{Int}, domtree::DomTree, root::Int, regio
 end
 
 #=============================================================================
- Merge Phi Extraction (block args + per-edge operands)
+ Merge result shape (block args + per-edge operands)
 =============================================================================#
 
-"""Extract the block arguments at `merge_idx` as [`MergePhiInfo`](@ref): each
-argument's stable id plus the per-predecessor operand feeding it (the operand on
-edge `pred → merge`). An `Undef` operand is an unassigned phi slot (omitted), so a
-predecessor on a dead path contributes nothing. The MBlock analogue of reading
-the merge block's leading phi nodes."""
-function extract_merge_phis(ctx::StructurizeCtx, merge_idx::Int, region_blocks::Set{Int})
+"""Read the merge block `merge_idx`'s block arguments as a [`MergeInfo`](@ref): the
+*live* arg positions — those some predecessor edge assigns a real (non-`Undef`)
+operand — become the `IfOp`'s results. An arg every predecessor leaves `Undef` is a
+dead phi slot and is dropped (no result). Returns `nothing` if no arg is live. The
+MBlock analogue of reading a merge block's leading phi nodes, but recording only
+the result *shape*: each arm later yields its own edge's operands directly
+(`yield_to_merge!`), so there is no per-predecessor value map here."""
+function merge_info(ctx::StructurizeCtx, merge_idx::Int)
     m = ctx.m::MCFG
-    result = MergePhiInfo[]
-    1 <= merge_idx <= length(m.blocks) || return result
+    1 <= merge_idx <= length(m.blocks) || return nothing
     args = m.blocks[merge_idx].args
-    isempty(args) && return result
+    isempty(args) && return nothing
     preds = ctx.cfg.blocks[merge_idx].preds
+    positions = Int[]; ids = Int[]; types = Any[]
     for (k, arg) in enumerate(args)
-        edge_values = Dict{Int, Any}()
-        for p in preds
-            ops = edge_operands(m, p, merge_idx)
-            ops === nothing && continue
-            v = ops[k]
-            v isa Undef && continue   # undef edge → unassigned phi slot
-            edge_values[p] = v
-        end
-        !isempty(edge_values) && push!(result, MergePhiInfo(arg, edge_values))
+        any(p -> (o = edge_operands(m, p, merge_idx); o !== nothing && !(o[k] isa Undef)), preds) || continue
+        push!(positions, k); push!(ids, arg); push!(types, get(ctx.types, arg, Any))
     end
-    return result
+    isempty(ids) ? nothing : MergeInfo(merge_idx, positions, ids, types)
 end
 
 #=============================================================================

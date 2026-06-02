@@ -7,17 +7,25 @@
 =============================================================================#
 
 """
-    MergePhiInfo
+    MergeInfo
 
-Info about one block argument at a merge/exit block. `ssa_idx` is the argument's
-stable id; `edge_values` maps predecessor block index → the operand that edge
-contributes to this argument. Built from the `MBlock` args + per-edge operands by
-[`extract_merge_phis`](@ref) — the lift then reasons in the same predecessor-keyed
-terms whether the value came from a Julia phi or an MLIR-style block argument.
+The merge/continuation block of an `IfOp`, in native block-argument form. `merge`
+is the block id; `positions` are the indices of its block args that are *live*
+(some predecessor edge carries a real, non-`Undef` operand) and so become `IfOp`
+results; `ids`/`types` are those args' stable ids and (widened) types. Built once
+by [`merge_info`](@ref).
+
+Each arm's `YieldOp` is then just the operands *its own* exit edge carries to
+`merge` — `edge_operands(m, arm_exit, merge)` read position by position — instead
+of a predecessor-keyed phi reconstruction with a reverse edge lookup. "What value
+does this arm contribute to the merge's k-th arg" *is* the k-th operand on the
+arm's edge (the MLIR model).
 """
-struct MergePhiInfo
-    ssa_idx::Int
-    edge_values::Dict{Int, Any}
+struct MergeInfo
+    merge::Int
+    positions::Vector{Int}
+    ids::Vector{Int}
+    types::Vector{Any}
 end
 
 """
@@ -65,7 +73,7 @@ Recursively structurize a set of blocks into a single Block.
 - `loop_ctx`: if provided, back-edges/exits become ContinueOp/BreakOp.
 """
 function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set{Int};
-                              merge_phis::Union{Nothing, Vector{MergePhiInfo}}=nothing,
+                              merge_phis::Union{Nothing, MergeInfo}=nothing,
                               loop_ctx::Union{Nothing, LoopCtx}=nothing)
     block = Block()
     m = ctx.m::MCFG
@@ -120,9 +128,11 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
         end
     end
 
-    # Region ended — set terminator if not already set
+    # Region ended — yield to the merge if not already terminated. The arm's exit
+    # block is the walk's tracked `last_block`; its edge to the merge carries the
+    # yield operands directly.
     if block.terminator === nothing && merge_phis !== nothing
-        set_exit_yield!(block, ctx, merge_phis, last_block)
+        yield_to_merge!(block, ctx, last_block, merge_phis)
     end
 
     return block
@@ -217,18 +227,6 @@ end
  Branch Lifting (IfOp)
 =============================================================================#
 
-"""True iff the branch at `current` has no continuation edges — both arms
-diverge (return/throw/break/continue). The only legitimate reason
-`find_branch_regions` returns `merge === nothing` once continuations are
-single-entry (post `normalize_cf`)."""
-function _both_arms_diverge(ctx::StructurizeCtx, current::Int, true_dest::Int,
-                            false_dest::Int, then_blocks::Set{Int}, else_blocks::Set{Int},
-                            region_blocks::Set{Int}, loop_ctx::Union{Nothing, LoopCtx})
-    entries, _ = branch_continuation(ctx.cfg, ctx.domtree, current, true_dest, false_dest,
-                                     then_blocks, else_blocks, region_blocks, loop_ctx)
-    return isempty(entries)
-end
-
 """
     emit_branch!(block, ctx, current, condbr, region_blocks, outer_merge_phis) -> next
 
@@ -237,7 +235,7 @@ continue with, or nothing if both branches exit/diverge.
 """
 function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
                       condbr::MCondBr, region_blocks::Set{Int},
-                      outer_merge_phis::Union{Nothing, Vector{MergePhiInfo}},
+                      outer_merge_phis::Union{Nothing, MergeInfo},
                       loop_ctx::Union{Nothing, LoopCtx}=nothing)
     # MCondBr carries explicit true/false edges (no fallthrough/succ derivation).
     true_dest = condbr.t.target
@@ -253,14 +251,10 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # no shape-matching (`find_gated_body` is gone; invariant I4).
     then_blocks, else_blocks, merge = find_branch_regions(
         ctx.cfg, ctx.domtree, current, true_dest, false_dest, region_blocks, loop_ctx)
-    @assert merge !== nothing || _both_arms_diverge(ctx, current, true_dest, false_dest,
-                                                    then_blocks, else_blocks, region_blocks, loop_ctx) """
-        multi-entry continuation reached the lift at BB$current — normalize_cf's \
-        continuation multiplexer should have collapsed it (internal error)"""
 
-    # If merge exists and is in region, extract its block args (the "phis").
-    # Skip args at loop headers: a header is never a branch merge now — the
-    # pre-header (`normalize_one_preheader!`) routes every multi-entry header's
+    # If merge exists and is in region, read its block args (the "phis") as a
+    # MergeInfo. Skip args at loop headers: a header is never a branch merge now —
+    # the pre-header (`normalize_one_preheader!`) routes every multi-entry header's
     # entry edges through a pre-header, so the branch's continuation is that
     # pre-header, not the header itself.
     #
@@ -268,8 +262,7 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # is genuinely arg-free: the walk continues through it without a separate
     # pass-through step. A no-arg merge yields `nothing` here.
     merge_phis = if merge !== nothing && merge ∈ region_blocks && !haskey(ctx.loop_map, merge)
-        phis = extract_merge_phis(ctx, merge, region_blocks)
-        isempty(phis) ? nothing : phis
+        merge_info(ctx, merge)
     else
         nothing
     end
@@ -302,13 +295,11 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
 
     if merge !== nothing && merge ∈ region_blocks && merge_phis !== nothing
         # --- Inner merge exists: standard IfOp ---
-        set_branch_yields!(then_blk, merge_phis, then_blocks, current, ctx)
-        set_branch_yields!(else_blk, merge_phis, else_blocks, current, ctx)
+        set_branch_yields!(then_blk, ctx, merge_phis, then_blocks, current)
+        set_branch_yields!(else_blk, ctx, merge_phis, else_blocks, current)
 
         if_op = IfOp(cond, then_blk, else_blk)
-        phi_indices = [p.ssa_idx for p in merge_phis]
-        phi_types = [ctx.types[p.ssa_idx] for p in merge_phis]
-        emit_ifop_result!(block, if_op, phi_indices, phi_types, ctx, branch_anchor)
+        emit_ifop_result!(block, if_op, merge_phis.ids, merge_phis.types, ctx, branch_anchor)
         return merge
     elseif merge !== nothing && merge ∈ region_blocks
         # Merge exists but no args
@@ -332,8 +323,8 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
 
         if_op = IfOp(cond, then_blk, else_blk)
 
-        if outer_merge_phis !== nothing && !isempty(outer_merge_phis)
-            phi_types = [ctx.types[p.ssa_idx] for p in outer_merge_phis]
+        if outer_merge_phis !== nothing
+            phi_types = outer_merge_phis.types
             # The IfOp yields the outer-merge values only if at least one arm
             # actually yields (reaches the outer continuation). If BOTH arms
             # diverge (return/break/continue), the IfOp has no results — and this
@@ -366,95 +357,68 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     end
 end
 
-"""Set yield terminator on a branch block for merge phis, if not already set."""
-function set_branch_yields!(blk::Block, merge_phis::Vector{MergePhiInfo},
-                            branch_blocks::Set{Int}, branch_entry::Int,
-                            ctx::StructurizeCtx)
-    blk.terminator !== nothing && return  # already set (e.g., ReturnNode, inner yield)
+"""Set `blk`'s terminator to the `YieldOp` carrying what `exit_block` contributes
+to `minfo.merge`: for each live merge-arg position, the operand on edge `exit_block
+→ merge` (`edge_operands`), remapped through `ssa_remap`. The arm yields *its own*
+edge — no predecessor-keyed reconstruction.
 
-    # Find the exit block: the block in branch_blocks (or branch_entry if empty)
-    # whose edge feeds the merge phis.
-    exit_block = find_exit_predecessor(merge_phis, branch_blocks, branch_entry)
-    blk.terminator = make_yield_for_edge(merge_phis, exit_block, blk, ctx)
+`Undef` (an unassigned phi slot) or a missing edge (`exit_block` does not reach the
+merge — an arm that diverged, whose yield is then dead) becomes a typed `Undef`. If
+the arm already redefines a merge arg at its (remapped) id — e.g. a nested IfOp on
+the same merge emitted the `getfield` there — that in-block definition is preferred
+over the raw edge operand."""
+function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo)
+    ops = edge_operands(ctx.m::MCFG, exit_block, minfo.merge)
+    vals = IRValue[]
+    for (j, k) in enumerate(minfo.positions)
+        v = ops === nothing ? Undef(minfo.types[j]) : ops[k]
+        if v isa Undef
+            push!(vals, Undef(minfo.types[j]))
+        else
+            v = remap_ssa_ref(v, ctx.ssa_remap)
+            idx = get(ctx.ssa_remap, minfo.ids[j], minfo.ids[j])
+            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) : v)
+        end
+    end
+    blk.terminator = YieldOp(vals)
+end
+
+"""The arm's exit block: the seed (in `blocks`, else the branch source `fallback`)
+whose edge targets `merge`. Single-entry continuations (post `normalize_cf`)
+guarantee the arm's exit is a *direct* merge predecessor, so a seed lookup
+suffices — no reachability search. `fallback` is returned when no seed reaches the
+merge (an arm that diverged); `yield_to_merge!` then yields dead `Undef`s."""
+function branch_exit_block(ctx::StructurizeCtx, merge::Int, blocks::Set{Int}, fallback::Int)
+    m = ctx.m::MCFG
+    for b in (isempty(blocks) ? (fallback,) : blocks)
+        edge_operands(m, b, merge) !== nothing && return b
+    end
+    return fallback
+end
+
+"""Set the yield terminator on an arm block, if not already set (a `ReturnNode` /
+inner yield takes precedence). The exit block is the arm block that reaches the
+merge directly."""
+function set_branch_yields!(blk::Block, ctx::StructurizeCtx, minfo::MergeInfo,
+                            branch_blocks::Set{Int}, branch_entry::Int)
+    blk.terminator !== nothing && return
+    yield_to_merge!(blk, ctx, branch_exit_block(ctx, minfo.merge, branch_blocks, branch_entry), minfo)
 end
 
 function set_yield_if_needed!(blk::Block)
     blk.terminator === nothing && (blk.terminator = YieldOp())
 end
 
-"""Create an empty branch block with appropriate terminator for its destination."""
+"""Create an empty branch arm's block. The arm is just the edge `from → dest`, so
+when `dest` is the merge the block yields the operands that edge carries
+(`from`'s edge to the merge); a loop boundary becomes a break/continue instead."""
 function make_empty_branch_block(ctx::StructurizeCtx, dest::Int, from::Int,
-                                  merge_phis::Union{Nothing, Vector{MergePhiInfo}},
+                                  minfo::Union{Nothing, MergeInfo},
                                   loop_ctx::Union{Nothing, LoopCtx})
     b = Block()
-    # Loop boundary (continue / break)?
     if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, loop_ctx)
         return b
     end
-    # Merge phis? Find the phi-edge value this empty arm contributes and yield it.
-    if merge_phis !== nothing && !isempty(merge_phis)
-        pred = find_exit_predecessor(merge_phis, Set{Int}([dest]), from)
-        b.terminator = make_yield_for_edge(merge_phis, pred, b, ctx)
-    end
+    minfo !== nothing && yield_to_merge!(b, ctx, from, minfo)
     return b
-end
-
-"""
-    find_exit_predecessor(merge_phis, blocks, fallback)
-
-The predecessor of the merge whose edge carries this branch's values: the arm
-block (in `blocks`) that directly feeds the merge, else the branch source
-`fallback`. Single-entry continuations (post `normalize_cf`) guarantee the arm's
-exit block is a *direct* merge predecessor — its terminator edge targets the merge
-— so a seed/fallback lookup suffices; no reachability search (the old pass-through
-BFS dissolved on the block-arg / edge-operand form).
-"""
-function find_exit_predecessor(merge_phis::Vector{MergePhiInfo}, blocks::Set{Int},
-                                fallback::Int)
-    seeds = isempty(blocks) ? Set{Int}([fallback]) : blocks
-    for b in seeds, phi in merge_phis
-        haskey(phi.edge_values, b) && return b
-    end
-    return fallback
-end
-
-"""Create a YieldOp with values from merge phis for a given predecessor edge."""
-function make_yield_for_edge(merge_phis::Vector{MergePhiInfo},
-                              pred::Int, blk::Block, ctx::StructurizeCtx)
-    yield_values = IRValue[]
-    remap = ctx.ssa_remap
-    for phi in merge_phis
-        val = get(phi.edge_values, pred, nothing)
-        if val !== nothing
-            val = remap_ssa_ref(val, remap)
-            resolved = resolve_yield_value(blk, phi.ssa_idx, val, remap)
-            push!(yield_values, resolved)
-        else
-            push!(yield_values, Undef(ctx.types[phi.ssa_idx]))
-        end
-    end
-    return YieldOp(yield_values)
-end
-
-"""
-Set a region's exit terminator on `blk`: resolve which phi-edge predecessor this
-region reaches and yield that value. Multi-entry continuations (short-circuit
-`&&`/`||`) were collapsed to single-entry upstream by `normalize_cf`, so the
-yield value is always visible — no tail duplication.
-"""
-function set_exit_yield!(blk::Block, ctx::StructurizeCtx,
-                          merge_phis::Vector{MergePhiInfo}, last_block::Int)
-    pred = find_exit_predecessor(merge_phis, Set{Int}([last_block]), last_block)
-    blk.terminator = make_yield_for_edge(merge_phis, pred, blk, ctx)
-    return blk.terminator
-end
-
-"""
-If the block already defines `phi_ssa_idx` (or its remapped index), yield that SSAValue.
-Otherwise yield `default_val`.
-"""
-function resolve_yield_value(blk::Block, phi_ssa_idx::Int, default_val,
-                              remap::Dict{Int, Int}=Dict{Int,Int}())
-    idx = get(remap, phi_ssa_idx, phi_ssa_idx)
-    haskey(blk.body, idx) ? SSAValue(idx) : default_val
 end
