@@ -317,7 +317,7 @@ function emit(m_in::MCFG)
     end
 
     remap_val(@nospecialize(v)) = v isa SSAValue ? SSAValue(pos_of[v.id]) : v
-    remap_stmt(@nospecialize(s)) = _remap_stmt(s, remap_val)
+    remap_stmt(@nospecialize(s)) = remap_ssa(s, remap_val)
 
     all_stmts = Vector{Any}(undef, nstmts)
     all_types = Vector{Any}(undef, nstmts)
@@ -363,7 +363,7 @@ function emit(m_in::MCFG)
         push!(bb_ranges, start:pos)
     end
 
-    return _assemble(m, all_stmts, all_types, all_flags, line, bb_ranges, order)
+    return _assemble(m, all_stmts, all_types, all_flags, line, bb_ranges)
 end
 
 # Reconstruct a terminator statement from the explicit-edge form. A CondBr's true
@@ -378,67 +378,10 @@ function _emit_term(t::MTerm, bb_of, remap_val)
     end
 end
 
-function _remap_stmt(@nospecialize(stmt), remap_val)
-    if stmt isa Expr
-        return Expr(stmt.head, Any[remap_val(a) for a in stmt.args]...)
-    elseif stmt isa PiNode
-        return PiNode(remap_val(stmt.val), stmt.typ)
-    elseif stmt isa SSAValue
-        return remap_val(stmt)
-    elseif stmt isa PhiNode
-        new_vals = Vector{Any}(undef, length(stmt.values))
-        for k in eachindex(stmt.values)
-            isassigned(stmt.values, k) && (new_vals[k] = remap_val(stmt.values[k]))
-        end
-        return PhiNode(copy(stmt.edges), new_vals)
-    else
-        return stmt
-    end
-end
-
 # Build the CFG (preds/succs) and IRCode from the flat statement arrays.
-function _assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges, order)
-    n = length(all_stmts)
-    nb = length(bb_ranges)
-    bb_blocks = BasicBlock[]
-    cfg_index = Int[]                       # first stmt of blocks 2..nb (length nb-1)
-    for (i, r) in enumerate(bb_ranges)
-        push!(bb_blocks, BasicBlock(StmtRange(first(r), last(r)), Int[], Int[]))
-        i > 1 && push!(cfg_index, first(r))
-    end
-    for (i, r) in enumerate(bb_ranges)
-        last_s = all_stmts[last(r)]
-        if last_s isa GotoNode
-            _cfg_edge!(bb_blocks, i, last_s.label)
-        elseif last_s isa GotoIfNot
-            _cfg_edge!(bb_blocks, i, last_s.dest)
-            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
-        elseif last_s isa ReturnNode
-            # no successors
-        else
-            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
-        end
-    end
-    cfg = CFG(bb_blocks, cfg_index)
-
-    info = Vector{CC.CallInfo}(undef, n)
-    fill!(info, CC.NoCallInfo())
-    stmts = InstructionStream(all_stmts, all_types, info, line, all_flags)
-
-    meta = Expr[]
-    @static if VERSION >= v"1.12-"
-        debuginfo = CC.DebugInfoStream(line)
-        if m.debuginfo isa CC.DebugInfoStream
-            debuginfo.def = m.debuginfo.def
-            debuginfo.linetable = m.debuginfo.linetable
-            debuginfo.edges = copy(m.debuginfo.edges)
-        end
-        return IRCode(stmts, cfg, debuginfo, copy(m.argtypes), meta, CC.VarState[s for s in m.sptypes])
-    else
-        linetable = m.debuginfo isa Vector ? copy(m.debuginfo) : Core.LineInfoNode[]
-        return IRCode(stmts, cfg, linetable, copy(m.argtypes), meta, CC.VarState[s for s in m.sptypes])
-    end
-end
+_assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges) =
+    build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
+                       argtypes=m.argtypes, sptypes=m.sptypes, debuginfo=m.debuginfo)
 
 #=============================================================================
  EdgeMultiplexer  (port of CFGToSCF.cpp EdgeMultiplexer::create/redirectEdge/
