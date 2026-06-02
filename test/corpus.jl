@@ -477,6 +477,47 @@ end
     end
 end
 
+@testset "I8: secondary loop exits through a pass-through block" begin
+    # A loop whose only escape is an early `return`/`throw` reached via the `||`
+    # short-circuit — the exit edge lands on a `goto #ret` pass-through, not the
+    # return block itself. Collapsing that edge to a bare break (which skips the
+    # return) silently miscompiled; the region-exit rule now follows the exit path
+    # to the return and re-materializes it. Found by fuzzing (exec vs direct).
+    @noinline opaque(b::Bool) = Base.compilerbarrier(:type, b)::Bool
+    function early_ret_in_loop(p::Bool, n::Int)
+        s = 0
+        for k in 1:n
+            if k > 2 || opaque(p)
+                return s + 2
+            end
+            s += k
+        end
+        return s
+    end
+    sci, _ = code_structured(early_ret_in_loop, Tuple{Bool, Int}) |> only
+    for p in (false, true), n in (0, 1, 2, 3, 5)
+        @test execute(sci, p, n) == early_ret_in_loop(p, n)
+    end
+
+    # A shared return reached from BOTH `||` arms, with a non-trivial returned
+    # value — re-materialized once per arm with fresh SSA indices (no
+    # "defined in multiple blocks").
+    function shared_ret(a::Bool, b::Bool, n::Int)
+        acc = 0
+        for k in 1:n
+            if opaque(a) || opaque(b)
+                return acc * 10 + k
+            end
+            acc += k
+        end
+        return acc
+    end
+    sci2, _ = code_structured(shared_ret, Tuple{Bool, Bool, Int}) |> only
+    for a in (false, true), b in (false, true), n in (0, 1, 3)
+        @test execute(sci2, a, b, n) == shared_ret(a, b, n)
+    end
+end
+
 @testset "fuzz: multi-entry shapes, exec vs direct" begin
     # The corpus families' two latent silent miscompiles were both found by
     # fuzzing with exec-vs-direct, not by a green structural net. Enumerate

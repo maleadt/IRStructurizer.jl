@@ -114,28 +114,105 @@ function resolve_dest(dest, region_blocks::Set{Int},
                        ctx::Union{Nothing, StructurizeCtx}=nothing,
                        source::Int=0)
     dest === nothing && return nothing
-    if loop_ctx !== nothing
-        if dest == loop_ctx.header
-            block.terminator === nothing &&
-                (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
-            return nothing
-        elseif dest ∉ loop_ctx.loop_blocks
-            # A *secondary* region-exit edge (a `return`/`throw` dead-end that is
-            # not the loop's primary exit) is NOT a normal break: collapsing it to
-            # a BreakOp would discard the return value or the throw. Re-materialize
-            # it in place (invariant I8). The primary exit (`exit_dest`) always
-            # breaks — control leaves the loop and the outer walk continues there.
-            if ctx !== nothing && block.terminator === nothing &&
-               dest != loop_ctx.exit_dest && is_region_exit(ctx.ir, dest)
-                emit_region_exit!(block, ctx, dest, source)
-                return nothing
-            end
-            block.terminator === nothing &&
-                (block.terminator = BreakOp(copy(loop_ctx.break_values)))
-            return nothing
-        end
+    if loop_ctx !== nothing && ctx !== nothing &&
+       resolve_loop_exit!(block, ctx, dest, source, loop_ctx)
+        return nothing
     end
     dest ∈ region_blocks ? dest : nothing
+end
+
+"""Resolve a loop boundary on the edge to `dest` (from `source`), setting `block`'s
+terminator. Returns `true` if `dest` is a loop boundary (handled), `false` if it
+is inside the loop (a normal forward edge). The four boundary cases:
+
+- back edge to the header → `ContinueOp`;
+- the loop's primary exit → `BreakOp` (control leaves; results carried);
+- a *secondary* exit that leads only to region-exits (return/throw), never to the
+  primary → re-materialize that exit path in place (invariant I8: don't drop the
+  return/throw to a bare break). A direct region-exit block is the trivial case;
+- any other secondary exit (it rejoins the primary continuation) → `BreakOp`."""
+function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
+                            source::Int, loop_ctx::LoopCtx)
+    if dest == loop_ctx.header
+        block.terminator === nothing &&
+            (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
+        return true
+    elseif dest ∉ loop_ctx.loop_blocks
+        if block.terminator === nothing && dest != loop_ctx.exit_dest
+            if is_region_exit(ctx.ir, dest)
+                emit_region_exit!(block, ctx, dest, source)
+                return true
+            elseif !exit_reaches_primary(ctx.ir, dest, loop_ctx.exit_dest, loop_ctx.loop_blocks)
+                emit_exit_path!(block, ctx, dest, loop_ctx)
+                return true
+            end
+        end
+        block.terminator === nothing &&
+            (block.terminator = BreakOp(copy(loop_ctx.break_values)))
+        return true
+    end
+    return false
+end
+
+"""Does the path leaving the loop at `dest` reach the loop's primary exit (without
+re-entering the loop)? If not, the path returns/throws independently and is
+re-materialized; if so, it rejoins the continuation and is a break."""
+function exit_reaches_primary(ir::IRCode, dest::Int, primary::Union{Int, Nothing},
+                              loop_blocks::Set{Int})
+    primary === nothing && return false
+    seen = Set{Int}()
+    worklist = Int[dest]
+    while !isempty(worklist)
+        b = pop!(worklist)
+        b == primary && return true
+        (b in seen || b in loop_blocks) && continue
+        push!(seen, b)
+        for s in ir.cfg.blocks[b].succs
+            (s in seen || s in loop_blocks) || push!(worklist, s)
+        end
+    end
+    return false
+end
+
+"""Re-materialize a secondary loop-exit path (a `return`/`throw` reached from
+within the loop, possibly through pass-through blocks like `goto #ret`) into
+`block`. Structurizes the path as an ordinary single-entry region — the loop's
+block-arg substitutions are in scope (`ctx.ssa_remap`), so loop-carried values
+resolve — and splices it in. The path provably leads only to region-exits (see
+`exit_reaches_primary`), so the recursive walk needs no loop context.
+
+A shared exit path (one return reached from several arms) is re-materialized once
+per arm. Its body definitions are renamed to fresh SSA indices (scoped via a
+saved/restored `ssa_remap`) so the copies don't define the same index twice —
+the same defined-in-loop / used-in-arm rename the reduce-form pass uses."""
+function emit_exit_path!(block::Block, ctx::StructurizeCtx, dest::Int, loop_ctx::LoopCtx)
+    ir = ctx.ir
+    region = Set{Int}()
+    worklist = Int[dest]
+    while !isempty(worklist)
+        b = pop!(worklist)
+        (b in region || b in loop_ctx.loop_blocks || b == loop_ctx.exit_dest) && continue
+        push!(region, b)
+        for s in ir.cfg.blocks[b].succs
+            push!(worklist, s)
+        end
+    end
+
+    saved_remap = copy(ctx.ssa_remap)
+    for b in region
+        bb = ir.cfg.blocks[b]
+        for si in first(bb.stmts):last(bb.stmts)
+            s = ir.stmts.stmt[si]
+            (s isa PhiNode || s isa GotoNode || s isa GotoIfNot || s isa ReturnNode) && continue
+            fresh = alloc_ssa!(ctx)
+            ctx.ssa_remap[si] = fresh
+            anchor_line!(ctx, fresh, si)
+        end
+    end
+    sub = structurize_region!(ctx, dest, region; loop_ctx=nothing)
+    ctx.ssa_remap = saved_remap
+    merge_block_into!(block, sub)
+    return block
 end
 
 """A region-exit block: no successors (MLIR's `isRegionExitBlock`,
@@ -401,23 +478,9 @@ function make_empty_branch_block(dest::Int, from::Int,
                                   loop_ctx::Union{Nothing, LoopCtx},
                                   ir::IRCode, ctx::StructurizeCtx)
     b = Block()
-    # Loop boundary?
-    if loop_ctx !== nothing
-        if dest == loop_ctx.header
-            b.terminator = ContinueOp(copy(loop_ctx.carried_values))
-            return b
-        elseif dest ∉ loop_ctx.loop_blocks
-            # Secondary region-exit (return/throw/unreachable, not the primary
-            # exit) reached from an empty branch arm: re-materialize it in place
-            # instead of collapsing to a BreakOp (which would drop the return
-            # value or the throw).
-            if dest != loop_ctx.exit_dest && is_region_exit(ir, dest)
-                emit_region_exit!(b, ctx, dest, from)
-                return b
-            end
-            b.terminator = BreakOp(copy(loop_ctx.break_values))
-            return b
-        end
+    # Loop boundary (continue / break / re-materialized exit path)?
+    if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, from, loop_ctx)
+        return b
     end
     # Merge phis? Use reachability from dest to find the right phi-edge value and
     # yield it directly. Multi-entry continuations (the short-circuit `&&`/`||`
