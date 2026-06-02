@@ -664,8 +664,9 @@ function normalize_one_irreducible!(m::MCFG)
     @assert length(entry_blocks) >= 1 "irreducible SCC with no entry block"
 
     # Separate the edges into entry blocks: external (entry edges) and in-SCC
-    # (back edges). Both route through the entry mux; the back edges are routed a
-    # second time through a latch so the header gets a single back edge.
+    # (back edges). Both route through the entry mux so every in-edge — including
+    # back edges — lands on the single header (MLIR's `createSingleEntryBlock`
+    # passing entryEdges *and* backEdges).
     entry_refs = EdgeRef[]
     back_refs = EdgeRef[]
     for src in sort!(collect(1:nb)), e in entry_blocks
@@ -673,18 +674,14 @@ function normalize_one_irreducible!(m::MCFG)
         append!(dst, edge_refs(m, src, e))
     end
 
-    # 1. Entry mux: collapse the multiple entry blocks to one header. It *absorbs*
-    #    the entries' args (becomes the loop header carrying them); each entry, a
-    #    dispatch arm reached only from the mux, reads them directly.
-    mux = single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
-
-    # 2. Single back edge: the header now has several back-edge predecessors, each
-    #    carrying different header-arg values — which the lift's single carried-
-    #    value set can't represent. Route the back edges through a latch (a mux
-    #    onto the single target = the header), unifying them into one back edge.
-    if length(back_refs) >= 2
-        single_entry_mux!(m, back_refs)        # target = the header mux; absorb=false
-    end
+    # Entry mux: collapse the multiple entry blocks to one header. It *absorbs* the
+    # entries' args (becomes the loop header carrying them); each entry, a dispatch
+    # arm reached only from the mux, reads them directly. The header now has
+    # several back-edge predecessors; unifying those into one back edge is the
+    # single-exiting latch's job (RESEARCH_ANSWER_3 §C4) — fired next by
+    # `normalize_one_loop_latch!` on the ≥2-back-edge trigger — so there is no
+    # separate back-edge mux here to collide with it.
+    single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
     return true
 end
 
@@ -858,9 +855,11 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
     end
 end
 
-"""Find one natural loop with ≥2 exit edges (the multi-exit shape the lift's
-`find_loop_exit` heuristic mishandles) and collapse it to a single-exiting latch
-in reduce form. Returns `true` if it transformed one. Trigger: `≥2 exit edges`."""
+"""Find one natural loop with ≥2 exit edges *or* ≥2 back edges and collapse it to
+a single-exiting latch in reduce form. ≥2 exit edges is the multi-exit shape the
+old `find_loop_exit` heuristic mishandled; ≥2 back edges is the post-entry-mux
+irreducible loop, whose back edges the one latch unifies (RESEARCH_ANSWER_3 §C4 —
+no separate back-edge mux). Returns `true` if it transformed one."""
 function normalize_one_loop_latch!(m::MCFG)
     loops = natural_loops_m(m)
     for h in sort!(collect(keys(loops)))
@@ -872,7 +871,7 @@ function normalize_one_loop_latch!(m::MCFG)
                 tgt == h ? push!(back_refs, r) : (tgt ∉ body && push!(exit_refs, r))
             end
         end
-        length(exit_refs) >= 2 || continue
+        (length(exit_refs) >= 2 || length(back_refs) >= 2) || continue
         mux = single_exiting_latch!(m, h, back_refs, exit_refs)
         reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))))
         return true
