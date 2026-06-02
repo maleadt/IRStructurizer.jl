@@ -129,14 +129,17 @@ divergence this closed. The one remaining row (M4) folds `find_loop_exit`'s prim
 into a single-exiting latch over all exit edges; current handling is correct (I8-safe), so it is
 cleanup, not a correctness gap.
 
-**Known limitation (pre-PLAN2, loud, separate effort — not a divergence).** A `break` in an
-*inner* nested loop fails to structurize (loud `SSA used but not defined`, *identical on the
-pre-PLAN2 baseline*). This is nested-loop extra-exit threading (`find_extra_exit_values`/
-`emit_loop!`), orthogonal to the branch multiplexer. It is **loud** (the validators reject it),
-never a silent miscompile. The generative fuzz net in `test/corpus.jl` (random nested guards +
-breaks/returns in loops, exec-vs-direct) is the tool to drive this — it asserts **no silent
-miscompile** and exercises these shapes; fuzzing eliminated the silent miscompiles the baseline
-had (36 → 0 on a 200-function extended run) and is the standing guard against new ones.
+**Known limitation (pre-PLAN2, loud, separate effort — not a divergence).** Some **multi-exit
+loop** shapes fail to structurize (loud `SSA used but not defined`, *identical on the pre-PLAN2
+baseline*): a `break` in an *inner* nested loop, and multiple exits reaching the *same*
+continuation with different carried values (e.g. `while…; if c; break; end; …; end; use(s)`).
+The root is loop-exit value threading (`find_extra_exit_values`/`emit_loop!` / the lack of a
+single-exiting latch, M4), orthogonal to the branch multiplexer. These are **loud** (the
+validators reject them), never silent miscompiles. The generative fuzz net in `test/corpus.jl`
+(random nested guards + breaks/returns in loops, exec-vs-direct) is the standing guard: it
+asserts **no silent miscompile** and exercises these shapes. Measured vs the baseline on a
+200-function extended run, this work took silent miscompiles 36 → **0** and loud crashes
+~1190 → ~480 (the residual being these multi-exit shapes, broken on the baseline too).
 
 ---
 
