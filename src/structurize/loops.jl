@@ -296,7 +296,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     end
 
     # 5. Build loop body
-    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs, exit_dest)
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
 
     # Restore remap (scoped to loop body)
     ctx.ssa_remap = saved_remap
@@ -337,8 +337,7 @@ The LoopCtx makes the region walk loop-aware: back-edges â†’ ContinueOp, exits â
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, carried_values::Vector{IRValue},
-                           subs::Dict{Int, BlockArgument},
-                           exit_dest::Union{Int, Nothing})
+                           subs::Dict{Int, BlockArgument})
     break_values = IRValue[arg for arg in body.args]
     # Extra exits (beyond header phis) must carry the current iteration's
     # computed value, not the stale block arg from the previous iteration.
@@ -346,7 +345,7 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
     for i in (n_header_phis + 1):length(break_values)
         break_values[i] = carried_values[i]
     end
-    lctx = LoopCtx(header, loop_blocks, carried_values, break_values, exit_dest)
+    lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
 
     # Use structurize_region! with loop context for the entire loop body
     content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)

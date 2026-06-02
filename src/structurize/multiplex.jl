@@ -946,7 +946,7 @@ function _enclosing_loop_ctx(ctx::StructurizeCtx, E::Int)
         end
     end
     best_body === nothing && return nothing
-    return LoopCtx(best_h, best_body, IRValue[], IRValue[], nothing)
+    return LoopCtx(best_h, best_body, IRValue[], IRValue[])
 end
 
 # Find one conditional with a multi-entry continuation; return (E, entries) or

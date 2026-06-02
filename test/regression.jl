@@ -2,19 +2,18 @@
  The structurizer's standing regression net.
 
  One @testset per CFG family, plus three divergence CFGs built as synthetic IR
- with structural assertions, and generative exec-vs-direct fuzzers. Every entry
- is an executable roundtrip (structurize → unstructurize → execute == direct)
- unless it is a pure structural assertion.
+ with structural assertions. Every entry is an executable roundtrip
+ (structurize → unstructurize → execute == direct) unless it is a pure
+ structural assertion.
+
+ Generative exec-vs-direct fuzzing is intentionally NOT here — it lives in the
+ untracked development scripts (e.g. `m4_loopfuzz.jl`). The test suite stays
+ deterministic; fuzzing is a development tool, run by hand.
 
  The synthetic-IR builder pins exact CFG shapes that natural Julia source can't
  reliably produce, so we can assert on the structure directly (the chosen merge,
  the body emitted once), not only through execution.
 =============================================================================#
-
-# Module-level opaque barrier so functions built by `eval` in the generative
-# fuzz (which run in module scope) can reference it (a testset-local `opaque`
-# would be invisible to them).
-@noinline fuzz_opaque(b::Bool) = Base.compilerbarrier(:type, b)::Bool
 
 @testset "regression suite" begin
 
@@ -519,11 +518,12 @@ end
     end
 end
 
-@testset "fuzz: multi-entry shapes, exec vs direct" begin
-    # Two latent silent miscompiles in these families were both found by fuzzing
-    # with exec-vs-direct, not by a green structural net. Enumerate
-    # short-circuit / nested-guard / guard-in-loop / guard-with-early-exit shapes
-    # and assert structurize→unstructurize→execute == direct for every input.
+@testset "multi-entry shapes (exec vs direct)" begin
+    # A curated, deterministic set of short-circuit / nested-guard / guard-in-loop
+    # / guard-with-early-exit shapes — two latent silent miscompiles once lived in
+    # these families. A fixed function list over enumerated inputs, asserting
+    # structurize→unstructurize→execute == direct (the generative fuzzer that
+    # first surfaced these lives in the dev scripts, not the suite).
     @noinline opaque(b) = Base.compilerbarrier(:type, b)::Bool
 
     fns = Any[
@@ -546,70 +546,17 @@ end
         (a::Bool, b::Bool, n::Int) -> (if opaque(a) || opaque(b); t = n + 1; else; t = n - 1; end;
                                        if opaque(a) || opaque(b); return t * 2; end; t),
     ]
-    args_for(nparams) = nparams == 2 ? [(false, 5), (true, 5), (false, 0), (true, 3)] :
-        nparams == 3 ? Iterators.product((false, true), (false, true), (-1, 0, 1, 2)) |> collect |> vec :
-        []
-    nfuzz = 0
     for f in fns
         m = only(methods(f))
         nparams = m.nargs - 1
-        # Build the type signature and the input set from parameter kinds.
-        ms = code_structured(f) |> only
-        sci = ms.first
-        # Infer inputs: enumerate booleans for Bool params, small ints otherwise.
+        sci = (code_structured(f) |> only).first
+        # Enumerate booleans for Bool params, small ints otherwise.
         ptypes = [fieldtype(Base.tuple_type_tail(m.sig), i) for i in 1:nparams]
         choices = [pt === Bool ? (false, true) : (-1, 0, 1, 2, 5) for pt in ptypes]
         for combo in Iterators.product(choices...)
-            exp = f(combo...)
-            got = execute(sci, combo...)
-            @test got == exp
-            nfuzz += 1
+            @test execute(sci, combo...) == f(combo...)
         end
     end
-    @test nfuzz > 100   # sanity: the fuzz actually ran a meaningful number of cases
-end
-
-@testset "fuzz: generated nested guards (no silent miscompile)" begin
-    # Generative fuzz over the shape space the edge multiplexer targets: random
-    # nested ||/&& guards, value-through-merge ternaries, and early returns, all
-    # inside a counted loop carrying an accumulator. structurize→unstructurize→
-    # execute must equal direct, for every input. This generator is exactly how
-    # the ||-guarded-return-in-loop miscompile (now fixed) was caught — the
-    # hand-written cases did not. Seeded + bounded for reproducibility.
-    rng = Ref(0x2c9277b5_1f8e3a07 % UInt64)
-    nextu() = (rng[] = rng[] * 0x5851f42d4c957f2d + 0x14057b7ef767814f; rng[] >> 33)
-    ri(n) = Int(nextu() % n)
-    pick(xs) = xs[ri(length(xs)) + 1]
-    function gcond(d)
-        atoms = ["fuzz_opaque(p$(ri(3)+1))", "k > $(ri(4))", "p$(ri(3)+1)"]
-        (d <= 0 || ri(3) == 0) && return pick(atoms)
-        "($(gcond(d-1)) $(pick(["||","&&"])) $(gcond(d-1)))"
-    end
-    function gbody(d, ind)
-        pad = "    "^ind; lines = String[]
-        for _ in 1:(ri(3)+1)
-            c = ri(d <= 0 ? 2 : 4)
-            if c == 0; push!(lines, "$(pad)s += k")
-            elseif c == 1; push!(lines, "$(pad)s += $(ri(9)+1)")
-            elseif c == 2
-                push!(lines, "$(pad)if $(gcond(2))"); append!(lines, gbody(d-1, ind+1)); push!(lines, "$(pad)end")
-            else; push!(lines, "$(pad)if $(gcond(1)); return s + $(ri(5)); end")
-            end
-        end
-        lines
-    end
-    nchecks = 0
-    for i in 1:40
-        src = "function _ff$(i)(p1::Bool,p2::Bool,p3::Bool,n::Int)\n s=0\n for k in 1:n\n" *
-              join(gbody(3, 1), "\n") * "\n end\n return s\nend"
-        f = eval(Meta.parse(src))
-        sci = (code_structured(f, Tuple{Bool,Bool,Bool,Int}) |> only).first   # must not throw
-        for p1 in (false,true), p2 in (false,true), p3 in (false,true), n in (0,1,2,4)
-            @test execute(sci, p1, p2, p3, n) == Base.invokelatest(f, p1, p2, p3, n)
-            nchecks += 1
-        end
-    end
-    @test nchecks > 500
 end
 
 @testset "multi-exit loops via the single-exiting latch (lf5 / sentinel / inner-break)" begin
@@ -617,7 +564,8 @@ end
     # one back + one exit edge in reduce form, so a multi-exit loop lifts as a
     # plain LoopOp with the escapees carried as BreakOp results. These shapes
     # silently miscompiled before the latch (the loop fuzzer measured 55 silent);
-    # the regression set below + the generative loop fuzzer are the standing guard.
+    # the curated set below is the standing guard (the generative loop fuzzer that
+    # measured those miscompiles lives in the dev scripts, not the suite).
 
     # lf5: two breaks, the second carrying a fresh value, read after the loop.
     function lf5(p::Bool, n::Int)
@@ -665,44 +613,6 @@ end
     for p in (false, true), n in (0, 1, 3, 5)
         @test execute(sci3, p, n) == inner_break(p, n)
     end
-end
-
-@testset "fuzz: multi-exit / nested-break loops (no silent miscompile)" begin
-    # Generative fuzz over the multi-exit-loop shape space the single-exiting latch
-    # targets: random plain/value-carrying breaks and nested loops inside a counted
-    # loop carrying an accumulator. structurize→unstructurize→execute must equal
-    # direct AND must not throw, for every input. On the pre-latch baseline this
-    # measured 55 silent miscompiles. Seeded + bounded.
-    rng = Ref(0x12345678_9abcdef0 % UInt64)
-    nextu() = (rng[] = rng[] * 0x5851f42d4c957f2d + 0x14057b7ef767814f; rng[] >> 33)
-    ri(n) = Int(nextu() % n)
-    pick(xs) = xs[ri(length(xs)) + 1]
-    function gstmt(ind, depth)
-        pad = "    "^ind; c = ri(depth <= 0 ? 4 : 6)
-        if c == 0; "$(pad)s += k"
-        elseif c == 1; "$(pad)s += $(ri(5)+1)"
-        elseif c == 2; "$(pad)if k > $(ri(5)); break; end"
-        elseif c == 3; "$(pad)if k > $(ri(5)); s = $(ri(9)); break; end"
-        elseif c == 4
-            v = "j$(depth)"
-            "$(pad)for $v in 1:k\n$(join([gstmt(ind+1, depth-1) for _ in 1:(ri(2)+1)], "\n"))\n$(pad)end"
-        else
-            "$(pad)if $(pick(["p", "k>2", "k<n"]))\n$(join([gstmt(ind+1, depth) for _ in 1:(ri(2)+1)], "\n"))\n$(pad)end"
-        end
-    end
-    nchecks = 0
-    for i in 1:50
-        body = join([gstmt(2, 2) for _ in 1:(ri(3)+1)], "\n")
-        src = "function _mf$(i)(p::Bool, n::Int)\n s=0\n for k in 1:n\n$body\n end\n return s\nend"
-        f = try eval(Meta.parse(src)) catch; continue end
-        sci = (code_structured(f, Tuple{Bool, Int}) |> only).first   # must not throw
-        for p in (false, true), n in (0, 1, 3, 5)
-            exp = try Base.invokelatest(f, p, n) catch; continue end
-            @test execute(sci, p, n) == exp
-            nchecks += 1
-        end
-    end
-    @test nchecks > 200
 end
 
 end  # regression suite

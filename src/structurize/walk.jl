@@ -24,7 +24,6 @@ struct LoopCtx
     loop_blocks::Set{Int}
     carried_values::Vector{IRValue}
     break_values::Vector{IRValue}
-    exit_dest::Union{Int, Nothing}   # the loop's primary exit (breaks normally)
 end
 
 """
@@ -46,9 +45,8 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
 
     # Advance the walker toward `target`, resolving loop boundaries
     # (back-edge → ContinueOp, exit → BreakOp); returns nothing if `target`
-    # leaves the region. `source` is the block we are leaving — used to resolve
-    # an exit block's phis when re-materializing a region-exit.
-    advance = (target, source) -> resolve_dest(target, region_blocks, loop_ctx, block, ctx, source)
+    # leaves the region.
+    advance = target -> resolve_dest(target, region_blocks, loop_ctx, block, ctx)
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
@@ -59,13 +57,12 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             if loop_body !== nothing
                 loop_exit = emit_loop!(block, ctx, current, loop_body, region_blocks)
                 # Update last_block to the loop's exit predecessor (for merge phi lookup)
-                exit_src = current
                 if loop_exit !== nothing
                     for b in loop_body
-                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b; exit_src = b)
+                        loop_exit ∈ ir.cfg.blocks[b].succs && (last_block = b)
                     end
                 end
-                current = advance(loop_exit, exit_src)
+                current = advance(loop_exit)
                 continue
             end
         end
@@ -85,15 +82,15 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             end
             return block
         elseif term isa GotoNode
-            current = advance(term.label, current)
+            current = advance(term.label)
         elseif term isa GotoIfNot
             next = emit_branch!(block, ctx, current, term, region_blocks, merge_phis, loop_ctx)
             next === nothing && return block
-            current = advance(next, current)
+            current = advance(next)
         else
             # Fallthrough
             next = current + 1
-            current = advance(next <= nblocks ? next : nothing, current)
+            current = advance(next <= nblocks ? next : nothing)
         end
     end
 
@@ -111,11 +108,10 @@ Returns the dest to continue walking, or nothing if it's a loop exit/back-edge.
 """
 function resolve_dest(dest, region_blocks::Set{Int},
                        loop_ctx::Union{Nothing, LoopCtx}, block::Block,
-                       ctx::Union{Nothing, StructurizeCtx}=nothing,
-                       source::Int=0)
+                       ctx::Union{Nothing, StructurizeCtx}=nothing)
     dest === nothing && return nothing
     if loop_ctx !== nothing && ctx !== nothing &&
-       resolve_loop_exit!(block, ctx, dest, source, loop_ctx)
+       resolve_loop_exit!(block, ctx, dest, loop_ctx)
         return nothing
     end
     dest ∈ region_blocks ? dest : nothing
@@ -130,7 +126,7 @@ distinguish and no re-materialization: an early `return`/`throw` is routed throu
 the latch into the post-loop dispatch (a multi-exit loop is latched) or *is* the
 single exit (then the post-loop walk re-emits it), never dropped to a bare break."""
 function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
-                            source::Int, loop_ctx::LoopCtx)
+                            loop_ctx::LoopCtx)
     if dest == loop_ctx.header
         block.terminator === nothing &&
             (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
@@ -387,8 +383,8 @@ function make_empty_branch_block(dest::Int, from::Int,
                                   loop_ctx::Union{Nothing, LoopCtx},
                                   ir::IRCode, ctx::StructurizeCtx)
     b = Block()
-    # Loop boundary (continue / break / re-materialized exit path)?
-    if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, from, loop_ctx)
+    # Loop boundary (continue / break)?
+    if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, loop_ctx)
         return b
     end
     # Merge phis? Use reachability from dest to find the right phi-edge value and
