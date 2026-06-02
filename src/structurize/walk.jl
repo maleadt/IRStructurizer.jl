@@ -284,12 +284,39 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, bb_idx::Int)
     bb = ir.cfg.blocks[bb_idx]
     for si in first(bb.stmts):last(bb.stmts)
         stmt = ir.stmts.stmt[si]
-        (stmt isa PhiNode || stmt isa GotoNode ||
-         stmt isa GotoIfNot || stmt isa ReturnNode) && continue
+        if stmt isa PhiNode
+            materialize_single_edge_phi!(block, ctx, si, stmt)
+            continue
+        end
+        (stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode) && continue
         idx = get(remap, si, si)
         stmt = remap_stmt(stmt, remap)
         push!(block, idx, stmt, ir.stmts.type[si], ir.stmts.flag[si])
         idx != si && anchor_line!(ctx, idx, si)
+    end
+end
+
+"""A phi reached on a single live edge `φ(#p => v)` is a pure copy `phi := v` —
+left by the edge multiplexer's dispatch (an entry reached from exactly one
+trampoline). The walk skips multi-edge phis (the loop-header and branch-merge
+machinery owns those, both ≥2 edges); a single-edge phi is otherwise dropped, so
+its downstream uses become "SSA used but not defined". Materialize it as a rename
+(`ssa_remap`): every reader resolving SSAs through `ssa_remap` then sees the
+source value, with no extra statement to misplace across a loop boundary (a copy
+statement snapshotting a loop-carried value miscompiled empty loops to infinite).
+Readers that consult the *raw* phi index — `emit_loop!`'s loop-carried init/carry
+values — apply `ssa_remap` explicitly."""
+function materialize_single_edge_phi!(block::Block, ctx::StructurizeCtx, si::Int, phi::PhiNode)
+    count(k -> isassigned(phi.values, k), eachindex(phi.values)) == 1 || return
+    haskey(ctx.ssa_remap, si) && return            # already renamed by an enclosing pass
+    haskey(block.body, si) && return               # already a definition at this index
+    k = findfirst(k -> isassigned(phi.values, k), eachindex(phi.values))
+    v = phi.values[k]
+    if v isa SSAValue
+        ctx.ssa_remap[si] = get(ctx.ssa_remap, v.id, v.id)
+    else
+        push!(block, si, v, ctx.types[si])         # constant copy (no SSA to track)
+        anchor_line!(ctx, si, si)
     end
 end
 

@@ -755,9 +755,112 @@ function single_exiting_latch!(m::MCFG, header::Int,
     return mux
 end
 
+# All SSAValue ids referenced inside `b`: body statement operands, terminator
+# operands, and outgoing-edge operands (the values this block contributes to its
+# successors' block arguments).
+function _mblock_use_ids(b::MBlock)
+    ids = Int[]
+    collect_ssa(@nospecialize(v)) = (v isa SSAValue && push!(ids, v.id); v)
+    for s in b.body
+        remap_ssa(s.stmt, collect_ssa)
+    end
+    t = b.term
+    if t isa MGoto
+        for v in t.edge.args; v isa SSAValue && push!(ids, v.id); end
+    elseif t isa MCondBr
+        t.cond isa SSAValue && push!(ids, t.cond.id)
+        for v in t.t.args; v isa SSAValue && push!(ids, v.id); end
+        for v in t.f.args; v isa SSAValue && push!(ids, v.id); end
+    elseif t isa MReturn
+        t.has_val && t.val isa SSAValue && push!(ids, t.val.id)
+    end
+    return ids
+end
+
+# Apply value-map `f` to every operand of `b`: body statements (via `remap_ssa`),
+# terminator operands, and outgoing-edge operands. Mirrors `_mblock_use_ids`.
+function _rewrite_mblock!(b::MBlock, f)
+    for (i, s) in enumerate(b.body)
+        b.body[i] = MStmt(s.id, remap_ssa(s.stmt, f), s.type, s.codeloc, s.flag)
+    end
+    t = b.term
+    if t isa MGoto
+        for k in eachindex(t.edge.args); t.edge.args[k] = f(t.edge.args[k]); end
+    elseif t isa MCondBr
+        for k in eachindex(t.t.args); t.t.args[k] = f(t.t.args[k]); end
+        for k in eachindex(t.f.args); t.f.args[k] = f(t.f.args[k]); end
+        b.term = MCondBr(f(t.cond), t.t, t.f)
+    elseif t isa MReturn
+        t.has_val && (b.term = MReturn(f(t.val), true))
+    end
+end
+
+"""Reduce form (the latch-arg half of MLIR's `transformToReduceLoop`). For every
+value defined inside the loop and used *outside* it, add a latch block argument
+fed `value`-or-`undef` from each latch predecessor by dominance (§C2.ii), and
+rewrite the outside uses to that latch arg. After this every loop-internal value
+read downstream is a latch block arg, so the lift threads it out as a `BreakOp`
+result with no escape scan. Our `LoopOp` has separate `Break`/`Continue` values,
+so only this latch-arg half is needed — no header arg, no exit-block arg.
+
+Excludes the latch's own block args (the mux slices / discriminator already become
+loop results through the post-loop dispatch). `loop_blocks` must include `latch`."""
+function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
+    domtree = construct_domtree(build_cfg(m))
+
+    # Definition site and type of each SSA id. Block-arg types live in `m.types`;
+    # body-statement types live in the `MStmt` (NOT `m.types`), so capture both —
+    # else a reduce arg for a body def gets `Any` and breaks the result phi's type.
+    def_block = Dict{Int, Int}()
+    def_type = Dict{Int, Any}()
+    for (bid, b) in enumerate(m.blocks)
+        for a in b.args; def_block[a] = bid; def_type[a] = get(m.types, a, Any); end
+        for s in b.body; def_block[s.id] = bid; def_type[s.id] = s.type; end
+    end
+
+    # Escaping values: loop-internal defs referenced from a non-loop block, in
+    # deterministic (block, first-seen) order. The latch's own args are skipped.
+    latch_args = Set(m.blocks[latch].args)
+    escaping = Int[]
+    seen = Set{Int}()
+    for bid in 1:length(m.blocks)
+        bid in loop_blocks && continue
+        for id in _mblock_use_ids(m.blocks[bid])
+            (get(def_block, id, 0) in loop_blocks) || continue
+            (id in latch_args || id in seen) && continue
+            push!(escaping, id); push!(seen, id)
+        end
+    end
+    isempty(escaping) && return
+
+    # All edges into the latch (the back + exit edges, post-redirect).
+    pred_refs = EdgeRef[]
+    for src in 1:length(m.blocks)
+        append!(pred_refs, edge_refs(m, src, latch))
+    end
+
+    for v in escaping
+        T = get(def_type, v, Any)
+        larg = alloc_id!(m)
+        m.types[larg] = T
+        m.codelocs[larg] = get(m.codelocs, v, _NOLOC)
+        push!(m.blocks[latch].args, larg)
+        dv = def_block[v]
+        for ref in pred_refs
+            e = edge_of(m, ref)
+            push!(e.args, dominates(domtree, dv, ref.src) ? SSAValue(v) : Undef(T))
+        end
+        fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(larg) : w
+        for bid in 1:length(m.blocks)
+            bid in loop_blocks && continue
+            _rewrite_mblock!(m.blocks[bid], fv)
+        end
+    end
+end
+
 """Find one natural loop with ≥2 exit edges (the multi-exit shape the lift's
-`find_loop_exit` heuristic mishandles) and collapse it to a single-exiting latch.
-Returns `true` if it transformed one. SPIKE: trigger is `≥2 exit edges`."""
+`find_loop_exit` heuristic mishandles) and collapse it to a single-exiting latch
+in reduce form. Returns `true` if it transformed one. Trigger: `≥2 exit edges`."""
 function normalize_one_loop_latch!(m::MCFG)
     loops = natural_loops_m(m)
     for h in sort!(collect(keys(loops)))
@@ -770,7 +873,8 @@ function normalize_one_loop_latch!(m::MCFG)
             end
         end
         length(exit_refs) >= 2 || continue
-        single_exiting_latch!(m, h, back_refs, exit_refs)
+        mux = single_exiting_latch!(m, h, back_refs, exit_refs)
+        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))))
         return true
     end
     return false
@@ -782,15 +886,10 @@ function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
-    # NOTE (M4, WIP): the single-exiting latch is gated behind IRS_M4=1. It is
-    # proven sound (sound mutation; kills the multi-exit-loop silent-miscompile
-    # class — loop fuzzer 55→0 silent) but firing it default-on regresses ~5
-    # function categories whose root is NOT reduce-form (a complete escape scan
-    # changed nothing): the lift's branch-handling of the latch's dispatch
-    # structure, and a double-latch collision with irreducible normalization.
-    # Landing it green is a lift-integration milestone, not a localized fix.
-    latch_on = get(ENV, "IRS_M4", "0") == "1"
-    while normalize_one_irreducible!(m) || (latch_on && normalize_one_loop_latch!(m))
+    # Each step collapses one multi-entry header (irreducible) or one multi-exit
+    # loop (the single-exiting latch + reduce form) — both strictly reduce the
+    # remaining count, so this terminates.
+    while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m)
         changed = true
         guard += 1
         guard > 4 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
