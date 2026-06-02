@@ -104,21 +104,26 @@ end  # acyclic regions
 
 @testset "cyclic regions" begin
 
-@testset "simple loop structure - ForOp" begin
+@testset "simple loop structure - escaping IV is a kept-carry ForOp" begin
+    # `i=0; while i<n; i+=1; return i` reads the IV after the loop. A ForOp can't
+    # carry the IV as a range result, but it *can* keep it as an ordinary carried
+    # value (PLAN7): the post-loop read is then a normal result, correct for both
+    # the empty case (= init 0) and non-empty (= n) — earlier this aliased the read
+    # to the bound and miscompiled the empty case (ISSUES.md #3).
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
+            @check "for"
             i = 0
-            @check "for %{{.*}} ="
             while i < n
                 i += 1
             end
-            @check "continue"
             return i
         end
     end
     f_count = (n::Int) -> (i = 0; while i < n; i += 1; end; i)
     @test @roundtrip f_count(5)
     @test @roundtrip f_count(0)
+    @test @roundtrip f_count(-3)   # empty by negative bound → init (0), not the bound
 end
 
 @testset "loop with condition" begin
@@ -189,20 +194,23 @@ end  # CFG analysis
 
 @testset "ForOp detection" begin
 
-@testset "bounded counter" begin
+@testset "bounded counter with escaping IV is a kept-carry ForOp" begin
+    # The induction variable `i` is returned, so the ForOp keeps it as an ordinary
+    # carried value (PLAN7) instead of dropping it: the range still drives iteration
+    # (lower 0, upper n, step 1) while the kept carry exposes the post-loop value,
+    # correct for the empty case (= init 0) too. Earlier this aliased the read to
+    # the bound and miscompiled the empty case (ISSUES.md #3).
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
+            @check "for"
             i = 0
-            @check "for %{{.*}} ="
             while i < n
                 i += 1
             end
-            @check "continue"
             return i
         end
     end
 
-    # Also verify ForOp bounds programmatically (FileCheck can't check these)
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
@@ -210,13 +218,20 @@ end  # CFG analysis
         end
         return i
     end |> only
-    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
-    @test length(for_ops) == 1
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 0
 
-    for_op = for_ops[1]
+    for_op = only(filter(x -> x isa ForOp, collect(statements(sci.entry.body))))
     @test for_op.lower == 0
-    @test for_op.upper isa Core.Argument
+    @test for_op.upper isa Core.Argument   # the bound `n`
     @test for_op.step == 1
+
+    # Execution across empty (n ≤ 0 → init 0) and non-empty (→ n); the empty case
+    # is what the buggy ForOp promotion got wrong (it returned the bound).
+    counted(n) = (i = 0; while i < n; i += 1; end; i)
+    for n in (-3, 0, 1, 5, 10)
+        @test execute(sci, n) == counted(n)
+    end
 end
 
 @testset "inclusive bound (<=) gets exclusive adjustment" begin
@@ -1585,12 +1600,20 @@ end
 
 end
 
-@testset "for-in-range produces valid ForOp" begin
-    # Native for-in-range is promoted to ForOp
+@testset "for-in-range whose loop var escapes is not a buggy ForOp" begin
+    # `for i in 1:n; last = i; end; return last` copies the loop variable into
+    # `last`. For a `1:n` range the iterate protocol makes `last` a *shadow* of the
+    # loop state (value == state), and `last` is read after the loop. Promoting to
+    # a ForOp aliased that shadow to the range's upper bound, returning `n+1`
+    # instead of `n` — a silent miscompile (`forlast(1) → 2`) that had NO execution
+    # check, so it went unnoticed (the ISSUES.md #3 root cause via the direct
+    # iterate-protocol path). The IV-escape gate keeps it a LoopOp, carrying `last`
+    # correctly. A for-in-range with a true accumulator still promotes (see the
+    # "Julia for-in-range (1:n) produces ForOp" testset above).
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             last = 0
-            @check "for"
+            @check "loop"
             for i in 1:n
                 last = i
             end
@@ -1605,7 +1628,12 @@ end
         end
         return last
     end |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
 
+    forlast(n) = (last = 0; for i in 1:n; last = i; end; last)
+    for n in (-3, 0, 1, 3, 5)
+        @test execute(sci, n) == forlast(n)   # empty → 0; else → n (was n+1 when buggy)
+    end
 end
 
 @testset "for-in-range with Int32 bounds" begin

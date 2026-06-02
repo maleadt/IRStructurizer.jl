@@ -299,6 +299,92 @@ end
     end
 end
 
+@testset "empty counted while-loop returns its init, not its bound (ISSUES #3)" begin
+    # A `while x < n` whose induction value starts at or above the bound runs zero
+    # times, so the loop result must be the *init* (the unchanged IV), not the
+    # bound. A ForOp does not carry its IV as a result, so an earlier promotion
+    # aliased a post-loop read of the IV to the loop's exclusive `upper` — correct
+    # only when the body ran; for the empty case (init ≥ bound) the final IV is the
+    # init, so the alias returned the bound: a silent miscompile (`fixed(5) → 5`,
+    # should be 100 — ISSUES.md #3). It now promotes to a ForOp that *keeps* the
+    # escaping IV as an ordinary carried value (PLAN7): the result is read normally
+    # and is correct for both the empty (= init) and non-empty (= last continue =
+    # upper) cases. The standing loop fuzzers all start the IV *below* the bound
+    # (`for k in 1:n`), so they miss this; the exec-over-empty checks below are what
+    # actually guard it — never remove them.
+    fixed(n::Int) = (x = 100; while x < n; x += 1; end; x)
+    ir, _ = only(code_ircode(fixed, Tuple{Int}))
+    # init=100 spans empty (n ≤ 100) and non-empty (n > 100); both promote modes.
+    for promote in (false, true)
+        sci = StructuredIRCode(ir; promote)
+        for n in (0, 5, 50, 100, 150, 200)
+            @test execute(sci, n) == fixed(n)
+        end
+    end
+    # The IV escapes (`return x`), but the kept-carry promotion makes it a correct
+    # ForOp (lower = init 100, step 1) rather than demoting it.
+    sci_p = StructuredIRCode(ir; promote=true)
+    @test count_stmts(sci_p.entry, s -> s isa WhileOp) == 0
+    @test count_stmts(sci_p.entry, s -> s isa ForOp) == 1
+    for_op = only(filter(x -> x isa ForOp, collect(statements(sci_p.entry.body))))
+    @test for_op.lower == 100
+    @test for_op.step == 1
+
+    # Inclusive bound (`while x <= n`): empty when init > n (so n < 100 is empty).
+    fixed_le(n::Int) = (x = 100; while x <= n; x += 1; end; x)
+    for n in (0, 50, 99, 100, 101, 200)
+        @test @roundtrip fixed_le(n)
+    end
+
+    # Step > 1 with a separate accumulator carried alongside the escaping IV — both
+    # the kept IV carry and the accumulator ride the ForOp correctly.
+    fixed_step(n::Int) = (x = 100; s = 0; while x < n; s += x; x += 2; end; x + s)
+    for n in (0, 50, 100, 150, 200)
+        @test @roundtrip fixed_step(n)
+    end
+
+    # A genuine counted `for i in 1:n` does NOT read `i` after the loop (Julia
+    # scopes it), so the gate must not fire — it still promotes to a ForOp. Empty
+    # range (n < 1) included to confirm the well-behaved counted case is untouched.
+    forsum(n::Int) = (acc = 0; for i in 1:n; acc += i; end; acc)
+    ir_for, _ = only(code_ircode(forsum, Tuple{Int}))
+    sci_for = StructuredIRCode(ir_for; promote=true)
+    @test count_stmts(sci_for.entry, s -> s isa ForOp) == 1   # still promotes
+    for n in (-1, 0, 1, 5)
+        @test execute(sci_for, n) == forsum(n)
+    end
+end
+
+@testset "escaping IV ForOp: step>1 and inclusive <= bound (PLAN7)" begin
+    # The kept-IV ForOp must be correct for a non-unit step and for an inclusive
+    # `<=` bound (which adjusts the *range* control by +1 but not the carried value).
+
+    # step 2: counted2(5) iterates i=0,2,4 then continues to 6 (the first value
+    # failing i<5), so the escaping IV result is 6; empty (n≤0) returns init 0.
+    counted2(n::Int) = (i = 0; while i < n; i += 2; end; i)
+    ir2, _ = only(code_ircode(counted2, Tuple{Int}))
+    sci2 = StructuredIRCode(ir2; promote=true)
+    @test count_stmts(sci2.entry, s -> s isa ForOp) == 1
+    let for_op = only(filter(x -> x isa ForOp, collect(statements(sci2.entry.body))))
+        @test for_op.lower == 0
+        @test for_op.step == 2
+    end
+    for n in (-3, 0, 1, 2, 5, 6, 50, 200)
+        @test execute(sci2, n) == counted2(n)
+    end
+    @test counted2(5) == 6 && execute(sci2, 5) == 6   # the step-2 exit value
+
+    # inclusive `<=` whose IV escapes: `while i<=n; i+=1; return i`. The exclusive
+    # range upper is n+1, but the carried IV value is unaffected by that adjustment.
+    counted_le(n::Int) = (i = 0; while i <= n; i += 1; end; i)
+    irle, _ = only(code_ircode(counted_le, Tuple{Int}))
+    scile = StructuredIRCode(irle; promote=true)
+    @test count_stmts(scile.entry, s -> s isa ForOp) == 1
+    for n in (-3, -1, 0, 1, 2, 5, 50, 200)
+        @test execute(scile, n) == counted_le(n)
+    end
+end
+
 @testset "the core walk emits only LoopOp (promotion is a post-pass)" begin
     # With `promote=false`, every loop must be a generic LoopOp — no ForOp/WhileOp
     # leaks from the core walk. (With promotion they become For/While; that path is
@@ -653,15 +739,18 @@ end
         while x < n; x += 1; end
         return x
     end
-    # The pre-header fix lives in the core lift, so assert it there across every n —
+    # The pre-header fix lives in the core lift, so assert it across every n —
     # including the empty-loop cases (init already ≥ bound) where the result is the
-    # branch selection (10/100) itself. (A separate, pre-existing *promotion* bug
-    # miscompiles an empty counted while-loop, returning the bound instead of the
-    # init — ISSUES.md #3 — so the empty case is asserted at promote=false here.)
+    # branch selection (10/100) itself. Both promote modes: the empty case once
+    # exposed a separate promotion bug (an empty counted while-loop returned its
+    # bound instead of its init — ISSUES.md #3), now closed by the IV-escape gate,
+    # so promote=true must agree across the full range too.
     ir_np, _ = only(code_ircode(meh1, Tuple{Bool, Int}))
-    sci_np = StructuredIRCode(ir_np; promote=false)
-    for c in (false, true), n in (0, 5, 50, 200)
-        @test execute(sci_np, c, n) == meh1(c, n)
+    for promote in (false, true)
+        sci_m = StructuredIRCode(ir_np; promote)
+        for c in (false, true), n in (0, 5, 50, 200)
+            @test execute(sci_m, c, n) == meh1(c, n)
+        end
     end
     # The literal ISSUES.md #2 repro through the full pipeline: at n=200 the loop
     # runs for both arms, so the result is the loop output (200), not the entry
