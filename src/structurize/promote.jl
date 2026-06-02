@@ -269,6 +269,30 @@ function _refs_ssa(@nospecialize(val), ssa::SSAValue)
     return false
 end
 
+"""Deep `_refs_ssa`: also recurses into nested control-flow regions and a
+`Block`, so a use buried in a nested IfOp/loop body still counts."""
+function _refs_ssa_deep(@nospecialize(val), ssa::SSAValue)
+    if val isa IfOp
+        return _refs_ssa(val.condition, ssa) ||
+               _refs_ssa_deep(val.then_region, ssa) || _refs_ssa_deep(val.else_region, ssa)
+    elseif val isa ForOp
+        return _refs_ssa(val.lower, ssa) || _refs_ssa(val.upper, ssa) || _refs_ssa(val.step, ssa) ||
+               any(v -> _refs_ssa(v, ssa), val.init_values) || _refs_ssa_deep(val.body, ssa)
+    elseif val isa WhileOp
+        return any(v -> _refs_ssa(v, ssa), val.init_values) ||
+               _refs_ssa_deep(val.before, ssa) || _refs_ssa_deep(val.after, ssa)
+    elseif val isa LoopOp
+        return any(v -> _refs_ssa(v, ssa), val.init_values) || _refs_ssa_deep(val.body, ssa)
+    elseif val isa Block
+        for (_, e) in val.body
+            _refs_ssa_deep(e.stmt, ssa) && return true
+        end
+        return val.terminator !== nothing && _refs_ssa_deep(val.terminator, ssa)
+    else
+        return _refs_ssa(val, ssa)
+    end
+end
+
 """
 Try to promote a LoopOp directly to ForOp by detecting the iteration protocol
 counting pattern. Works on LoopOps that have been simplified by simplify_loop_exit!.
@@ -683,9 +707,27 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         end
     end
 
+    # The IV increment (`carried_val = iv + step`) is implicit in a ForOp, so it
+    # is normally dropped. But if another body statement or a surviving (non-IV)
+    # carried value reads it — e.g. `s += k` where `k` is the post-increment IV —
+    # it must stay, remapped below to read the ForOp's induction variable;
+    # dropping it then left a dangling SSA reference (`%k used but not defined`).
+    incr_used = false
+    if carried_val isa SSAValue
+        for (sidx, sentry) in after.body
+            sidx == carried_val.id && continue
+            if _refs_ssa_deep(sentry.stmt, carried_val); incr_used = true; break; end
+        end
+        if !incr_used && after.terminator isa YieldOp
+            for (i, v) in enumerate(after.terminator.values)
+                i != iv_pos && v isa SSAValue && v.id == carried_val.id && (incr_used = true; break)
+            end
+        end
+    end
+
     for (sidx, sentry) in after.body
-        # Skip the IV increment statement
-        if carried_val isa SSAValue && sidx == carried_val.id
+        # Skip the IV increment statement, unless something else reads it.
+        if carried_val isa SSAValue && sidx == carried_val.id && !incr_used
             continue
         end
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
