@@ -622,9 +622,9 @@ end
 
 Assemble a dense `IRCode` from flat statement arrays plus per-block statement
 ranges. Builds the CFG (preds/succs from each block's last statement), the
-`InstructionStream`, and the debug info, then constructs the `IRCode`. Shared by
-`assemble_ircode` (unstructurize) and `_assemble` (multiplex's `emit`) — the same
-`cfg.index` off-by-one (block 1 excluded) was once fixed in both, proof of drift.
+`InstructionStream`, and the debug info, then constructs the `IRCode`. Used by
+`assemble_ircode` — the SCI → IRCode output boundary (the test-only roundtrip
+oracle; cuTile consumes the `StructuredIRCode` directly).
 """
 function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
                             argtypes, sptypes, debuginfo)

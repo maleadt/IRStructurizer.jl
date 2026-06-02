@@ -5,8 +5,7 @@ using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
 
 using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
                      construct_domtree, DomTree, dominates,
-                     construct_postdomtree, PostDomTree, postdominates,
-                     CFGReachability, bb_in_irreducible_loop,
+                     CFGReachability,
                      widenconst,
                      WorldRange
 using Base: code_ircode
@@ -14,6 +13,10 @@ using Base: code_ircode
 # structured IR definitions
 include("ir/types.jl")
 include("ir/show.jl")
+
+# explicit-edge mutable CFG types (MBlock/MCFG) — defined before the lift so its
+# StructurizeCtx and method signatures can name them; operations live in multiplex.jl
+include("structurize/mcfg.jl")
 
 # substitution machinery (phi refs → block args)
 include("structurize/substitutions.jl")

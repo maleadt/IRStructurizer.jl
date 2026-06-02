@@ -36,10 +36,10 @@
     end
 
     ir = q1_ir()
-    ctx = IRStructurizer.StructurizeCtx(ir)
+    domtree = Core.Compiler.construct_domtree(ir)
     region = Set(1:length(ir.cfg.blocks))
     then_blocks, else_blocks, merge =
-        IRStructurizer.find_branch_regions(ctx, 1, 2, 3, region)  # E: true=BB2, false=BB3
+        IRStructurizer.find_branch_regions(ir.cfg, domtree, 1, 2, 3, region)  # E: true=BB2, false=BB3
     @test merge == 2                       # T is the continuation
     @test !(2 in then_blocks)              # ...not swallowed into an arm
     @test !(2 in else_blocks)
@@ -83,10 +83,10 @@ end
 
     for m_first in (false, true)
         ir, m_bb = q2_ir(; m_first)
-        ctx = IRStructurizer.StructurizeCtx(ir)
+        domtree = Core.Compiler.construct_domtree(ir)
         region = Set(1:length(ir.cfg.blocks))
         fdest = (ir.stmts.stmt[ir.cfg.blocks[1].stmts[end]]::GotoIfNot).dest
-        _, _, merge = IRStructurizer.find_branch_regions(ctx, 1, 2, fdest, region)
+        _, _, merge = IRStructurizer.find_branch_regions(ir.cfg, domtree, 1, 2, fdest, region)
         @test merge == m_bb                # M chosen regardless of its index
 
         sci = StructuredIRCode(q2_ir(; m_first)[1])
