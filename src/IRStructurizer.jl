@@ -29,8 +29,7 @@ include("ir/validation.jl")
 # unstructurize: StructuredIRCode → IRCode
 include("unstructurize.jl")
 
-# mutate-then-lift CFG normalization (EdgeMultiplexer); uses CC + push_phi_value!
-# from unstructurize.jl, so included after it.
+# mutate-then-lift CFG normalization (EdgeMultiplexer)
 include("structurize/multiplex.jl")
 
 # public API

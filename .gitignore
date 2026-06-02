@@ -1,12 +1,1 @@
 Manifest*.toml
-
-# Planning/working docs kept on disk but untracked (review oracle, plans, research).
-# Globs so new plans/research/sessions stay untracked too.
-CLAUDE.md
-GROUND_TRUTH.md
-PLAN*.md
-RESEARCH_*.md
-TODO.md
-SESSION*.md
-# Ad-hoc fuzz/repro scripts referenced by the research docs
-m4_loopfuzz.jl

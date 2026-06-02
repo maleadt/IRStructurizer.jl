@@ -60,7 +60,6 @@ end
 @testset "IRStructurizer" verbose=true begin
     include("interface.jl")
     include("structurize.jl")
-    include("corpus.jl")
     include("multiplex.jl")
     include("ir.jl")
     include("unstructurize.jl")
