@@ -317,7 +317,7 @@ function emit(m_in::MCFG)
     end
 
     remap_val(@nospecialize(v)) = v isa SSAValue ? SSAValue(pos_of[v.id]) : v
-    remap_stmt(@nospecialize(s)) = _remap_stmt(s, remap_val)
+    remap_stmt(@nospecialize(s)) = remap_ssa(s, remap_val)
 
     all_stmts = Vector{Any}(undef, nstmts)
     all_types = Vector{Any}(undef, nstmts)
@@ -363,7 +363,7 @@ function emit(m_in::MCFG)
         push!(bb_ranges, start:pos)
     end
 
-    return _assemble(m, all_stmts, all_types, all_flags, line, bb_ranges, order)
+    return _assemble(m, all_stmts, all_types, all_flags, line, bb_ranges)
 end
 
 # Reconstruct a terminator statement from the explicit-edge form. A CondBr's true
@@ -378,67 +378,10 @@ function _emit_term(t::MTerm, bb_of, remap_val)
     end
 end
 
-function _remap_stmt(@nospecialize(stmt), remap_val)
-    if stmt isa Expr
-        return Expr(stmt.head, Any[remap_val(a) for a in stmt.args]...)
-    elseif stmt isa PiNode
-        return PiNode(remap_val(stmt.val), stmt.typ)
-    elseif stmt isa SSAValue
-        return remap_val(stmt)
-    elseif stmt isa PhiNode
-        new_vals = Vector{Any}(undef, length(stmt.values))
-        for k in eachindex(stmt.values)
-            isassigned(stmt.values, k) && (new_vals[k] = remap_val(stmt.values[k]))
-        end
-        return PhiNode(copy(stmt.edges), new_vals)
-    else
-        return stmt
-    end
-end
-
 # Build the CFG (preds/succs) and IRCode from the flat statement arrays.
-function _assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges, order)
-    n = length(all_stmts)
-    nb = length(bb_ranges)
-    bb_blocks = BasicBlock[]
-    cfg_index = Int[]                       # first stmt of blocks 2..nb (length nb-1)
-    for (i, r) in enumerate(bb_ranges)
-        push!(bb_blocks, BasicBlock(StmtRange(first(r), last(r)), Int[], Int[]))
-        i > 1 && push!(cfg_index, first(r))
-    end
-    for (i, r) in enumerate(bb_ranges)
-        last_s = all_stmts[last(r)]
-        if last_s isa GotoNode
-            _cfg_edge!(bb_blocks, i, last_s.label)
-        elseif last_s isa GotoIfNot
-            _cfg_edge!(bb_blocks, i, last_s.dest)
-            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
-        elseif last_s isa ReturnNode
-            # no successors
-        else
-            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
-        end
-    end
-    cfg = CFG(bb_blocks, cfg_index)
-
-    info = Vector{CC.CallInfo}(undef, n)
-    fill!(info, CC.NoCallInfo())
-    stmts = InstructionStream(all_stmts, all_types, info, line, all_flags)
-
-    meta = Expr[]
-    @static if VERSION >= v"1.12-"
-        debuginfo = CC.DebugInfoStream(line)
-        if m.debuginfo isa CC.DebugInfoStream
-            debuginfo.def = m.debuginfo.def
-            debuginfo.linetable = m.debuginfo.linetable
-            debuginfo.edges = copy(m.debuginfo.edges)
-        end
-        return IRCode(stmts, cfg, debuginfo, copy(m.argtypes), meta, CC.VarState[s for s in m.sptypes])
-    else
-        linetable = m.debuginfo isa Vector ? copy(m.debuginfo) : Core.LineInfoNode[]
-        return IRCode(stmts, cfg, linetable, copy(m.argtypes), meta, CC.VarState[s for s in m.sptypes])
-    end
-end
+_assemble(m::MCFG, all_stmts, all_types, all_flags, line, bb_ranges) =
+    build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
+                       argtypes=m.argtypes, sptypes=m.sptypes, debuginfo=m.debuginfo)
 
 #=============================================================================
  EdgeMultiplexer  (port of CFGToSCF.cpp EdgeMultiplexer::create/redirectEdge/
@@ -598,17 +541,17 @@ serving as the default. Entries in `excluded` are left out (used by the latch,
 which dispatches them through a separate back edge). `live` (see `slice_vals`)
 restricts which slice positions are forwarded by value vs as `Undef`."""
 function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
-                   live::Union{Nothing, Set{Int}}=nothing)
+                   live::Union{Nothing, Set{Int}}=nothing, from::Int=mux.mux_id)
     targets = [e for e in mux.entries if !(e in excluded)]
     @assert !isempty(targets) "dispatch has no targets"
 
     if length(targets) == 1
-        m.blocks[mux.mux_id].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1], live)))
+        m.blocks[from].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1], live)))
         return
     end
 
     disc = mux.disc_id
-    cur = mux.mux_id
+    cur = from
     for i in 1:length(targets) - 1
         e = targets[i]
         cmp = alloc_id!(m)
@@ -721,8 +664,9 @@ function normalize_one_irreducible!(m::MCFG)
     @assert length(entry_blocks) >= 1 "irreducible SCC with no entry block"
 
     # Separate the edges into entry blocks: external (entry edges) and in-SCC
-    # (back edges). Both route through the entry mux; the back edges are routed a
-    # second time through a latch so the header gets a single back edge.
+    # (back edges). Both route through the entry mux so every in-edge — including
+    # back edges — lands on the single header (MLIR's `createSingleEntryBlock`
+    # passing entryEdges *and* backEdges).
     entry_refs = EdgeRef[]
     back_refs = EdgeRef[]
     for src in sort!(collect(1:nb)), e in entry_blocks
@@ -730,19 +674,209 @@ function normalize_one_irreducible!(m::MCFG)
         append!(dst, edge_refs(m, src, e))
     end
 
-    # 1. Entry mux: collapse the multiple entry blocks to one header. It *absorbs*
-    #    the entries' args (becomes the loop header carrying them); each entry, a
-    #    dispatch arm reached only from the mux, reads them directly.
-    mux = single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
-
-    # 2. Single back edge: the header now has several back-edge predecessors, each
-    #    carrying different header-arg values — which the lift's single carried-
-    #    value set can't represent. Route the back edges through a latch (a mux
-    #    onto the single target = the header), unifying them into one back edge.
-    if length(back_refs) >= 2
-        single_entry_mux!(m, back_refs)        # target = the header mux; absorb=false
-    end
+    # Entry mux: collapse the multiple entry blocks to one header. It *absorbs* the
+    # entries' args (becomes the loop header carrying them); each entry, a dispatch
+    # arm reached only from the mux, reads them directly. The header now has
+    # several back-edge predecessors; unifying those into one back edge is the
+    # single-exiting latch's job (RESEARCH_ANSWER_3 §C4) — fired next by
+    # `normalize_one_loop_latch!` on the ≥2-back-edge trigger — so there is no
+    # separate back-edge mux here to collide with it.
+    single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
     return true
+end
+
+# M4 SPIKE: single-exiting latch ----------------------------------------------
+
+"""Natural loops on the MBlock CFG: header id → set of in-loop block ids. A back
+edge is `src→header` where `header` dominates `src`."""
+function natural_loops_m(m::MCFG)
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    loops = Dict{Int, Set{Int}}()
+    nb = length(m.blocks)
+    for src in 1:nb
+        for h in _term_targets(m.blocks[src].term)
+            dominates(domtree, h, src) || continue
+            body = get!(Set{Int}, loops, h)
+            push!(body, h)
+            wl = Int[src]
+            while !isempty(wl)
+                b = pop!(wl)
+                b in body && continue
+                push!(body, b)
+                append!(wl, cfg.blocks[b].preds)
+            end
+        end
+    end
+    return loops
+end
+
+_edge_refs_of(src::Int, t::MGoto)   = (EdgeRef(src, :goto),)
+_edge_refs_of(src::Int, t::MCondBr) = (EdgeRef(src, :t), EdgeRef(src, :f))
+_edge_refs_of(src::Int, t::MReturn) = ()
+
+"""Route a loop's back edges and exit edges through one latch — MLIR's
+`createSingleExitingLatch`. Back edges carry `shouldRepeat=1`, exit edges `=0`;
+the latch branches on `shouldRepeat` back to `header` (the single back edge) or
+to a fresh exit-dispatch block that switches to the original exit targets (the
+single exit edge). The loop is then single-back-edge / single-exit-edge."""
+function single_exiting_latch!(m::MCFG, header::Int,
+                               back_refs::Vector{EdgeRef}, exit_refs::Vector{EdgeRef})
+    exit_targets = Int[]
+    for r in exit_refs
+        t = edge_of(m, r).target
+        t in exit_targets || push!(exit_targets, t)
+    end
+    targets = vcat([header], exit_targets)          # header first → entry_index 0
+
+    mux = create_mux!(m, targets; absorb=false, extra_types=Any[Int])
+    sr_id = mux.extra_ids[1]                          # shouldRepeat
+
+    for r in back_refs;  redirect_edge!(m, mux, r; extra_vals=Any[1]); end
+    for r in exit_refs;  redirect_edge!(m, mux, r; extra_vals=Any[0]); end
+    live = _live_positions(m, mux, vcat(back_refs, exit_refs))
+
+    latch = mux.mux_id
+    cmp = alloc_id!(m); m.types[cmp] = Bool; m.codelocs[cmp] = _NOLOC
+    push!(m.blocks[latch].body,
+          MStmt(cmp, Expr(:call, Core.:(===), SSAValue(sr_id), 1), Bool, _NOLOC, UInt32(0)))
+    header_edge = MEdge(header, slice_vals(mux, header, live))
+    exitblk = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC, Any))
+    m.blocks[latch].term = MCondBr(SSAValue(cmp), header_edge, MEdge(exitblk, Any[]))
+
+    if isempty(exit_targets)
+        m.blocks[exitblk].term = MReturn()           # infinite loop: unreachable
+    else
+        dispatch!(m, mux; excluded=Set{Int}([header]), live, from=exitblk)
+    end
+    return mux
+end
+
+# All SSAValue ids referenced inside `b`: body statement operands, terminator
+# operands, and outgoing-edge operands (the values this block contributes to its
+# successors' block arguments).
+function _mblock_use_ids(b::MBlock)
+    ids = Int[]
+    collect_ssa(@nospecialize(v)) = (v isa SSAValue && push!(ids, v.id); v)
+    for s in b.body
+        remap_ssa(s.stmt, collect_ssa)
+    end
+    t = b.term
+    if t isa MGoto
+        for v in t.edge.args; v isa SSAValue && push!(ids, v.id); end
+    elseif t isa MCondBr
+        t.cond isa SSAValue && push!(ids, t.cond.id)
+        for v in t.t.args; v isa SSAValue && push!(ids, v.id); end
+        for v in t.f.args; v isa SSAValue && push!(ids, v.id); end
+    elseif t isa MReturn
+        t.has_val && t.val isa SSAValue && push!(ids, t.val.id)
+    end
+    return ids
+end
+
+# Apply value-map `f` to every operand of `b`: body statements (via `remap_ssa`),
+# terminator operands, and outgoing-edge operands. Mirrors `_mblock_use_ids`.
+function _rewrite_mblock!(b::MBlock, f)
+    for (i, s) in enumerate(b.body)
+        b.body[i] = MStmt(s.id, remap_ssa(s.stmt, f), s.type, s.codeloc, s.flag)
+    end
+    t = b.term
+    if t isa MGoto
+        for k in eachindex(t.edge.args); t.edge.args[k] = f(t.edge.args[k]); end
+    elseif t isa MCondBr
+        for k in eachindex(t.t.args); t.t.args[k] = f(t.t.args[k]); end
+        for k in eachindex(t.f.args); t.f.args[k] = f(t.f.args[k]); end
+        b.term = MCondBr(f(t.cond), t.t, t.f)
+    elseif t isa MReturn
+        t.has_val && (b.term = MReturn(f(t.val), true))
+    end
+end
+
+"""Reduce form (the latch-arg half of MLIR's `transformToReduceLoop`). For every
+value defined inside the loop and used *outside* it, add a latch block argument
+fed `value`-or-`undef` from each latch predecessor by dominance (§C2.ii), and
+rewrite the outside uses to that latch arg. After this every loop-internal value
+read downstream is a latch block arg, so the lift threads it out as a `BreakOp`
+result with no escape scan. Our `LoopOp` has separate `Break`/`Continue` values,
+so only this latch-arg half is needed — no header arg, no exit-block arg.
+
+Excludes the latch's own block args (the mux slices / discriminator already become
+loop results through the post-loop dispatch). `loop_blocks` must include `latch`."""
+function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
+    domtree = construct_domtree(build_cfg(m))
+
+    # Definition site and type of each SSA id. Block-arg types live in `m.types`;
+    # body-statement types live in the `MStmt` (NOT `m.types`), so capture both —
+    # else a reduce arg for a body def gets `Any` and breaks the result phi's type.
+    def_block = Dict{Int, Int}()
+    def_type = Dict{Int, Any}()
+    for (bid, b) in enumerate(m.blocks)
+        for a in b.args; def_block[a] = bid; def_type[a] = get(m.types, a, Any); end
+        for s in b.body; def_block[s.id] = bid; def_type[s.id] = s.type; end
+    end
+
+    # Escaping values: loop-internal defs referenced from a non-loop block, in
+    # deterministic (block, first-seen) order. The latch's own args are skipped.
+    latch_args = Set(m.blocks[latch].args)
+    escaping = Int[]
+    seen = Set{Int}()
+    for bid in 1:length(m.blocks)
+        bid in loop_blocks && continue
+        for id in _mblock_use_ids(m.blocks[bid])
+            (get(def_block, id, 0) in loop_blocks) || continue
+            (id in latch_args || id in seen) && continue
+            push!(escaping, id); push!(seen, id)
+        end
+    end
+    isempty(escaping) && return
+
+    # All edges into the latch (the back + exit edges, post-redirect).
+    pred_refs = EdgeRef[]
+    for src in 1:length(m.blocks)
+        append!(pred_refs, edge_refs(m, src, latch))
+    end
+
+    for v in escaping
+        T = get(def_type, v, Any)
+        larg = alloc_id!(m)
+        m.types[larg] = T
+        m.codelocs[larg] = get(m.codelocs, v, _NOLOC)
+        push!(m.blocks[latch].args, larg)
+        dv = def_block[v]
+        for ref in pred_refs
+            e = edge_of(m, ref)
+            push!(e.args, dominates(domtree, dv, ref.src) ? SSAValue(v) : Undef(T))
+        end
+        fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(larg) : w
+        for bid in 1:length(m.blocks)
+            bid in loop_blocks && continue
+            _rewrite_mblock!(m.blocks[bid], fv)
+        end
+    end
+end
+
+"""Find one natural loop with ≥2 exit edges *or* ≥2 back edges and collapse it to
+a single-exiting latch in reduce form. ≥2 exit edges is the multi-exit shape the
+old `find_loop_exit` heuristic mishandled; ≥2 back edges is the post-entry-mux
+irreducible loop, whose back edges the one latch unifies (RESEARCH_ANSWER_3 §C4 —
+no separate back-edge mux). Returns `true` if it transformed one."""
+function normalize_one_loop_latch!(m::MCFG)
+    loops = natural_loops_m(m)
+    for h in sort!(collect(keys(loops)))
+        body = loops[h]
+        back_refs = EdgeRef[]; exit_refs = EdgeRef[]
+        for src in sort!(collect(body))
+            for r in _edge_refs_of(src, m.blocks[src].term)
+                tgt = edge_of(m, r).target
+                tgt == h ? push!(back_refs, r) : (tgt ∉ body && push!(exit_refs, r))
+            end
+        end
+        (length(exit_refs) >= 2 || length(back_refs) >= 2) || continue
+        mux = single_exiting_latch!(m, h, back_refs, exit_refs)
+        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))))
+        return true
+    end
+    return false
 end
 
 """Mutate `m` until no multi-entry situation remains. Each mux strictly reduces
@@ -751,10 +885,13 @@ function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
-    while normalize_one_irreducible!(m)
+    # Each step collapses one multi-entry header (irreducible) or one multi-exit
+    # loop (the single-exiting latch + reduce form) — both strictly reduce the
+    # remaining count, so this terminates.
+    while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m)
         changed = true
         guard += 1
-        guard > limit && error("normalize_cf! failed to converge (likely a mux bug)")
+        guard > 4 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
     end
     return changed
 end
@@ -809,7 +946,7 @@ function _enclosing_loop_ctx(ctx::StructurizeCtx, E::Int)
         end
     end
     best_body === nothing && return nothing
-    return LoopCtx(best_h, best_body, IRValue[], IRValue[], nothing)
+    return LoopCtx(best_h, best_body, IRValue[], IRValue[])
 end
 
 # Find one conditional with a multi-entry continuation; return (E, entries) or

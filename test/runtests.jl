@@ -65,4 +65,5 @@ end
     include("ir.jl")
     include("unstructurize.jl")
     include("debuginfo.jl")
+    include("regression.jl")
 end

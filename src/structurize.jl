@@ -46,20 +46,42 @@ function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
     ctx.line_map[new_ssa] = source_ssa  # positive anchor → follow to resolve
 end
 
-"""Remap SSAValue references in a statement. Clones Expr to avoid mutating shared IRCode."""
-function remap_stmt(@nospecialize(stmt), remap::Dict{Int, Int})
-    isempty(remap) && return stmt
-    if stmt isa SSAValue
-        return remap_ssa_ref(stmt, remap)
-    elseif stmt isa Expr
-        new_args = Any[remap_ssa_ref(a, remap) for a in stmt.args]
-        return Expr(stmt.head, new_args...)
+"""
+    remap_ssa(stmt, f) -> stmt
+
+Rebuild `stmt` with every value operand passed through `f` (a value-mapping
+closure). The single SSA-substitution primitive shared by the walk
+(`remap_stmt`), `emit` (multiplex), and `assemble_ircode` (unstructurize) — each
+supplies its own `f`. Handles every operand-bearing node: `Expr`, `PiNode`,
+`PhiNode` (unassigned slots left unassigned), `GotoIfNot` (cond), `ReturnNode`
+(val), and a bare `SSAValue`. Clones rather than mutates, so shared IR is safe.
+"""
+function remap_ssa(@nospecialize(stmt), f)
+    if stmt isa Expr
+        return Expr(stmt.head, Any[f(a) for a in stmt.args]...)
     elseif stmt isa PiNode
-        return PiNode(remap_ssa_ref(stmt.val, remap), stmt.typ)
+        return PiNode(f(stmt.val), stmt.typ)
+    elseif stmt isa PhiNode
+        new_vals = Vector{Any}(undef, length(stmt.values))
+        for k in eachindex(stmt.values)
+            isassigned(stmt.values, k) && (new_vals[k] = f(stmt.values[k]))
+        end
+        return PhiNode(copy(stmt.edges), new_vals)
+    elseif stmt isa GotoIfNot
+        return GotoIfNot(f(stmt.cond), stmt.dest)
+    elseif stmt isa ReturnNode
+        return isdefined(stmt, :val) ? ReturnNode(f(stmt.val)) : stmt
+    elseif stmt isa SSAValue
+        return f(stmt)
     else
         return stmt
     end
 end
+
+"""Remap SSAValue references in a statement via an index map. Clones to avoid
+mutating shared IRCode; identity (no allocation) when `remap` is empty."""
+remap_stmt(@nospecialize(stmt), remap::Dict{Int, Int}) =
+    isempty(remap) ? stmt : remap_ssa(stmt, v -> remap_ssa_ref(v, remap))
 
 remap_ssa_ref(@nospecialize(val), remap::Dict{Int, Int}) =
     val isa SSAValue ? SSAValue(get(remap, val.id, val.id)) : val

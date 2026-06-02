@@ -229,13 +229,18 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     # 1. Extract header phi nodes
     phi_info = extract_loop_phis(ir, header, loop_blocks)
 
-    # 2. Find exit destination (prefer the post-dominator of the header —
-    #    the structurally correct continuation, not an error/unreachable path)
-    exit_dest = find_loop_exit(ctx, header, loop_blocks)
+    # 2. The loop's single exit — its one non-loop successor. The single-exiting
+    #    latch (normalize_cf) unified every multi-exit loop to one exit edge, so
+    #    there is no choice to make: no post-dominance preference, no block-index
+    #    tie-break (the old `find_loop_exit` I1 leak — gone).
+    exit_dest = single_loop_exit(ctx, loop_blocks)
 
-    # 3. Find extra exit values (loop-internal SSAs used outside)
+    # 3. Escaping values: every loop-internal value used outside the loop. After
+    #    reduce form (normalize_cf) the latch carries the escapees as block args,
+    #    so this is a flat used-outside scan — no post-loop BFS, no remap-vs-merge
+    #    collision (the old `find_extra_exit_values`).
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
-    extra_exits = find_extra_exit_values(ir, loop_blocks, already_exported, exit_dest)
+    extra_exits = loop_escaping_values(ir, loop_blocks, already_exported)
 
     # 4. Build init/carried values and block arguments
     init_values = IRValue[]
@@ -248,7 +253,11 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     for phi in phi_info
         # If a preceding IfOp already defined this phi SSA (via getfield),
         # use that as init_val — it captures the correct branch-selected value.
-        init_val = haskey(block.body, phi.ssa_idx) ? SSAValue(phi.ssa_idx) : phi.entry_val
+        # Otherwise the entry value, remapped through `ssa_remap`: a single-edge
+        # phi feeding this loop's entry was renamed (not emitted at its own index),
+        # so the raw `entry_val` would be an undefined SSA.
+        init_val = haskey(block.body, phi.ssa_idx) ? SSAValue(phi.ssa_idx) :
+                   remap_ssa_ref(phi.entry_val, ctx.ssa_remap)
         push!(init_values, init_val)
         push!(carried_values, phi.carried_val)
         push!(phi_indices, phi.ssa_idx)
@@ -287,7 +296,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     end
 
     # 5. Build loop body
-    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs, exit_dest)
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
 
     # Restore remap (scoped to loop body)
     ctx.ssa_remap = saved_remap
@@ -328,8 +337,7 @@ The LoopCtx makes the region walk loop-aware: back-edges → ContinueOp, exits �
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, carried_values::Vector{IRValue},
-                           subs::Dict{Int, BlockArgument},
-                           exit_dest::Union{Int, Nothing})
+                           subs::Dict{Int, BlockArgument})
     break_values = IRValue[arg for arg in body.args]
     # Extra exits (beyond header phis) must carry the current iteration's
     # computed value, not the stale block arg from the previous iteration.
@@ -337,7 +345,7 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
     for i in (n_header_phis + 1):length(break_values)
         break_values[i] = carried_values[i]
     end
-    lctx = LoopCtx(header, loop_blocks, carried_values, break_values, exit_dest)
+    lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
 
     # Use structurize_region! with loop context for the entire loop body
     content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)
@@ -399,44 +407,17 @@ function extract_loop_phis(ir::IRCode, header::Int, loop_blocks::Set{Int})
     result
 end
 
-"""
-Find the loop's *primary* exit: where control goes when the loop stops iterating
-normally — the continuation. The loop breaks to it and its loop values are
-threaded out as results. A *secondary* exit (an early `return`/`throw` reached
-mid-body) is re-materialized in place instead (invariant I8).
-
-The primary exit is taken at the loop's "keep iterating?" decision, so its source
-block is adjacent to the back edge: it branches to the exit on one side and, on
-the other, to the loop header or a latch (a back-edge source). An irreducible
-loop's mux header dispatches *into* the loop and its latch only loops back, so no
-block is both an exit source and back-edge-adjacent → there is no primary exit
-(`nothing`): every escape is an early return, re-materialized, and the loop has
-no break/result.
-
-Layout-independent (invariant I1): candidates are sorted and the header's
-post-dominator is preferred; nothing keys on raw block order. (MLIR's
-single-exiting latch removes this choice entirely — the M4 cleanup.)
-"""
-function find_loop_exit(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
-    ir = ctx.ir
-    exits = sort!(collect(find_loop_exits(ir, loop_blocks)))
+"""The loop's single exit: its one successor outside `loop_blocks`, or `nothing`
+(a statically-infinite loop / all escapes are region-exits). The single-exiting
+latch (`normalize_cf`) unifies every multi-exit loop to one exit edge, so this is
+unambiguous — no post-dominance preference, no block-index tie-break (the old
+`find_loop_exit` I1 leak). More than one would mean the latch failed to fire."""
+function single_loop_exit(ctx::StructurizeCtx, loop_blocks::Set{Int})
+    exits = find_loop_exits(ctx.ir, loop_blocks)
     isempty(exits) && return nothing
-    length(exits) == 1 && return exits[1]
-    # The header's post-dominator is THE continuation when it resolves: every
-    # non-early-exit path reaches it. (It is 0/virtual only when every path
-    # returns/throws early — the irreducible / all-early-exit case handled below.)
-    ipdom = ctx.postdomtree.idoms_bb[header]
-    ipdom != 0 && ipdom ∉ loop_blocks && ipdom in exits && return ipdom
-    # No post-dominating continuation: pick the back-edge-adjacent exit (the
-    # loop's iteration-exit decision), or `nothing` if every exit is early.
-    latches = Set{Int}(b for b in loop_blocks if header in ir.cfg.blocks[b].succs)
-    backedge_adjacent(b) = header in ir.cfg.blocks[b].succs ||
-                           any(s -> s in latches, ir.cfg.blocks[b].succs)
-    cands = sort!([e for e in exits
-                   if any(b -> e in ir.cfg.blocks[b].succs && backedge_adjacent(b), loop_blocks)])
-    isempty(cands) && return nothing
-    length(cands) == 1 && return cands[1]
-    return first(cands)
+    length(exits) == 1 && return only(exits)
+    error("internal error: loop has ", length(exits), " exit edges; the single-",
+          "exiting latch (normalize_cf) should have unified them to one")
 end
 
 """Find all blocks outside `loop_blocks` that are successors of loop blocks."""
@@ -451,68 +432,39 @@ function find_loop_exits(ir::IRCode, loop_blocks::Set{Int})
 end
 
 """
-Find loop-internal SSA values referenced outside the loop.
+Loop-internal SSA values referenced from outside the loop — a flat used-outside
+scan over every non-loop block (deterministic block/statement order).
 
-Scans the post-loop region reachable from the *primary* exit (`exit_dest`), not
-every exit edge: a value only needs threading out if it is read at the loop's
-continuation. Secondary region-exits (early `return`/`throw`) are re-materialized
-in place and read their loop values directly, so they are not scanned — and a
-loop with no primary exit (`exit_dest === nothing`, e.g. an irreducible loop that
-escapes only via early returns) has no escaping values at all. Values escape
-through the continuation's exit-block phis, direct references downstream, or as
-operands of a sequential loop.
+After the single-exiting latch + reduce form (`normalize_cf`), every loop-internal
+value read downstream is a latch block argument, so the escapees are exactly the
+values some non-loop block uses whose definition is in the loop. No post-loop BFS
+from a chosen "primary" exit (the old `find_extra_exit_values`, which missed
+values read on a sibling/inner path), and no remap-vs-merge-phi collision: each is
+threaded out once as a loop result. `already_exported` skips the header phis,
+which are already loop-carried.
 """
-function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
-                                 already_exported::Set{Int},
-                                 exit_dest::Union{Int, Nothing})
-    result = @NamedTuple{ssa_idx::Int, value::Any, type::Any}[]
+function loop_escaping_values(ir::IRCode, loop_blocks::Set{Int},
+                              already_exported::Set{Int})
+    result = @NamedTuple{ssa_idx::Int, type::Any}[]
     seen = Set{Int}()
-
-    # Seed from the primary exit only; BFS its successors gives the post-loop
-    # region where loop values may be read.
-    reachable = Set{Int}()
-    worklist = exit_dest === nothing ? Int[] : Int[exit_dest]
-    while !isempty(worklist)
-        b = pop!(worklist)
-        b ∈ reachable && continue
+    for b in 1:length(ir.cfg.blocks)
         b ∈ loop_blocks && continue
-        push!(reachable, b)
-        for succ in ir.cfg.blocks[b].succs
-            succ ∉ reachable && succ ∉ loop_blocks && push!(worklist, succ)
-        end
-    end
-
-    for blk_idx in reachable
-        bb = ir.cfg.blocks[blk_idx]
+        bb = ir.cfg.blocks[b]
         for si in first(bb.stmts):last(bb.stmts)
-            stmt = ir.stmts.stmt[si]
-            if stmt isa PhiNode
-                si ∈ already_exported && continue
-                for (edge_idx, edge) in enumerate(stmt.edges)
-                    if isassigned(stmt.values, edge_idx) && Int(edge) ∈ loop_blocks
-                        loop_val = stmt.values[edge_idx]
-                        gf_idx = loop_val isa SSAValue ? loop_val.id : si
-                        gf_idx ∈ seen && continue
-                        gf_idx ∈ already_exported && continue
-                        push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
-                        push!(seen, gf_idx)
-                    end
-                end
-            else
-                # Single-predecessor exit blocks may reference loop values directly
-                for arg in stmt_ssa_uses(stmt)
-                    is_defined_in(arg, loop_blocks, ir) || continue
-                    arg.id ∈ already_exported && continue
-                    arg.id ∈ seen && continue
-                    push!(result, (; ssa_idx=arg.id, value=arg, type=ir.stmts.type[arg.id]))
-                    push!(seen, arg.id)
-                end
+            for u in stmt_ssa_uses(ir.stmts.stmt[si])
+                is_defined_in(u, loop_blocks, ir) || continue
+                (u.id ∈ already_exported || u.id ∈ seen) && continue
+                push!(result, (; ssa_idx=u.id, type=ir.stmts.type[u.id]))
+                push!(seen, u.id)
             end
         end
     end
     result
 end
 
+"""All `SSAValue` operands referenced by `stmt`: `Expr` args, `GotoIfNot` cond,
+`ReturnNode`/`PiNode` value, a bare `SSAValue`, and the assigned values of a
+`PhiNode` (a non-loop block's phi can carry a loop value out on a loop edge)."""
 function stmt_ssa_uses(@nospecialize(stmt))
     if stmt isa SSAValue
         return (stmt,)
@@ -526,6 +478,9 @@ function stmt_ssa_uses(@nospecialize(stmt))
         # A `PiNode`'s refined value is a real use — without this, a post-loop
         # type-assertion on a loop-internal SSA isn't threaded out as an exit.
         return (stmt.val,)
+    elseif stmt isa PhiNode
+        return (stmt.values[k] for k in eachindex(stmt.values)
+                if isassigned(stmt.values, k) && stmt.values[k] isa SSAValue)
     else
         return ()
     end

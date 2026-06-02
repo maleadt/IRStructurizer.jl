@@ -552,49 +552,20 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
         end
     end
 
-    function remap_stmt(@nospecialize(stmt))
-        if stmt isa Expr
-            return Expr(stmt.head, Any[remap_val(a) for a in stmt.args]...)
-        elseif stmt isa PhiNode
-            new_edges = copy(stmt.edges)  # BB indices unchanged
-            new_values = Vector{Any}(undef, length(stmt.values))
-            for i in 1:length(stmt.values)
-                if isassigned(stmt.values, i)
-                    new_values[i] = remap_val(stmt.values[i])
-                end
-            end
-            return PhiNode(new_edges, new_values)
-        elseif stmt isa GotoNode
-            return stmt  # BB indices unchanged
-        elseif stmt isa GotoIfNot
-            return GotoIfNot(remap_val(stmt.cond), stmt.dest)
-        elseif stmt isa ReturnNode
-            isdefined(stmt, :val) || return stmt
-            return ReturnNode(remap_val(stmt.val))
-        elseif stmt isa Core.PiNode
-            return Core.PiNode(remap_val(stmt.val), stmt.typ)
-        elseif stmt isa SSAValue
-            return remap_val(stmt)
-        else
-            return stmt  # nothing, constants, etc.
-        end
-    end
-
-    # Build flat statement/type arrays
+    # Build flat statement/type arrays (BB indices in Goto*/Phi edges are
+    # unchanged; `remap_ssa` only rewrites value operands via `remap_val`).
     all_stmts = Vector{Any}(undef, n)
     all_types = Vector{Any}(undef, n)
     pos = 0
     for bb in ctx.bbs
         for (_, stmt, typ) in bb.stmts
             pos += 1
-            all_stmts[pos] = remap_stmt(stmt)
+            all_stmts[pos] = remap_ssa(stmt, remap_val)
             all_types[pos] = typ
         end
     end
 
-    # Build InstructionStream with debug info
-    info = Vector{CC.CallInfo}(undef, n)
-    fill!(info, CC.NoCallInfo())
+    # Debug info: fill `line` from the per-statement line_map.
     @static if VERSION >= v"1.12-"
         line = fill(Int32(0), n * 3)
         if sci.debuginfo_table !== nothing
@@ -625,70 +596,78 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
             end
         end
     end
-    flag = fill(UInt32(0), n)
-    stmts = InstructionStream(all_stmts, all_types, info, line, flag)
 
-    # Build CFG. `cfg.index` lists the first statement of blocks 2..n (length
-    # n-1), excluding block 1 — including block 1's start makes `block_for_inst`
-    # mis-map every statement and fails `verify_ir`.
-    bb_blocks = BasicBlock[]
-    cfg_index = Int[]
+    # Per-block statement ranges (every BB has ≥1 stmt; ensured above).
+    bb_ranges = UnitRange{Int}[]
     offset = 0
-    for (i, bb) in enumerate(ctx.bbs)
+    for bb in ctx.bbs
         len = length(bb.stmts)
-        push!(bb_blocks, BasicBlock(StmtRange(offset + 1, offset + len), Int[], Int[]))
-        i > 1 && push!(cfg_index, offset + 1)
+        push!(bb_ranges, (offset + 1):(offset + len))
         offset += len
     end
 
-    # Compute preds/succs from terminators
-    for (i, bb) in enumerate(ctx.bbs)
-        isempty(bb.stmts) && continue
-        last_s = all_stmts[last(bb_blocks[i].stmts)]
-        if last_s isa GotoNode
-            _cfg_edge!(bb_blocks, i, last_s.label)
-        elseif last_s isa GotoIfNot
-            _cfg_edge!(bb_blocks, i, last_s.dest)
-            if i < length(bb_blocks)
-                _cfg_edge!(bb_blocks, i, i + 1)
-            end
-        elseif last_s isa ReturnNode
-            # no successors
-        else
-            if i < length(bb_blocks)
-                _cfg_edge!(bb_blocks, i, i + 1)
-            end
-        end
-    end
-
-    cfg = CFG(bb_blocks, cfg_index)
-
-    argtypes = copy(sci.argtypes)
-    sptypes = CC.VarState[s for s in sci.sptypes]
-    meta = Expr[]
-
-    @static if VERSION >= v"1.12-"
-        debuginfo = CC.DebugInfoStream(stmts.line)
-        if sci.debuginfo_table !== nothing
-            orig = sci.debuginfo_table::CC.DebugInfoStream
-            debuginfo.def = orig.def
-            debuginfo.linetable = orig.linetable
-            debuginfo.edges = copy(orig.edges)
-        end
-        return IRCode(stmts, cfg, debuginfo, argtypes, meta, sptypes)
-    else
-        linetable = if sci.debuginfo_table isa Vector
-            copy(sci.debuginfo_table)
-        else
-            Core.LineInfoNode[]
-        end
-        return IRCode(stmts, cfg, linetable, argtypes, meta, sptypes)
-    end
+    return build_dense_ircode(all_stmts, all_types, fill(UInt32(0), n), line, bb_ranges;
+                              argtypes=sci.argtypes, sptypes=sci.sptypes,
+                              debuginfo=sci.debuginfo_table)
 end
 
 function _cfg_edge!(blocks::Vector{BasicBlock}, from::Int, to::Int)
     push!(blocks[to].preds, from)
     push!(blocks[from].succs, to)
+end
+
+"""
+    build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
+                       argtypes, sptypes, debuginfo) -> IRCode
+
+Assemble a dense `IRCode` from flat statement arrays plus per-block statement
+ranges. Builds the CFG (preds/succs from each block's last statement), the
+`InstructionStream`, and the debug info, then constructs the `IRCode`. Shared by
+`assemble_ircode` (unstructurize) and `_assemble` (multiplex's `emit`) — the same
+`cfg.index` off-by-one (block 1 excluded) was once fixed in both, proof of drift.
+"""
+function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
+                            argtypes, sptypes, debuginfo)
+    n = length(all_stmts)
+    nb = length(bb_ranges)
+    bb_blocks = BasicBlock[]
+    cfg_index = Int[]                       # first stmt of blocks 2..nb (length nb-1)
+    for (i, r) in enumerate(bb_ranges)
+        push!(bb_blocks, BasicBlock(StmtRange(first(r), last(r)), Int[], Int[]))
+        i > 1 && push!(cfg_index, first(r))
+    end
+    for (i, r) in enumerate(bb_ranges)
+        last_s = all_stmts[last(r)]
+        if last_s isa GotoNode
+            _cfg_edge!(bb_blocks, i, last_s.label)
+        elseif last_s isa GotoIfNot
+            _cfg_edge!(bb_blocks, i, last_s.dest)
+            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
+        elseif last_s isa ReturnNode
+            # no successors
+        else
+            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
+        end
+    end
+    cfg = CFG(bb_blocks, cfg_index)
+
+    info = Vector{CC.CallInfo}(undef, n)
+    fill!(info, CC.NoCallInfo())
+    stmts = InstructionStream(all_stmts, all_types, info, line, all_flags)
+    meta = Expr[]
+
+    @static if VERSION >= v"1.12-"
+        di = CC.DebugInfoStream(line)
+        if debuginfo isa CC.DebugInfoStream
+            di.def = debuginfo.def
+            di.linetable = debuginfo.linetable
+            di.edges = copy(debuginfo.edges)
+        end
+        return IRCode(stmts, cfg, di, copy(argtypes), meta, CC.VarState[s for s in sptypes])
+    else
+        linetable = debuginfo isa Vector ? copy(debuginfo) : Core.LineInfoNode[]
+        return IRCode(stmts, cfg, linetable, copy(argtypes), meta, CC.VarState[s for s in sptypes])
+    end
 end
 
 #=============================================================================
