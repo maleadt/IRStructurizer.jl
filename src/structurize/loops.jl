@@ -254,13 +254,13 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     subs = Dict{Int, BlockArgument}()
 
     for phi in phi_info
-        # If a preceding IfOp already defined this phi SSA (via getfield),
-        # use that as init_val — it captures the correct branch-selected value.
-        # Otherwise the entry value, remapped through `ssa_remap`: a single-edge
-        # phi feeding this loop's entry was renamed (not emitted at its own index),
-        # so the raw `entry_val` would be an undefined SSA.
-        init_val = haskey(block.body, phi.ssa_idx) ? SSAValue(phi.ssa_idx) :
-                   remap_ssa_ref(phi.entry_val, ctx.ssa_remap)
+        # The entry value comes through the pre-header: a header is single-entry
+        # from outside (`normalize_one_preheader!`), so its one entry edge carries
+        # the merged init (a branch selection / irreducible discriminator computed
+        # by the IfOp that yields into the pre-header). Remap through `ssa_remap`
+        # (a single-edge pre-header arg may have been renamed, not emitted at its
+        # own index).
+        init_val = remap_ssa_ref(phi.entry_val, ctx.ssa_remap)
         push!(init_values, init_val)
         push!(carried_values, phi.carried_val)
         push!(phi_indices, phi.ssa_idx)
@@ -317,13 +317,11 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     anchor_line!(ctx, loop_ssa, header_anchor)
 
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
-        # If a preceding IfOp already defined this phi SSA (multi-entry header),
-        # use a fresh index for the loop's getfield to avoid SSA uniqueness violation.
-        # Downstream code references phi_idx which is the IfOp's definition;
-        # the loop result is accessed via the fresh index (only used if phi changes in loop).
-        idx = haskey(block.body, phi_idx) ? alloc_ssa!(ctx) : phi_idx
-        push!(block, idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
-        idx != phi_idx && anchor_line!(ctx, idx, header_anchor)
+        # The loop result lands at the header arg's own id: a header is never a
+        # branch merge (the pre-header is), so `phi_idx` is not pre-defined by an
+        # enclosing IfOp — no fresh-index dance, and post-loop uses of `phi_idx`
+        # resolve to this result (ISSUES.md #2 fixed).
+        push!(block, phi_idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
     end
 
     return exit_dest

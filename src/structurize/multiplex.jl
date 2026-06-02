@@ -774,17 +774,61 @@ function normalize_one_continuation!(m::MCFG)
     return false
 end
 
+#=============================================================================
+ Loop pre-header.
+
+ A loop header reached by more than one entry edge (an `if/else` before the loop,
+ or the absorbed entry-dispatch of an irreducible loop) is *also* a branch merge.
+ Route those entry edges through one pre-header so the header gains a single
+ non-back predecessor — MLIR's `newLoopParentBlock` (`CFGToSCF.cpp:854`), built
+ here in the mutate phase rather than during the lift.
+=============================================================================#
+
+"""Find one loop header with ≥2 entry edges and route them through a single
+pre-header, leaving the back edge on the header. MLIR fires its entry mux on
+`entryEdges.size() > 1` (`CFGToSCF.cpp:821`, per-edge), covering a reducible
+header with several outside predecessors as well as an irreducible one.
+
+Making the header single-entry-from-outside is what lets the lift treat the
+branch's continuation as the *pre-header* (whose args receive the merged entry
+values — an `if`/`else` selection, or an irreducible discriminator — and feed the
+loop init) while the loop *results* stay on the header's own args. Keeping the two
+distinct is what removes the lift's "merge that is a loop header" special case and
+fixes the entry-value-returned-as-result miscompile (ISSUES.md #2).
+
+`absorb=false`, entry edges only: the pre-header forwards into the header's
+existing args, and the single-exiting latch still owns back/exit unification
+(RESEARCH_ANSWER_3 §C4 — no collision). Runs after irreducible + latch so it sees
+the final (mux) header."""
+function normalize_one_preheader!(m::MCFG)
+    loops = natural_loops_m(m)
+    cfg = build_cfg(m)
+    for h in sort!(collect(keys(loops)))
+        body = loops[h]
+        entry_refs = EdgeRef[]
+        for p in sort!(collect(cfg.blocks[h].preds))
+            p ∈ body && continue                      # back edge stays on the header
+            append!(entry_refs, edge_refs(m, p, h))
+        end
+        length(entry_refs) > 1 || continue
+        single_entry_mux!(m, entry_refs)              # absorb=false: a pure pre-header
+        return true
+    end
+    return false
+end
+
 """Mutate `m` until no multi-entry situation remains. Each step collapses one
 multi-entry header (irreducible), one multi-exit loop (the single-exiting latch +
-reduce form), or one multi-predecessor branch continuation — all strictly reduce
-the remaining count (the mux block is single-entry by construction), so this
-terminates. The lift then only ever structurizes single-entry regions."""
+reduce form), one multi-predecessor branch continuation, or one multi-entry loop
+header (the pre-header) — all strictly reduce the remaining count (the mux block is
+single-entry by construction), so this terminates. The lift then only ever
+structurizes single-entry regions."""
 function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
     while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m) ||
-          normalize_one_continuation!(m)
+          normalize_one_continuation!(m) || normalize_one_preheader!(m)
         changed = true
         guard += 1
         guard > 8 * limit && error("normalize_cf! failed to converge (likely a mux bug)")

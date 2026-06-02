@@ -259,20 +259,15 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         continuation multiplexer should have collapsed it (internal error)"""
 
     # If merge exists and is in region, extract its block args (the "phis").
-    # Skip args at loop headers — UNLESS the header has multiple non-loop predecessors
-    # (entry multiplexer case: the branch must yield the correct entry values).
-    is_multi_entry_header = if merge !== nothing && haskey(ctx.loop_map, merge) &&
-                               loop_ctx === nothing  # not inside a loop
-        loop_body = ctx.loop_map[merge]
-        count(p -> p ∉ loop_body, ctx.cfg.blocks[merge].preds) > 1
-    else
-        false
-    end
+    # Skip args at loop headers: a header is never a branch merge now — the
+    # pre-header (`normalize_one_preheader!`) routes every multi-entry header's
+    # entry edges through a pre-header, so the branch's continuation is that
+    # pre-header, not the header itself.
+    #
     # Continuation-by-exclusion finds the *real* merge directly, so a no-arg merge
     # is genuinely arg-free: the walk continues through it without a separate
     # pass-through step. A no-arg merge yields `nothing` here.
-    merge_phis = if merge !== nothing && merge ∈ region_blocks &&
-                   (!haskey(ctx.loop_map, merge) || is_multi_entry_header)
+    merge_phis = if merge !== nothing && merge ∈ region_blocks && !haskey(ctx.loop_map, merge)
         phis = extract_merge_phis(ctx, merge, region_blocks)
         isempty(phis) ? nothing : phis
     else
