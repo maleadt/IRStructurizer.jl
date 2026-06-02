@@ -598,17 +598,17 @@ serving as the default. Entries in `excluded` are left out (used by the latch,
 which dispatches them through a separate back edge). `live` (see `slice_vals`)
 restricts which slice positions are forwarded by value vs as `Undef`."""
 function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
-                   live::Union{Nothing, Set{Int}}=nothing)
+                   live::Union{Nothing, Set{Int}}=nothing, from::Int=mux.mux_id)
     targets = [e for e in mux.entries if !(e in excluded)]
     @assert !isempty(targets) "dispatch has no targets"
 
     if length(targets) == 1
-        m.blocks[mux.mux_id].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1], live)))
+        m.blocks[from].term = MGoto(MEdge(targets[1], slice_vals(mux, targets[1], live)))
         return
     end
 
     disc = mux.disc_id
-    cur = mux.mux_id
+    cur = from
     for i in 1:length(targets) - 1
         e = targets[i]
         cmp = alloc_id!(m)
@@ -745,16 +745,105 @@ function normalize_one_irreducible!(m::MCFG)
     return true
 end
 
+# M4 SPIKE: single-exiting latch ----------------------------------------------
+
+"""Natural loops on the MBlock CFG: header id → set of in-loop block ids. A back
+edge is `src→header` where `header` dominates `src`."""
+function natural_loops_m(m::MCFG)
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    loops = Dict{Int, Set{Int}}()
+    nb = length(m.blocks)
+    for src in 1:nb
+        for h in _term_targets(m.blocks[src].term)
+            dominates(domtree, h, src) || continue
+            body = get!(Set{Int}, loops, h)
+            push!(body, h)
+            wl = Int[src]
+            while !isempty(wl)
+                b = pop!(wl)
+                b in body && continue
+                push!(body, b)
+                append!(wl, cfg.blocks[b].preds)
+            end
+        end
+    end
+    return loops
+end
+
+_edge_refs_of(src::Int, t::MGoto)   = (EdgeRef(src, :goto),)
+_edge_refs_of(src::Int, t::MCondBr) = (EdgeRef(src, :t), EdgeRef(src, :f))
+_edge_refs_of(src::Int, t::MReturn) = ()
+
+"""Route a loop's back edges and exit edges through one latch — MLIR's
+`createSingleExitingLatch`. Back edges carry `shouldRepeat=1`, exit edges `=0`;
+the latch branches on `shouldRepeat` back to `header` (the single back edge) or
+to a fresh exit-dispatch block that switches to the original exit targets (the
+single exit edge). The loop is then single-back-edge / single-exit-edge."""
+function single_exiting_latch!(m::MCFG, header::Int,
+                               back_refs::Vector{EdgeRef}, exit_refs::Vector{EdgeRef})
+    exit_targets = Int[]
+    for r in exit_refs
+        t = edge_of(m, r).target
+        t in exit_targets || push!(exit_targets, t)
+    end
+    targets = vcat([header], exit_targets)          # header first → entry_index 0
+
+    mux = create_mux!(m, targets; absorb=false, extra_types=Any[Int])
+    sr_id = mux.extra_ids[1]                          # shouldRepeat
+
+    for r in back_refs;  redirect_edge!(m, mux, r; extra_vals=Any[1]); end
+    for r in exit_refs;  redirect_edge!(m, mux, r; extra_vals=Any[0]); end
+    live = _live_positions(m, mux, vcat(back_refs, exit_refs))
+
+    latch = mux.mux_id
+    cmp = alloc_id!(m); m.types[cmp] = Bool; m.codelocs[cmp] = _NOLOC
+    push!(m.blocks[latch].body,
+          MStmt(cmp, Expr(:call, Core.:(===), SSAValue(sr_id), 1), Bool, _NOLOC, UInt32(0)))
+    header_edge = MEdge(header, slice_vals(mux, header, live))
+    exitblk = add_block!(m, MBlock(Int[], MStmt[], MReturn(), _NOLOC, Any))
+    m.blocks[latch].term = MCondBr(SSAValue(cmp), header_edge, MEdge(exitblk, Any[]))
+
+    if isempty(exit_targets)
+        m.blocks[exitblk].term = MReturn()           # infinite loop: unreachable
+    else
+        dispatch!(m, mux; excluded=Set{Int}([header]), live, from=exitblk)
+    end
+    return mux
+end
+
+"""Find one natural loop with ≥2 exit edges (the multi-exit shape the lift's
+`find_loop_exit` heuristic mishandles) and collapse it to a single-exiting latch.
+Returns `true` if it transformed one. SPIKE: trigger is `≥2 exit edges`."""
+function normalize_one_loop_latch!(m::MCFG)
+    loops = natural_loops_m(m)
+    for h in sort!(collect(keys(loops)))
+        body = loops[h]
+        back_refs = EdgeRef[]; exit_refs = EdgeRef[]
+        for src in sort!(collect(body))
+            for r in _edge_refs_of(src, m.blocks[src].term)
+                tgt = edge_of(m, r).target
+                tgt == h ? push!(back_refs, r) : (tgt ∉ body && push!(exit_refs, r))
+            end
+        end
+        length(exit_refs) >= 2 || continue
+        single_exiting_latch!(m, h, back_refs, exit_refs)
+        return true
+    end
+    return false
+end
+
 """Mutate `m` until no multi-entry situation remains. Each mux strictly reduces
 the count (the mux block is single-entry by construction), so this terminates."""
 function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
-    while normalize_one_irreducible!(m)
+    while normalize_one_irreducible!(m) ||
+          (get(ENV, "IRS_M4", "0") == "1" && normalize_one_loop_latch!(m))
         changed = true
         guard += 1
-        guard > limit && error("normalize_cf! failed to converge (likely a mux bug)")
+        guard > 4 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
     end
     return changed
 end
