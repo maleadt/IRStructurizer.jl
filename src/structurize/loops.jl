@@ -489,14 +489,22 @@ function find_extra_exit_values(ir::IRCode, loop_blocks::Set{Int},
             if stmt isa PhiNode
                 si ∈ already_exported && continue
                 for (edge_idx, edge) in enumerate(stmt.edges)
-                    if isassigned(stmt.values, edge_idx) && Int(edge) ∈ loop_blocks
-                        loop_val = stmt.values[edge_idx]
-                        gf_idx = loop_val isa SSAValue ? loop_val.id : si
-                        gf_idx ∈ seen && continue
-                        gf_idx ∈ already_exported && continue
-                        push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
-                        push!(seen, gf_idx)
-                    end
+                    isassigned(stmt.values, edge_idx) || continue
+                    loop_val = stmt.values[edge_idx]
+                    # Thread out a value that either flows in directly on a loop-block
+                    # edge, OR is loop-internal but reaches this phi via a post-loop
+                    # dispatch block (the single-exiting latch: its exit-slice args are
+                    # forwarded to the original exit targets' phis from the exit block,
+                    # not from a loop block). Without the latter, those slice values
+                    # would be dropped → "SSA used but not defined".
+                    from_loop = Int(edge) ∈ loop_blocks
+                    is_internal = loop_val isa SSAValue && is_defined_in(loop_val, loop_blocks, ir)
+                    (from_loop || is_internal) || continue
+                    gf_idx = loop_val isa SSAValue ? loop_val.id : si
+                    gf_idx ∈ seen && continue
+                    gf_idx ∈ already_exported && continue
+                    push!(result, (; ssa_idx=gf_idx, value=loop_val, type=ir.stmts.type[si]))
+                    push!(seen, gf_idx)
                 end
             else
                 # Single-predecessor exit blocks may reference loop values directly

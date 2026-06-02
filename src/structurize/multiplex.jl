@@ -839,8 +839,15 @@ function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
-    while normalize_one_irreducible!(m) ||
-          (get(ENV, "IRS_M4", "0") == "1" && normalize_one_loop_latch!(m))
+    # NOTE (M4, WIP): the single-exiting latch is gated behind IRS_M4=1. It is
+    # proven sound (sound mutation; kills the multi-exit-loop silent-miscompile
+    # class — loop fuzzer 55→0 silent) but firing it default-on regresses ~5
+    # function categories whose root is NOT reduce-form (a complete escape scan
+    # changed nothing): the lift's branch-handling of the latch's dispatch
+    # structure, and a double-latch collision with irreducible normalization.
+    # Landing it green is a lift-integration milestone, not a localized fix.
+    latch_on = get(ENV, "IRS_M4", "0") == "1"
+    while normalize_one_irreducible!(m) || (latch_on && normalize_one_loop_latch!(m))
         changed = true
         guard += 1
         guard > 4 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
