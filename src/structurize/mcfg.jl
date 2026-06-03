@@ -42,13 +42,18 @@ end
 
 """A basic block in explicit-edge form: block arguments (the SSA ids that were
 phi nodes), body statements, and a terminator with explicit edges.
-`term_codeloc` is the debug location to attach to the emitted terminator."""
+`term_codeloc` is the debug location to attach to the emitted terminator, and
+`term_id` is the terminator's original SSA index (PC) so that location can be
+resolved through the SCI debug table — 0 when the terminator is synthesized (no
+source: a fallthrough goto, a mux/trampoline block, etc.)."""
 mutable struct MBlock
     args::Vector{Int}      # stable ids of block arguments (were phi results)
     body::Vector{MStmt}
     term::MTerm
     term_codeloc::NTuple{3, Int32}
+    term_id::Int
 end
+MBlock(args, body, term, term_codeloc) = MBlock(args, body, term, term_codeloc, 0)
 MBlock() = MBlock(Int[], MStmt[], MReturn(), (Int32(0), Int32(0), Int32(0)))
 
 """The whole mutable CFG. Blocks are indexed by id == position in `blocks`; the

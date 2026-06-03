@@ -280,8 +280,14 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         make_empty_branch_block(ctx, false_dest, current, sub_merge_phis, loop_ctx)
     end
 
-    # Anchor for debug info: the branch condition (the block's last body stmt).
-    branch_anchor = last_body_id(ctx, current)
+    # Anchor for debug info: the branch terminator's own location (the original
+    # `GotoIfNot`). Falls back to the block's last body stmt when the terminator
+    # is synthesized (`term_id` 0). Using the terminator is both more accurate and
+    # robust to a body-less block, e.g. `if arg` (whose condition is a block
+    # argument, so there is no body stmt to inherit from).
+    branch_anchor = let tid = (ctx.m::MCFG).blocks[current].term_id
+        tid != 0 ? tid : last_body_id(ctx, current)
+    end
 
     if merge !== nothing && merge ∈ region_blocks && merge_phis !== nothing
         # Inner merge exists: standard IfOp.
