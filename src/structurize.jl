@@ -130,3 +130,41 @@ function structurize(m, line_map::Dict{Int, Int}=Dict{Int, Int}();
     promote && promote_loops!(entry, ctx)
     return entry, ctx.next_ssa - 1, ctx.next_arg - 1, ctx.line_map
 end
+
+"""
+    lift_mcfg(m::MCFG; validate=true, promote=true) -> StructuredIRCode
+
+Lift a normalized `MCFG` to a `StructuredIRCode`. `split_duplicate_edges!` first
+routes any `GotoIfNot` whose two edges target the same block through a trampoline,
+so every predecessor reaches a block by at most one edge (the lift reads "what
+predecessor P contributes" as a single edge operand; a `cond ? a : b` shape needs
+the two predecessors distinct). Debug info comes from the `MBlock` codelocs.
+"""
+function lift_mcfg(m::MCFG; validate::Bool=true, promote::Bool=true)
+    split_duplicate_edges!(m)
+    debuginfo_table, line_map = capture_debuginfo(m)
+    valid_worlds = m.valid_worlds isa WorldRange ? m.valid_worlds :
+                   WorldRange(typemin(UInt), typemax(UInt))
+    sci = StructuredIRCode(copy(m.argtypes), copy(m.sptypes), Block(), 0, 0,
+                           debuginfo_table, line_map, valid_worlds)
+    entry, max_ssa, max_arg, updated_line_map = structurize(m, line_map; promote)
+    sci.entry = entry
+    sci.max_ssa_idx = max_ssa
+    sci.max_arg_idx = max_arg
+    merge!(sci.line_map, updated_line_map)
+
+    # Parent chain (entry to SCI, sub-blocks to containing block) after structurize
+    # and promote, since promote_loops! replaces block.body without going through
+    # push!.
+    sci.entry.parent = sci
+    fix_parents!(sci.entry)
+
+    if validate
+        validate_scf(sci.entry)
+        validate_no_phis(sci.entry)
+        validate_terminators(sci)
+        validate_ssa_defs(sci)
+        validate_ssa_uniqueness(sci)
+    end
+    return sci
+end

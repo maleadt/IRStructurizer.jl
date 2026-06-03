@@ -245,10 +245,10 @@ mutate-then-lift approach of MLIR's CFGToSCF pass (Bahmann et al. 2015).
 
 ```
 code_ircode → IRCode
-     │  ingest                       (structurize/multiplex.jl)
+     │  ingest                       (structurize/ingest.jl)
      ▼
 MCFG                                 explicit-edge CFG: block args + per-edge operands
-     │  normalize_cf!                collapse multi-entry regions to single-entry
+     │  normalize_cf!                (structurize/normalize.jl)
      ▼
 MCFG  (single-entry, reducible)
      │  lift_mcfg → structurize      (structurize.jl, walk.jl, loops.jl)
