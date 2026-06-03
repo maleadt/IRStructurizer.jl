@@ -58,11 +58,20 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                 # Fall back to existing path: LoopOp → WhileOp → ForOp
                 promoted = try_promote_while(stmt, ctx)
                 if promoted !== nothing
-                    result2, iv_pos = try_promote_for(promoted, idx, block, new_body, ctx)
-                    if result2 isa ForOp && iv_pos > 0
-                        for_promotions[idx] = ([iv_pos], result2, Dict{Int,Int}())
-                        carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i != iv_pos]
-                        push!(new_body, (idx, result2, Tuple{carry_types...}, entry.flag))
+                    result2, removed2 = try_promote_for(promoted, idx, block, new_body, ctx)
+                    if result2 isa ForOp
+                        if isempty(removed2)
+                            # The escaping IV is kept as an ordinary carry, so the
+                            # arity and order are unchanged and post-loop getfields
+                            # read it directly. No for_promotions entry, no getfield
+                            # rewrite. Carried-value semantics give the empty-loop
+                            # case its init, which is the value we want there.
+                            push!(new_body, (idx, result2, entry.type, entry.flag))
+                        else
+                            for_promotions[idx] = (removed2, result2, Dict{Int,Int}())
+                            carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed2]
+                            push!(new_body, (idx, result2, Tuple{carry_types...}, entry.flag))
+                        end
                     else
                         push!(new_body, (idx, result2, entry.type, entry.flag))
                     end
@@ -84,6 +93,11 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                     push!(new_body, (idx, new_gf, entry.type, entry.flag))
                 else
+                    # `upper` alias for a removed IV/shadow position. Every escaping
+                    # removed position is kept as a real carry instead, so this branch
+                    # is only reachable for a provably-dead getfield (the IV-escape
+                    # check returned false) and the alias is never observed.
+                    @assert !_ssa_used_in_block(SSAValue(idx), idx, block) "escaping removed position aliased to upper"
                     push!(new_body, (idx, for_op.upper, entry.type, entry.flag))
                 end
             else
@@ -236,6 +250,27 @@ function simplify_loop_exit(body::Block)
     end
     push!(result.body, (outer_idx, merged_if, Tuple{}))
     return result
+end
+
+"""Is the loop result's `pos`-th field read anywhere in the parent block? A `ForOp`
+does not carry its induction variable as a result; the IV is implicit in the range.
+Promotion can drop the IV carry and serve a post-loop `getfield` at that position
+from the exclusive `upper` bound, but `upper` equals the final IV only when the body
+ran at least once. An empty (zero-trip) loop leaves the IV at its init (`lower`), so
+the `upper` alias is wrong there. Callers use this per position to decide whether to
+keep an escaping IV or shadow as a real carry (read back normally) or to drop it
+(safe only when no live read remains). A genuine counted `for i in lo:hi` never reads
+`i` afterwards, since Julia scopes it out, so a counted loop is unaffected."""
+function loop_result_pos_escapes(loop_idx::Int, pos::Int, parent_block::Block)
+    for (pidx, pentry) in parent_block.body
+        s = pentry.stmt
+        s isa Expr || continue
+        s.head === :call && length(s.args) == 3 && s.args[1] === Core.getfield || continue
+        s.args[2] isa SSAValue && s.args[2].id == loop_idx || continue
+        s.args[3]::Int == pos || continue
+        _ssa_used_in_block(SSAValue(pidx), pidx, parent_block) && return true
+    end
+    return false
 end
 
 """Check if an SSA value is referenced in a block's body (after `after_idx`) or terminator."""
@@ -433,6 +468,20 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         _ssa_used_in_block(SSAValue(gf_idx), gf_idx, parent_block) && return (loop, Int[], Dict{Int,Int}())
     end
 
+    # Partition `removed` by whether each position escapes. A removed position (the
+    # IV or one of its value#1 shadows) would otherwise be aliased to `upper`
+    # post-loop, which is wrong for an empty loop whose final IV is the init. So any
+    # escaping position becomes a real kept carry (read back normally) and the rest
+    # stay removed (their `upper` alias is then provably dead). A duplicate-carry
+    # redirect stays removed; an Undef-init dup is folded into its survivor, not a
+    # value that escapes on its own.
+    kept = Int[]
+    for r in removed
+        haskey(carry_redirect, r) && continue
+        loop_result_pos_escapes(idx, r, parent_block) && push!(kept, r)
+    end
+    removed = setdiff(removed, kept)   # run before any count(p<…, removed)/carry_types
+
     # --- Build ForOp ---
     lower = loop.init_values[iv_pos]
     # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step
@@ -447,19 +496,24 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     for_body = Block()
     arg_remap = Dict{Int, BlockArgument}()
 
-    # Map IV and shadow IVs to ForOp's iv_arg (skip duplicate carries)
+    # Map (still-)removed IV / shadow IVs to ForOp's iv_arg (skip duplicate carries)
     for r in removed
         haskey(carry_redirect, r) && continue
         arg_remap[body.args[r].id] = iv_arg
     end
 
-    # Non-IV, non-shadow, non-duplicate args get fresh BlockArguments
+    # Retained carries get fresh BlockArguments in original index order, each with
+    # its own init. This covers genuine carries and kept escaping IV/shadows (the
+    # latter are no longer in `removed`). A kept escaping IV/shadow holds the current
+    # IV in-body, e.g. the value an `acc += i` reads, so its in-body uses resolve to
+    # `iv_arg` and its fresh for-arg is a write-only carry slot that only exposes the
+    # post-loop result. A genuine carry maps its body uses to its own for-arg.
     non_iv_inits = IRValue[]
     for (i, arg) in enumerate(body.args)
         i ∈ removed && continue
         for_arg = BlockArgument(alloc_arg!(ctx), arg.type)
         push!(for_body.args, for_arg)
-        arg_remap[arg.id] = for_arg
+        arg_remap[arg.id] = (i ∈ kept) ? iv_arg : for_arg
         push!(non_iv_inits, loop.init_values[i])
     end
 
@@ -468,23 +522,53 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         arg_remap[body.args[dup_pos].id] = arg_remap[body.args[surv_pos].id]
     end
 
-    # Body: stmts before the exit IfOp + continue branch stmts (minus IV increment)
+    # ContinueOp values. A kept escaping position carries `iv_arg` itself, not its
+    # lifted continue. The iterate protocol advances the state before re-checking, so
+    # the lifted continue is the advanced value `iv+step`, which equals `upper` (the
+    # post-loop bound). Carrying `iv_arg` makes the kept carry's last value the last
+    # in-body IV (`upper - step`), matching the LoopOp's break, which is the
+    # pre-advance current value. The empty range is guarded by the outer `if`, so the
+    # init is read only when the loop ran.
+    cont_values = IRValue[]
+    for (i, v) in enumerate(continue_op.values)
+        i ∈ removed && continue
+        push!(cont_values, i ∈ kept ? iv_arg : v)
+    end
+
+    # The IV increment (`step_ssa = iv + step`) is implicit in the range. Kept
+    # carries reference `iv_arg`, not the increment, so the statement is needed only
+    # if some other retained body stmt or surviving carried value reads it. Keep it
+    # only when referenced. A dead increment is harmless; a missing one dangles.
     last_idx = body.body.ssa_idxes[end]
+    incr_used = false
+    if step_ssa !== nothing
+        for v in cont_values
+            v isa SSAValue && v.id == step_ssa && (incr_used = true; break)
+        end
+        if !incr_used
+            for (sidx, sentry) in body.body
+                sidx == last_idx && break
+                _refs_ssa_deep(sentry.stmt, SSAValue(step_ssa)) && (incr_used = true; break)
+            end
+        end
+        if !incr_used
+            for (sidx, sentry) in cont_region.body
+                sidx == step_ssa && continue
+                _refs_ssa_deep(sentry.stmt, SSAValue(step_ssa)) && (incr_used = true; break)
+            end
+        end
+    end
+
+    # Body: stmts before the exit IfOp + continue branch stmts (minus dead increment)
     for (sidx, sentry) in body.body
         sidx == last_idx && break
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     for (sidx, sentry) in cont_region.body
-        step_ssa !== nothing && sidx == step_ssa && continue  # skip IV increment
+        step_ssa !== nothing && sidx == step_ssa && !incr_used && continue  # drop dead IV increment
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
-    # ContinueOp with non-IV, non-shadow values
-    cont_values = IRValue[]
-    for (i, v) in enumerate(continue_op.values)
-        i ∈ removed && continue
-        push!(cont_values, v)
-    end
     for_body.terminator = ContinueOp(cont_values)
 
     remap_block_args!(for_body, arg_remap)
@@ -587,25 +671,32 @@ end
 
 """
 Try to promote a WhileOp to ForOp by detecting counting patterns.
-Returns (promoted_op, iv_pos) where iv_pos > 0 if ForOp was created.
+Returns `(promoted_op, removed)` where `removed::Vector{Int}` lists the loop-result
+positions the ForOp dropped (the caller adjusts post-loop `getfield`s accordingly):
+- `(ForOp, [iv_pos])`: the IV was removed, the usual case, since it is implicit in
+  the range.
+- `(ForOp, Int[])`: the IV escapes, so it is kept as an ordinary carry. The result
+  arity and order match the original WhileOp, and the empty (zero-trip) case reads
+  back the init rather than the bound. No position is removed.
+- `(op, Int[])` with `op` still a WhileOp: not promoted.
 """
 function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
                           ctx::StructurizeCtx)
-    op isa WhileOp || return (op, 0)
+    op isa WhileOp || return (op, Int[])
 
     # Look for: condition is slt_int/sle_int on a block arg vs loop-invariant bound
     before = op.before
-    before.terminator isa ConditionOp || return (op, 0)
+    before.terminator isa ConditionOp || return (op, Int[])
     cond_op = before.terminator
 
     # Find the condition expression
     cond_val = cond_op.condition
-    cond_val isa SSAValue || return (op, 0)
+    cond_val isa SSAValue || return (op, Int[])
     cond_entry = get(before.body, cond_val.id, nothing)
-    cond_entry === nothing && return (op, 0)
+    cond_entry === nothing && return (op, Int[])
     cond_expr = cond_entry.stmt
-    cond_expr isa Expr && cond_expr.head === :call || return (op, 0)
-    length(cond_expr.args) >= 3 || return (op, 0)
+    cond_expr isa Expr && cond_expr.head === :call || return (op, Int[])
+    length(cond_expr.args) >= 3 || return (op, Int[])
 
     func = cond_expr.args[1]
     iv_candidate = cond_expr.args[2]
@@ -614,18 +705,24 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # Check condition function (=== is not a counting pattern; handled by Path A)
     is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
     is_sle = func isa GlobalRef && func.name === :sle_int
-    (is_slt || is_sle) || return (op, 0)
+    (is_slt || is_sle) || return (op, Int[])
 
     # IV must be a block argument
-    iv_candidate isa BlockArgument || return (op, 0)
+    iv_candidate isa BlockArgument || return (op, Int[])
 
     # Find IV's position in args
     iv_pos = findfirst(a -> a.id == iv_candidate.id, before.args)
-    iv_pos === nothing && return (op, 0)
+    iv_pos === nothing && return (op, Int[])
+
+    # A ForOp does not carry its IV as a result. If the IV is read after the loop,
+    # keep it as an ordinary carry (`keep_iv`) so the post-loop read is a normal
+    # result, correct for both the empty (init) and non-empty (last continue = upper)
+    # cases. If the IV does not escape, drop it; it is redundant with the range.
+    keep_iv = loop_result_pos_escapes(idx, iv_pos, parent_block)
 
     # Find step: look in the after region for add_int(iv_arg, step)
     after = op.after
-    iv_pos <= length(after.args) || return (op, 0)
+    iv_pos <= length(after.args) || return (op, Int[])
     after_iv_arg = after.args[iv_pos]
     before_iv_arg = before.args[iv_pos]
 
@@ -648,19 +745,19 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
             end
         end
     end
-    step === nothing && return (op, 0)
+    step === nothing && return (op, Int[])
 
     # ForOp requires positive step (ascending loops only)
-    step isa Integer && step < 0 && return (op, 0)
+    step isa Integer && step < 0 && return (op, Int[])
 
     # Step must be loop-invariant (not defined inside the loop body)
     if step isa SSAValue && (haskey(op.after.body, step.id) || haskey(op.before.body, step.id))
-        return (op, 0)
+        return (op, Int[])
     end
 
     # Bound must be loop-invariant (not a block arg of this loop)
     if bound isa BlockArgument && any(a -> a.id == bound.id, before.args)
-        return (op, 0)
+        return (op, Int[])
     end
 
     # Build ForOp
@@ -678,11 +775,13 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         upper = SSAValue(adj_ssa)
     end
 
-    # Non-IV init values
-    non_iv_inits = IRValue[]
+    # Carry init values. When the IV escapes (`keep_iv`) it rides as an ordinary
+    # carry, so its init (`lower`) is kept in place and the arity/order match the
+    # original WhileOp; otherwise the IV position is dropped (implicit in the range).
+    carry_inits = IRValue[]
     for (i, v) in enumerate(op.init_values)
-        i == iv_pos && continue
-        push!(non_iv_inits, v)
+        (i == iv_pos && !keep_iv) && continue
+        push!(carry_inits, v)
     end
 
     iv_arg = BlockArgument(alloc_arg!(ctx), iv_candidate.type)
@@ -691,13 +790,8 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     for_body = Block()
     arg_remap = Dict{Int, BlockArgument}()
 
-    # Map after IV arg → ForOp's iv_arg
-    arg_remap[after_iv_arg.id] = iv_arg
-    # Also map before IV arg (in case of stale cross-scope refs)
-    arg_remap[before_iv_arg.id] = iv_arg
-
     for (i, arg) in enumerate(after.args)
-        i == iv_pos && continue
+        (i == iv_pos && !keep_iv) && continue
         for_arg = BlockArgument(alloc_arg!(ctx), arg.type)
         push!(for_body.args, for_arg)
         arg_remap[arg.id] = for_arg
@@ -707,13 +801,20 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         end
     end
 
-    # The IV increment (`carried_val = iv + step`) is implicit in a ForOp, so it
-    # is normally dropped. But if another body statement or a surviving (non-IV)
-    # carried value reads it — e.g. `s += k` where `k` is the post-increment IV —
-    # it must stay, remapped below to read the ForOp's induction variable;
-    # dropping it then left a dangling SSA reference (`%k used but not defined`).
-    incr_used = false
-    if carried_val isa SSAValue
+    # In-body IV references always resolve to the implicit induction variable
+    # (`iv_arg`), overriding the write-only carry slot the kept-IV loop just mapped
+    # above: the kept carry is computed (continue = the increment) but never read.
+    arg_remap[after_iv_arg.id] = iv_arg
+    arg_remap[before_iv_arg.id] = iv_arg
+
+    # The IV increment (`carried_val = iv + step`) is implicit in a ForOp, so it is
+    # normally dropped. It must stay when something else reads it: another body
+    # statement (e.g. `s += k` where `k` is the post-increment IV), or the kept-IV
+    # carry whose continue is the increment. When kept it is remapped below to read
+    # the ForOp's induction variable; dropping it in that case leaves a dangling SSA
+    # reference (`%k used but not defined`).
+    incr_used = keep_iv
+    if !incr_used && carried_val isa SSAValue
         for (sidx, sentry) in after.body
             sidx == carried_val.id && continue
             if _refs_ssa_deep(sentry.stmt, carried_val); incr_used = true; break; end
@@ -733,11 +834,13 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
-    # ContinueOp with non-IV carried values
+    # ContinueOp carried values. At `iv_pos` (when kept) this is `carried_val`, the
+    # increment SSA = `iv + step`; its last value is `upper` (non-empty) so the kept
+    # carry's result matches `while`-counted post-increment semantics.
     cont_values = IRValue[]
     if after.terminator isa YieldOp
         for (i, v) in enumerate(after.terminator.values)
-            i == iv_pos && continue
+            (i == iv_pos && !keep_iv) && continue
             push!(cont_values, v)
         end
     end
@@ -747,7 +850,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     remap_block_args!(for_body, arg_remap)
     step = remap_value(step, arg_remap)
 
-    return (ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits), iv_pos)
+    return (ForOp(lower, upper, step, iv_arg, for_body, carry_inits), keep_iv ? Int[] : [iv_pos])
 end
 
 #=============================================================================

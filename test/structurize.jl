@@ -104,21 +104,26 @@ end  # acyclic regions
 
 @testset "cyclic regions" begin
 
-@testset "simple loop structure - ForOp" begin
+@testset "simple loop structure - escaping IV is a kept-carry ForOp" begin
+    # `i=0; while i<n; i+=1; return i` reads the IV after the loop. A ForOp can't
+    # carry the IV as a range result, but it can keep it as an ordinary carried
+    # value, so the post-loop read is a normal result, correct for both the empty
+    # case (= init 0) and non-empty (= n). Dropping it and aliasing the read to the
+    # bound would miscompile the empty case.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
+            @check "for"
             i = 0
-            @check "for %{{.*}} ="
             while i < n
                 i += 1
             end
-            @check "continue"
             return i
         end
     end
     f_count = (n::Int) -> (i = 0; while i < n; i += 1; end; i)
     @test @roundtrip f_count(5)
     @test @roundtrip f_count(0)
+    @test @roundtrip f_count(-3)   # empty by negative bound → init (0), not the bound
 end
 
 @testset "loop with condition" begin
@@ -189,20 +194,23 @@ end  # CFG analysis
 
 @testset "ForOp detection" begin
 
-@testset "bounded counter" begin
+@testset "bounded counter with escaping IV is a kept-carry ForOp" begin
+    # The induction variable `i` is returned, so the ForOp keeps it as an ordinary
+    # carried value instead of dropping it. The range still drives iteration (lower
+    # 0, upper n, step 1) while the kept carry exposes the post-loop value, correct
+    # for the empty case (= init 0) too. Dropping it and aliasing the read to the
+    # bound would miscompile the empty case.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
+            @check "for"
             i = 0
-            @check "for %{{.*}} ="
             while i < n
                 i += 1
             end
-            @check "continue"
             return i
         end
     end
 
-    # Also verify ForOp bounds programmatically (FileCheck can't check these)
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
@@ -210,13 +218,20 @@ end  # CFG analysis
         end
         return i
     end |> only
-    for_ops = filter(x -> x isa ForOp, collect(statements(sci.entry.body)))
-    @test length(for_ops) == 1
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 0
 
-    for_op = for_ops[1]
+    for_op = only(filter(x -> x isa ForOp, collect(statements(sci.entry.body))))
     @test for_op.lower == 0
-    @test for_op.upper isa Core.Argument
+    @test for_op.upper isa Core.Argument   # the bound `n`
     @test for_op.step == 1
+
+    # Execution across empty (n ≤ 0 → init 0) and non-empty (→ n); the empty case
+    # is what the buggy ForOp promotion got wrong (it returned the bound).
+    counted(n) = (i = 0; while i < n; i += 1; end; i)
+    for n in (-3, 0, 1, 5, 10)
+        @test execute(sci, n) == counted(n)
+    end
 end
 
 @testset "inclusive bound (<=) gets exclusive adjustment" begin
@@ -1585,8 +1600,17 @@ end
 
 end
 
-@testset "for-in-range produces valid ForOp" begin
-    # Native for-in-range is promoted to ForOp
+@testset "for-in-range whose loop var escapes is a kept-carry ForOp" begin
+    # `for i in 1:n; last = i; end; return last` copies the loop variable into
+    # `last`. For a `1:n` range the iterate protocol makes `last` a value#1 shadow of
+    # the loop state, and `last` is read after the loop. Promotion keeps `last` as an
+    # ordinary carried value whose continue is the induction variable, not the lifted
+    # continue (which is the advanced `iv+step`, equal to the bound). The last value
+    # is then the last in-body IV (= n), and the empty range is guarded by the outer
+    # `if`, so the init (0) is returned for n < 1. Aliasing the shadow to the range's
+    # upper bound instead would return `n+1`, a miscompile that earlier had no
+    # execution check to catch it (`forlast(1)` gave 2). The exec checks below cover
+    # the empty case, so keep them.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             last = 0
@@ -1605,7 +1629,42 @@ end
         end
         return last
     end |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
 
+    forlast(n) = (last = 0; for i in 1:n; last = i; end; last)
+    for n in (-3, 0, 1, 2, 3, 5, 50, 200)
+        @test execute(sci, n) == forlast(n)   # empty → 0; else → n (was n+1 when buggy)
+    end
+
+    # Step ≠ 1 (`1:2:n`): the last in-body odd ≤ n. Empty → init 0.
+    forlast2(n) = (last = 0; for i in 1:2:n; last = i; end; last)
+    sci2, _ = code_structured(Tuple{Int}) do n
+        last = 0
+        for i in 1:2:n
+            last = i
+        end
+        return last
+    end |> only
+    @test count_stmts(sci2.entry, x -> x isa ForOp) == 1
+    for n in (-3, 0, 1, 2, 4, 5, 6, 50, 200)
+        @test execute(sci2, n) == forlast2(n)
+    end
+
+    # Escaping index-capture shadow read *in-body* alongside a real accumulator
+    # (the shadow's in-body uses must resolve to the IV, not the write-only carry).
+    forboth(n) = (last = 0; acc = 0; for i in 1:n; acc += i; last = i; end; last + acc)
+    sci3, _ = code_structured(Tuple{Int}) do n
+        last = 0; acc = 0
+        for i in 1:n
+            acc += i
+            last = i
+        end
+        return last + acc
+    end |> only
+    @test count_stmts(sci3.entry, x -> x isa ForOp) == 1
+    for n in (-3, 0, 1, 2, 5, 50, 200)
+        @test execute(sci3, n) == forboth(n)
+    end
 end
 
 @testset "for-in-range with Int32 bounds" begin

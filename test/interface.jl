@@ -242,8 +242,14 @@ end
     @test validate_ssa_defs(sci2)
 end
 
-@testset "ForOp detection during CFG analysis" begin
-    # Test that counting loops are detected as ForOp during CFG analysis
+@testset "counting loop whose IV escapes promotes to a kept-carry ForOp" begin
+    # `i=0; while i<n; i+=1; return i` reads the induction variable after the loop.
+    # A ForOp does not carry its IV as a result, so promotion keeps the escaping IV
+    # as an ordinary carried value rather than dropping it and aliasing the post-loop
+    # read to the bound. The alias would be right only when the loop ran; for the
+    # empty case (init >= bound, e.g. n <= 0) the IV keeps its init. The carried
+    # value reads back normally and is correct for both the empty (= init 0) and
+    # non-empty (= n) cases.
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
@@ -252,10 +258,16 @@ end
         return i
     end |> only
 
-    # Counting loop should produce ForOp
     loop_ops = filter(x -> x isa ControlFlowOp, collect(statements(sci.entry.body)))
     @test !isempty(loop_ops)
     @test loop_ops[1] isa ForOp
+    @test !any(x -> x isa WhileOp, statements(sci.entry.body))
+
+    # Empty by negative bound returns the init (0), not the bound; n>0 returns n.
+    counted(n) = (i = 0; while i < n; i += 1; end; i)
+    for n in (-3, 0, 1, 5)
+        @test execute(sci, n) == counted(n)
+    end
 end
 
 @testset "code_structured single-argument form" begin
