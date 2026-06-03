@@ -1,12 +1,12 @@
-# The explicit-edge mutable CFG (`MBlock`/`MCFG`) — MLIR's block-argument /
-# per-edge-operand IR shape, the single working form for the whole structurizer.
+# The explicit-edge mutable CFG (`MBlock`/`MCFG`), in MLIR's block-argument /
+# per-edge-operand IR shape.
 #
 # Julia's `IRCode` is dense (SSA value == position) and fallthrough-sensitive
 # (`GotoIfNot` falls through to the next block on `true`), so it cannot be mutated
-# in place. The `MCFG` carries *stable ids* through CFG mutation (irreducible /
-# multi-exit-loop / continuation normalization, see `multiplex.jl`) and is then
-# lifted to the structured IR directly — block arguments + per-edge operands stand
-# in for SSA phi nodes, so redirecting an edge is local. `ingest` (IRCode → MCFG)
+# in place. The `MCFG` carries stable ids through CFG mutation (irreducible,
+# multi-exit-loop, and continuation normalization; see `multiplex.jl`) and is then
+# lifted to the structured IR directly. Block arguments and per-edge operands stand
+# in for SSA phi nodes, so redirecting an edge is local. `ingest` (IRCode to MCFG)
 # is the only conversion in the production pipeline; the lift reads this form.
 #
 # These type definitions live here (rather than in `multiplex.jl`) so the lift's
@@ -28,7 +28,7 @@ struct MCondBr; cond::Any; t::MEdge; f::MEdge;      end   # GotoIfNot: true=t, f
 struct MReturn; val::Any; has_val::Bool;           end    # ReturnNode(val) / ReturnNode()
 const MTerm = Union{MGoto, MCondBr, MReturn}
 
-MReturn() = MReturn(nothing, false)        # unreachable / throw dead-end
+MReturn() = MReturn(nothing, false)        # unreachable / throw dead-end (no value)
 
 """A statement in a block body: stable id, statement, type, debug codeloc, and
 the `IR_FLAG_*` bitmask carried over from the source IRCode."""
@@ -58,8 +58,8 @@ types/codelocs live in the `MStmt`s."""
 mutable struct MCFG
     blocks::Vector{MBlock}
     entry::Int
-    types::Dict{Int, Any}              # id → type (block args + synthesized stmts)
-    codelocs::Dict{Int, NTuple{3, Int32}}  # id → codeloc (block args + synthesized)
+    types::Dict{Int, Any}              # id => type (block args + synthesized stmts)
+    codelocs::Dict{Int, NTuple{3, Int32}}  # id => codeloc (block args + synthesized)
     next_id::Int                       # next fresh stable id
     # carried through to the lift / SCI
     argtypes::Vector{Any}

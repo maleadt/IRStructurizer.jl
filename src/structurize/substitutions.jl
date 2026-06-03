@@ -1,17 +1,13 @@
-# SSA substitution machinery for structurization (phi refs → block args)
+# SSA substitution machinery for structurization (phi refs to block args).
 #
-# These functions accept any context with `next_arg::Int` field for allocating
+# These functions accept any context with a `next_arg::Int` field for allocating
 # BlockArgument IDs (duck-typed to work with StructurizeCtx).
-
-#=============================================================================
- SSA Substitution (phi refs → block args)
-=============================================================================#
 
 """
     Substitutions
 
-A mapping from SSA value indices to BlockArguments.
-Used during IR construction to replace phi node references with block arguments.
+A mapping from SSA value indices to BlockArguments. Used during IR construction
+to replace phi node references with block arguments.
 """
 const Substitutions = Dict{Int, BlockArgument}
 
@@ -19,7 +15,7 @@ const Substitutions = Dict{Int, BlockArgument}
     substitute_ssa(value, subs::Substitutions)
 
 Recursively substitute SSAValues with BlockArguments according to the substitution map.
-Used to convert phi node references to block argument references inside loop bodies.
+Converts phi node references to block argument references inside loop bodies.
 """
 function substitute_ssa(value, subs::Substitutions)
     if value isa SSAValue && haskey(subs, value.id)
@@ -30,7 +26,7 @@ function substitute_ssa(value, subs::Substitutions)
     elseif value isa PiNode
         return PiNode(substitute_ssa(value.val, subs), value.typ)
     elseif value isa PhiNode
-        # Phi nodes shouldn't appear in structured IR, but handle gracefully
+        # Phi nodes shouldn't appear in structured IR, but handle them gracefully.
         new_values = Vector{Any}(undef, length(value.values))
         for i in eachindex(value.values)
             if isassigned(value.values, i)
@@ -43,19 +39,15 @@ function substitute_ssa(value, subs::Substitutions)
     end
 end
 
-# Convenience for empty substitutions
+# Convenience for empty substitutions.
 substitute_ssa(value) = value
-
-#=============================================================================
- Block Substitution (apply SSA → BlockArgument mappings)
-=============================================================================#
 
 """
     apply_substitutions!(block::Block, subs::Substitutions, ctx)
 
 Apply SSA substitutions within a block. Does not recurse into control flow regions.
 Each control flow op's entry values (condition, init_values) are substituted,
-but the nested regions are handled by process_block_args! dispatch.
+but the nested regions are handled by the per-op `apply_substitutions!` methods.
 
 `ctx` must have a mutable `next_arg::Int` field for allocating BlockArgument IDs.
 """

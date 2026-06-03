@@ -30,7 +30,7 @@ Typed undefined value, analogous to LLVM's `undef`/`poison` or SPIR-V's `OpUndef
 
 Inserted during structurization when a phi node has a missing predecessor edge.
 In a structured IfOp, both branches must yield equal arity, but the original IR
-may only define a value on one path. The dead path gets `Undef(T)` — this value
+may only define a value on one path. The dead path gets `Undef(T)`. This value
 is never observed at runtime (guarded by the branch condition).
 """
 struct Undef
@@ -66,7 +66,7 @@ or `0` (`IR_FLAG_NULL`) for statements synthesized after structurization.
 
 Indexing by SSA index: `m[ssa_idx]` returns `(; stmt, type, flag)` or throws `KeyError`,
 `get(m, ssa_idx, default)` returns `default` if missing. `setindex!` accepts any
-NamedTuple subset of `(stmt, type, flag)` — fields not mentioned are preserved.
+NamedTuple subset of `(stmt, type, flag)`; fields not mentioned are preserved.
 Iteration yields `idx => (; stmt, type, flag)` pairs.
 
 Storage is parallel `Vector`s (analogous to `Core.Compiler.InstructionStream`
@@ -77,8 +77,8 @@ struct SSAMap <: AbstractDict{Int, @NamedTuple{stmt::Any, type::Any, flag::UInt3
     ssa_idxes::Vector{Int}
     stmts::Vector{Any}
     types::Vector{Any}
-    flags::Vector{UInt32}  # IR_FLAG_* bitmask per stmt; parallel to stmts/types
-    pos_by_idx::Dict{Int, Int}  # ssa_idx → position in the parallel vectors
+    flags::Vector{UInt32}  # IR_FLAG_* bitmask per stmt, parallel to stmts/types
+    pos_by_idx::Dict{Int, Int}  # ssa_idx to position in the parallel vectors
 end
 
 SSAMap() = SSAMap(Int[], Any[], Any[], UInt32[], Dict{Int,Int}())
@@ -107,11 +107,10 @@ function Base.get(m::SSAMap, ssa_idx::Int, default)
     return (; stmt=m.stmts[i], type=m.types[i], flag=m.flags[i])
 end
 
-# Push raw tuple. The 3-tuple form defaults the flag to IR_FLAG_NULL (0) — used
-# by passes that synthesize new statements without an inferred flag of origin.
-# The 4-tuple form takes an explicit flag and is used by the IRCode ingestion
-# site (and by structurizer-internal sites that *relocate* an existing stmt and
-# want to preserve its flag).
+# Push raw tuple. The 3-tuple form defaults the flag to IR_FLAG_NULL (0), used by
+# passes that synthesize new statements without an inferred flag. The 4-tuple form
+# takes an explicit flag and is used by the IRCode ingestion site and by sites that
+# relocate an existing stmt and want to preserve its flag.
 function Base.push!(m::SSAMap, (idx, stmt, type)::Tuple{Int,Any,Any})
     push!(m, (idx, stmt, type, UInt32(0)))
 end
@@ -132,7 +131,7 @@ types(m::SSAMap) = (typ for typ in m.types)
 flags(m::SSAMap) = (f for f in m.flags)
 
 # Mutation: setindex! accepts any NamedTuple subset of (stmt, type, flag).
-# Fields not mentioned are preserved — `m[idx] = (type=Float64,)` overwrites
+# Fields not mentioned are preserved: `m[idx] = (type=Float64,)` overwrites
 # only the type, keeping stmt and flag.
 function Base.setindex!(m::SSAMap, entry::NamedTuple{names}, ssa_idx::Int) where {names}
     names ⊆ (:stmt, :type, :flag) ||
@@ -228,7 +227,7 @@ operands(t::ConditionOp) = t.args
  Abstract Control Flow Type
 =============================================================================#
 
-# operands() for ControlFlowOps — defined after the types (below)
+# operands() for ControlFlowOps is defined after the types (below).
 
 """
     ControlFlowOp
@@ -326,20 +325,19 @@ handle held across mutations always sees the current `(stmt, type, flag)`.
 Yielded by `instructions(block)` and usable as a key in `UseIndex`.
 
 Field access is Symbol-keyed: `inst[:stmt]`, `inst[:type]`, `inst[:flag]`
-read the live entry; `inst[:stmt] = …` etc. write back. The containing
-block is `inst.block`; the SSA index is `inst.ssa_idx`. The polymorphic
+read the live entry, and `inst[:stmt] = ...` etc. write back. The containing
+block is `inst.block`, the SSA index is `inst.ssa_idx`. The polymorphic
 `value_type(inst)` is a convenience for `inst[:type]` and also accepts
-non-Instruction values (`SSAValue`, `BlockArgument`, …).
+non-Instruction values (`SSAValue`, `BlockArgument`).
 
 Analogous to `Core.Compiler.Instruction` in `Compiler/src/ssair/ir.jl`,
 which is also a `(storage, key)` handle dispatching to parallel field
-vectors via `node[:stmt]` etc. — the difference being that the storage
-here is keyed by SSA index (preserved across structurization) rather
-than by dense position. Becomes stale on `delete!` of the underlying
-entry; identity (`==`, `hash`) is by `ssa_idx` only — sound because SSA
-indices are globally unique within a `StructuredIRCode` and never reused
-after `delete!` (allocated via `max_ssa_idx`, enforced by
-`validate_ssa_uniqueness`).
+vectors via `node[:stmt]` etc., except that the storage here is keyed by
+SSA index (preserved across structurization) rather than by dense position.
+Becomes stale on `delete!` of the underlying entry. Identity (`==`, `hash`)
+is by `ssa_idx` only, which is sound because SSA indices are globally unique
+within a `StructuredIRCode` and never reused after `delete!` (allocated via
+`max_ssa_idx`, enforced by `validate_ssa_uniqueness`).
 """
 struct Instruction
     ssa_idx::Int
@@ -374,7 +372,7 @@ end
     instructions(block::Block)
 
 Iterate over the instructions in a block, yielding `Instruction` objects.
-Each `Instruction` bundles the SSA index, statement, and type — users never
+Each `Instruction` bundles the SSA index, statement, and type, so users never
 need to interact with SSAMap directly.
 
 Analogous to LLVM.jl's `instructions(bb::BasicBlock)`.
@@ -600,9 +598,9 @@ mutable struct StructuredIRCode
     entry::Block
     max_ssa_idx::Int
     max_arg_idx::Int
-    # Debug info — access via source_location()
+    # Debug info, accessed via source_location().
     # debuginfo_table: the original source table (linetable or DebugInfoStream), or nothing
-    # line_map: ssa_idx → val, where val < 0 means direct reference (-val is PC or linetable idx),
+    # line_map: ssa_idx to val, where val < 0 means direct reference (-val is PC or linetable idx),
     #           val > 0 means anchor (val is another SSA idx to follow). empty!(line_map) wipes all.
     const debuginfo_table::Any
     const line_map::Dict{Int, Int}
@@ -617,8 +615,8 @@ mutable struct StructuredIRCode
 end
 
 # Minimal constructor for hand-built SCIs (tests, MWEs). Wires the parent
-# chain (entry → SCI, sub-blocks → containing block) so `root(block)`
-# walks succeed — the full `StructuredIRCode(ir::IRCode; ...)` constructor
+# chain (entry to SCI, sub-blocks to containing block) so `root(block)`
+# walks succeed. The full `StructuredIRCode(ir::IRCode; ...)` constructor
 # does the same after structurization.
 function StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx)
     sci = StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx, 0, nothing,
@@ -661,16 +659,16 @@ validates that no unstructured control flow remains.
 - `structurize`: If true (default), convert GotoNode/GotoIfNot to structured ops
 - `validate`: If true (default), throw `UnstructuredControlFlowError` if unstructured
   control flow remains after structurization
-- `promote`: If true (default), run the `LoopOp`→`WhileOp`/`ForOp` promotion post-pass.
-  Pass `false` to keep the core's generic `LoopOp` form (invariant I6).
+- `promote`: If true (default), run the `LoopOp` to `WhileOp`/`ForOp` promotion post-pass.
+  Pass `false` to keep the generic `LoopOp` form.
 """
 function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
                           promote::Bool=true)
-    # Mutate-then-lift: collapse every multi-entry CFG situation (irreducible loop
-    # headers, multi-exit loops, multi-predecessor continuations) to single-entry
-    # with edge multiplexers, then lift the resulting `MCFG` directly (block args +
-    # per-edge operands replace phi nodes) — no dense round-trip. `lift_mcfg`
-    # captures debug info from the `MBlock` codelocs and runs the structurize walk.
+    # Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
+    # loops, multi-predecessor continuations) to single-entry with edge multiplexers,
+    # then lift the resulting `MCFG` (block args + per-edge operands replace phi nodes).
+    # `lift_mcfg` captures debug info from the `MBlock` codelocs and runs the
+    # structurize walk.
     if structurize && !isempty(ir.stmts.stmt)
         return lift_mcfg(normalize_cf(ir); validate, promote)
     end
@@ -686,7 +684,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
     end
     stmts = ir.stmts.stmt
     types = ir.stmts.type
-    flags = ir.stmts.flag      # per-statement IR_FLAG_* bitmask (effects, nothrow, …)
+    flags = ir.stmts.flag      # per-statement IR_FLAG_* bitmask (effects, nothrow, etc.)
     n = length(stmts)
     @static if VERSION >= v"1.12-"
         debuginfo_table = ir.debuginfo
@@ -726,7 +724,7 @@ function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=tru
 end
 
 #=============================================================================
- source_location — resolve SSA index to inlining stack
+ source_location: resolve SSA index to inlining stack
 =============================================================================#
 
 """

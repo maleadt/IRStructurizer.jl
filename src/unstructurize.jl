@@ -1,4 +1,4 @@
-# Unstructurize: convert StructuredIRCode back to flat IRCode
+# Convert StructuredIRCode back to flat IRCode.
 #
 # Lowers nested control flow ops (IfOp, ForOp, WhileOp, LoopOp) back to
 # GotoNode/GotoIfNot/PhiNode/ReturnNode for execution via OpaqueClosure.
@@ -17,10 +17,10 @@ FlatBB() = FlatBB(Tuple{Int, Any, Any}[])
 struct LoopTarget
     header_bb::Int
     exit_bb_ref::Ref{Int}                   # set after body lowering (-1 = placeholder)
-    header_carry_phis::Vector{PhiNode}       # carry phis (excluding IV for ForOp)
+    header_carry_phis::Vector{PhiNode}      # carry phis (excluding IV for ForOp)
     iv_info::Union{Nothing, @NamedTuple{phi::PhiNode, ssa::Int, step::Any, typ::Any}}
-    exit_phis::Vector{PhiNode}               # for BreakOp (LoopOp only)
-    break_gotos::Vector{Tuple{Int, Int}}     # (bb, stmt_pos) of GotoNode(-1) placeholders
+    exit_phis::Vector{PhiNode}              # for BreakOp (LoopOp only)
+    break_gotos::Vector{Tuple{Int, Int}}    # (bb, stmt_pos) of GotoNode(-1) placeholders
 end
 
 mutable struct UnstructurizeCtx
@@ -30,7 +30,7 @@ mutable struct UnstructurizeCtx
     arg_rename::Dict{Int, Int}               # BlockArgument.id → sparse SSA of phi
     cfop_results::Dict{Int, Vector{Int}}     # cfop old SSA → result phi sparse SSAs
     loop_stack::Vector{LoopTarget}
-    # Debug info: maps sparse SSA → anchor (same semantics as StructurizeCtx.line_map)
+    # maps sparse SSA → debug-info anchor (same semantics as StructurizeCtx.line_map)
     line_map::Dict{Int, Int}
 end
 
@@ -61,7 +61,7 @@ function emit!(ctx::UnstructurizeCtx, bb::Int, @nospecialize(stmt), @nospecializ
 end
 
 #=============================================================================
- Value Resolution (structured IR values → sparse SSA)
+ Value Resolution (structured IR values to sparse SSA)
 =============================================================================#
 
 function resolve_value(ctx::UnstructurizeCtx, @nospecialize(val))
@@ -100,14 +100,13 @@ function emit_resolved!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int,
     resolved = resolve_stmt(ctx, stmt)
     sparse = emit!(ctx, bb, resolved, typ)
     ctx.ssa_rename[old_ssa] = sparse
-    # Propagate debug info: old_ssa → sparse
     propagate_line!(ctx, sparse, old_ssa)
     return sparse
 end
 
-# Propagate/anchor line info between structured IR SSA indices and sparse SSAs.
-# Resolve to the final negative value immediately to avoid cycles (sparse SSA
-# indices can overlap with old structured SSA indices in the same line_map).
+# Anchor line info from a structured IR SSA index onto a sparse SSA. Resolve to
+# the final negative value immediately to avoid cycles: sparse SSA indices can
+# overlap with old structured SSA indices in the same line_map.
 function propagate_line!(ctx::UnstructurizeCtx, sparse_ssa::Int, old_ssa::Int)
     val = resolve_line(ctx.line_map, old_ssa)
     val !== nothing && (ctx.line_map[sparse_ssa] = -val)
@@ -184,29 +183,28 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
                      op::IfOp, @nospecialize(cfop_typ))
     cond = resolve_value(ctx, op.condition)
 
-    # Emit GotoIfNot with placeholder dest (fixed after then-region)
+    # GotoIfNot with placeholder dest, fixed up after the then-region
     branch_ssa = emit!(ctx, bb, GotoIfNot(cond, -1), Any)
     anchor_sparse_line!(ctx, branch_ssa, cfop_idx)
     branch_pos = length(ctx.bbs[bb].stmts)
 
-    # then_bb is next in sequence → correct fallthrough for GotoIfNot
+    # then_bb is next in sequence, the fallthrough taken when cond is true
     then_bb = new_bb!(ctx)
     then_last = lower_block_body!(ctx, then_bb, op.then_region)
     then_term = op.then_region.terminator
 
-    # Create else_bb and fix placeholder
     else_bb = new_bb!(ctx)
     fix_branch_dest!(ctx, bb, branch_pos, cond, else_bb)
 
     else_last = lower_block_body!(ctx, else_bb, op.else_region)
     else_term = op.else_region.terminator
 
-    # Check which branches yield (vs return/continue/break)
+    # which branches yield, vs return/continue/break
     then_yields = then_term isa YieldOp
     else_yields = else_term isa YieldOp
 
     if then_yields || else_yields
-        # At least one branch yields → need merge block
+        # at least one branch yields, so a merge block is needed
         merge_bb = new_bb!(ctx)
 
         if then_yields
@@ -220,7 +218,7 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
             lower_diverging_terminator!(ctx, else_last, else_term)
         end
 
-        # Create merge PhiNodes
+        # build the merge PhiNodes
         phi_ssas = Int[]
         then_vals = then_yields ? then_term.values : nothing
         else_vals = else_yields ? else_term.values : nothing
@@ -247,11 +245,11 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         ctx.cfop_results[cfop_idx] = phi_ssas
         return merge_bb
     else
-        # Both branches diverge (return/continue/break)
+        # both branches diverge (return/continue/break)
         lower_diverging_terminator!(ctx, then_last, then_term)
         lower_diverging_terminator!(ctx, else_last, else_term)
         ctx.cfop_results[cfop_idx] = Int[]
-        # Unreachable merge block for any code that follows the IfOp
+        # unreachable merge block for any code that follows the IfOp
         return new_bb!(ctx)
     end
 end
@@ -283,7 +281,7 @@ function lower_diverging_terminator!(ctx::UnstructurizeCtx, bb::Int,
     elseif term isa BreakOp
         handle_break!(ctx, bb, term)
     elseif term === nothing
-        # unreachable block — do nothing
+        # unreachable block, nothing to emit
     else
         error("Unexpected diverging terminator: $(typeof(term))")
     end
@@ -303,7 +301,7 @@ function handle_continue!(ctx::UnstructurizeCtx, bb::Int, term::ContinueOp)
         push_phi_value!(iv.phi, bb, SSAValue(iv_next))
     end
 
-    # Add carry values to header phis
+    # add carry values to the header phis
     for (i, phi) in enumerate(lt.header_carry_phis)
         val = resolve_value(ctx, term.values[i])
         push_phi_value!(phi, bb, val)
@@ -316,13 +314,13 @@ function handle_break!(ctx::UnstructurizeCtx, bb::Int, term::BreakOp)
     @assert !isempty(ctx.loop_stack) "BreakOp outside loop"
     lt = ctx.loop_stack[end]
 
-    # Add values to exit phis
+    # add values to the exit phis
     for (i, phi) in enumerate(lt.exit_phis)
         val = resolve_value(ctx, term.values[i])
         push_phi_value!(phi, bb, val)
     end
 
-    # Emit placeholder GotoNode (exit_bb not yet known)
+    # placeholder GotoNode; exit_bb is not known until the loop is fully lowered
     pos = length(ctx.bbs[bb].stmts) + 1
     emit!(ctx, bb, GotoNode(-1), Any)
     push!(lt.break_gotos, (bb, pos))
@@ -341,7 +339,7 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     header_bb = new_bb!(ctx)
     emit!(ctx, bb, GotoNode(header_bb), Any)
 
-    # Header PhiNodes: IV + carries
+    # header PhiNodes: induction variable plus carries
     iv_phi = PhiNode(Int32[bb], Any[lower])
     iv_phi_ssa = emit!(ctx, header_bb, iv_phi, op.iv_arg.type)
     ctx.arg_rename[op.iv_arg.id] = iv_phi_ssa
@@ -358,7 +356,7 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         push!(carry_phi_ssas, phi_ssa)
     end
 
-    # Condition: slt_int(iv, upper)
+    # loop condition: slt_int(iv, upper)
     cond_ssa = emit!(ctx, header_bb,
         Expr(:call, GlobalRef(Core.Intrinsics, :slt_int),
              SSAValue(iv_phi_ssa), upper),
@@ -368,10 +366,9 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     emit!(ctx, header_bb, GotoIfNot(SSAValue(cond_ssa), -1), Any)
     branch_pos = length(ctx.bbs[header_bb].stmts)
 
-    # body_bb: next in sequence (fallthrough)
+    # body_bb is next in sequence, the fallthrough
     body_bb = new_bb!(ctx)
 
-    # Set up loop target
     iv_info = (; phi=iv_phi, ssa=iv_phi_ssa, step=step, typ=op.iv_arg.type)
     lt = LoopTarget(header_bb, Ref(-1), carry_phis, iv_info, PhiNode[],
                     Tuple{Int,Int}[])
@@ -379,7 +376,6 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
 
     body_last = lower_block_body!(ctx, body_bb, op.body)
 
-    # Handle body terminator
     body_term = op.body.terminator
     if body_term isa ContinueOp
         handle_continue!(ctx, body_last, body_term)
@@ -389,7 +385,6 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
 
     pop!(ctx.loop_stack)
 
-    # Create exit_bb and fix placeholder
     exit_bb = new_bb!(ctx)
     fix_branch_dest!(ctx, header_bb, branch_pos, SSAValue(cond_ssa), exit_bb)
 
@@ -406,7 +401,7 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     header_bb = new_bb!(ctx)
     emit!(ctx, bb, GotoNode(header_bb), Any)
 
-    # Header PhiNodes for carries
+    # header PhiNodes for carries
     carry_phis = PhiNode[]
     carry_phi_ssas = Int[]
     for (i, init_val) in enumerate(op.init_values)
@@ -423,10 +418,10 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         push!(carry_phi_ssas, phi_ssa)
     end
 
-    # Lower before-region body (condition computation)
+    # lower the before-region body (condition computation)
     header_last = lower_block_body!(ctx, header_bb, op.before)
 
-    # ConditionOp → GotoIfNot
+    # ConditionOp becomes GotoIfNot
     cond_term = op.before.terminator::ConditionOp
     cond = resolve_value(ctx, cond_term.condition)
 
@@ -434,13 +429,12 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     emit!(ctx, header_last, GotoIfNot(cond, -1), Any)
     branch_pos = length(ctx.bbs[header_last].stmts)
 
-    # after_bb: next in sequence (fallthrough when cond is true)
+    # after_bb is next in sequence, the fallthrough taken when cond is true
     after_bb = new_bb!(ctx)
 
-    # Lower after-region body
     after_last = lower_block_body!(ctx, after_bb, op.after)
 
-    # YieldOp → back-edge to header
+    # YieldOp becomes the back-edge to the header
     yield_term = op.after.terminator::YieldOp
     for (i, phi) in enumerate(carry_phis)
         val = resolve_value(ctx, yield_term.values[i])
@@ -448,7 +442,6 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     end
     emit!(ctx, after_last, GotoNode(header_bb), Any)
 
-    # Create exit_bb and fix placeholder
     exit_bb = new_bb!(ctx)
     fix_branch_dest!(ctx, header_last, branch_pos, cond, exit_bb)
 
@@ -465,7 +458,7 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     header_bb = new_bb!(ctx)
     emit!(ctx, bb, GotoNode(header_bb), Any)
 
-    # Header PhiNodes for carries
+    # header PhiNodes for carries
     carry_phis = PhiNode[]
     carry_phi_ssas = Int[]
     for (i, init_val) in enumerate(op.init_values)
@@ -478,9 +471,8 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         push!(carry_phi_ssas, phi_ssa)
     end
 
-    # Pre-create exit phis (BreakOps add edges during body lowering)
-    n_results = length(extract_tuple_types(cfop_typ, 0))
-    # Use cfop_typ to determine result count
+    # pre-create exit phis (BreakOps add edges during body lowering); the result
+    # count comes from cfop_typ
     result_types = extract_tuple_types(cfop_typ,
         cfop_typ isa DataType && cfop_typ <: Tuple ? length(cfop_typ.parameters) : 0)
     exit_phis = PhiNode[PhiNode(Int32[], Any[]) for _ in result_types]
@@ -489,10 +481,9 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
                     Tuple{Int,Int}[])
     push!(ctx.loop_stack, lt)
 
-    # Lower body into header_bb
+    # lower the body into header_bb
     body_last = lower_block_body!(ctx, header_bb, op.body)
 
-    # Handle body terminator
     body_term = op.body.terminator
     if body_term !== nothing
         lower_diverging_terminator!(ctx, body_last, body_term)
@@ -500,7 +491,7 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
 
     pop!(ctx.loop_stack)
 
-    # Create exit_bb, emit exit phis, fix break placeholders
+    # create exit_bb, emit exit phis, fix break placeholders
     exit_bb = new_bb!(ctx)
     lt.exit_bb_ref[] = exit_bb
 
@@ -510,7 +501,6 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         push!(exit_phi_ssas, ssa)
     end
 
-    # Fix break goto placeholders
     for (b, pos) in lt.break_gotos
         old = ctx.bbs[b].stmts[pos]
         ctx.bbs[b].stmts[pos] = (old[1], GotoNode(exit_bb), old[3])
@@ -521,18 +511,18 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
 end
 
 #=============================================================================
- Assembly: flatten BBs → IRCode
+ Assembly: flatten BBs into IRCode
 =============================================================================#
 
 function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
-    # Ensure all BBs have at least one statement
+    # ensure every BB has at least one statement
     for i in 1:length(ctx.bbs)
         if isempty(ctx.bbs[i].stmts)
             emit!(ctx, i, nothing, Nothing)
         end
     end
 
-    # Build sparse_ssa → final_position mapping
+    # map each sparse SSA to its final contiguous position
     sparse_to_final = Dict{Int, Int}()
     pos = 0
     for bb in ctx.bbs
@@ -543,7 +533,6 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
     end
     n = pos
 
-    # Value remapping: sparse SSA → final contiguous index
     function remap_val(@nospecialize(val))
         if val isa SSAValue
             return SSAValue(sparse_to_final[val.id])
@@ -552,8 +541,8 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
         end
     end
 
-    # Build flat statement/type arrays (BB indices in Goto*/Phi edges are
-    # unchanged; `remap_ssa` only rewrites value operands via `remap_val`).
+    # Build flat statement/type arrays. BB indices in Goto*/Phi edges are
+    # unchanged; remap_ssa only rewrites value operands via remap_val.
     all_stmts = Vector{Any}(undef, n)
     all_types = Vector{Any}(undef, n)
     pos = 0
@@ -565,7 +554,7 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
         end
     end
 
-    # Debug info: fill `line` from the per-statement line_map.
+    # debug info: fill `line` from the per-statement line_map
     @static if VERSION >= v"1.12-"
         line = fill(Int32(0), n * 3)
         if sci.debuginfo_table !== nothing
@@ -597,7 +586,7 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
         end
     end
 
-    # Per-block statement ranges (every BB has ≥1 stmt; ensured above).
+    # per-block statement ranges (every BB has >=1 stmt, ensured above)
     bb_ranges = UnitRange{Int}[]
     offset = 0
     for bb in ctx.bbs
@@ -622,9 +611,7 @@ end
 
 Assemble a dense `IRCode` from flat statement arrays plus per-block statement
 ranges. Builds the CFG (preds/succs from each block's last statement), the
-`InstructionStream`, and the debug info, then constructs the `IRCode`. Used by
-`assemble_ircode` — the SCI → IRCode output boundary (the test-only roundtrip
-oracle; cuTile consumes the `StructuredIRCode` directly).
+`InstructionStream`, and the debug info, then constructs the `IRCode`.
 """
 function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
                             argtypes, sptypes, debuginfo)
@@ -685,7 +672,6 @@ function CC.IRCode(sci::StructuredIRCode)
     bb = new_bb!(ctx)
     bb = lower_block_body!(ctx, bb, sci.entry)
 
-    # Handle entry block terminator
     term = sci.entry.terminator
     if term isa ReturnNode
         emit!(ctx, bb, resolve_stmt(ctx, term), Any)

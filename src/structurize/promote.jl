@@ -1,25 +1,25 @@
-# Loop promotion post-pass: LoopOp → WhileOp → ForOp
+# Loop promotion post-pass: LoopOp to WhileOp to ForOp.
 #
-# After the core structurizer produces LoopOps (with ContinueOp/BreakOp),
-# this pass recognizes higher-level patterns and promotes them:
-#   1. LoopOp with iteration protocol exit → ForOp (direct, via simplify+detect)
-#   2. LoopOp with condition-at-top → WhileOp (before/after regions)
-#   3. WhileOp with counting pattern → ForOp (lower/upper/step/iv)
+# The core structurizer produces LoopOps (with ContinueOp/BreakOp). This pass
+# recognizes higher-level patterns and promotes them:
+#   1. LoopOp with iteration protocol exit to ForOp (direct, via simplify+detect)
+#   2. LoopOp with condition-at-top to WhileOp (before/after regions)
+#   3. WhileOp with counting pattern to ForOp (lower/upper/step/iv)
 #
-# Each promotion step remaps block arguments so each region owns its own
-# arg namespace (MLIR's region ownership principle).
+# Each promotion step remaps block arguments so each region owns its own arg
+# namespace (MLIR's region ownership principle).
 
 #=============================================================================
  Top-Level Promotion Pass
 =============================================================================#
 
 """Count `BreakOp` terminators reachable inside this loop body, descending into
-`IfOp` arms but NOT into nested loops (whose breaks are their own). A counted/
-condition loop has exactly one — its iteration-exit break; a second one is a
-*secondary* dynamic exit (an early `break`/`return` reached mid-body) that `ForOp`/
-`WhileOp` cannot represent (their iteration is fixed), so such a loop must stay a
-`LoopOp`. Promoting it produced a `ForOp` body with a stray `BreakOp` whose exit
-placeholder leaked at unstructurize — a crash; this guard prevents it."""
+`IfOp` arms but not into nested loops (whose breaks are their own). A counted or
+condition loop has exactly one, its iteration-exit break. A second one is a
+secondary dynamic exit (an early `break`/`return` reached mid-body) that `ForOp`
+and `WhileOp` cannot represent, since their iteration is fixed, so such a loop must
+stay a `LoopOp`. Promoting it would build a `ForOp` body with a stray `BreakOp`
+whose exit placeholder leaks at unstructurize, a crash this guard prevents."""
 function count_breaks(block::Block)
     n = block.terminator isa BreakOp ? 1 : 0
     for (_, e) in block.body
@@ -35,7 +35,7 @@ where the pattern matches.
 """
 function promote_loops!(block::Block, ctx::StructurizeCtx)
     new_body = SSAMap()
-    # Track ForOp promotions: loop_ssa_idx → (removed_positions, ForOp, carry_redirect)
+    # Track ForOp promotions: loop_ssa_idx => (removed_positions, ForOp, carry_redirect)
     for_promotions = Dict{Int, Tuple{Vector{Int}, ForOp, Dict{Int,Int}}}()
 
     for (idx, entry) in block.body
@@ -46,26 +46,26 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             promote_loops!(stmt.body, ctx)
             push!(new_body, (idx, stmt, entry.type, entry.flag))
         elseif stmt isa LoopOp
-            # Recursively promote inner loops first
+            # Promote inner loops first.
             promote_loops!(stmt.body, ctx)
-            # Try direct LoopOp → ForOp (handles iteration protocol patterns)
+            # Try direct LoopOp to ForOp (iteration protocol patterns).
             result, removed, redirect = try_promote_for_from_loop(stmt, idx, block, new_body, ctx)
             if result isa ForOp
                 for_promotions[idx] = (removed, result, redirect)
                 carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed]
                 push!(new_body, (idx, result, Tuple{carry_types...}, entry.flag))
             else
-                # Fall back to existing path: LoopOp → WhileOp → ForOp
+                # Fall back to LoopOp to WhileOp to ForOp.
                 promoted = try_promote_while(stmt, ctx)
                 if promoted !== nothing
                     result2, removed2 = try_promote_for(promoted, idx, block, new_body, ctx)
                     if result2 isa ForOp
                         if isempty(removed2)
-                            # The escaping IV is kept as an ordinary carry, so the
-                            # arity and order are unchanged and post-loop getfields
-                            # read it directly. No for_promotions entry, no getfield
-                            # rewrite. Carried-value semantics give the empty-loop
-                            # case its init, which is the value we want there.
+                            # The escaping IV is kept as an ordinary carry, so arity
+                            # and order are unchanged and post-loop getfields read it
+                            # directly: no for_promotions entry, no getfield rewrite.
+                            # Carried-value semantics give the empty-loop case its
+                            # init, the value we want there.
                             push!(new_body, (idx, result2, entry.type, entry.flag))
                         else
                             for_promotions[idx] = (removed2, result2, Dict{Int,Int}())
@@ -81,14 +81,15 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             end
         elseif stmt isa Expr && stmt.head === :call && stmt.args[1] === Core.getfield &&
                stmt.args[2] isa SSAValue && haskey(for_promotions, stmt.args[2].id)
-            # Fix getfield for ForOp: removed positions → upper bound or redirect, others → adjusted index
+            # Fix getfield for ForOp: removed positions to upper bound or redirect,
+            # others to adjusted index.
             loop_ssa = stmt.args[2].id
             field_idx = stmt.args[3]::Int
             removed, for_op, redirect = for_promotions[loop_ssa]
             if field_idx ∈ removed
                 target_pos = get(redirect, field_idx, 0)
                 if target_pos > 0
-                    # Duplicate carry → redirect to surviving carry's adjusted index
+                    # Duplicate carry: redirect to surviving carry's adjusted index.
                     adjusted = target_pos - count(p -> p < target_pos, removed)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                     push!(new_body, (idx, new_gf, entry.type, entry.flag))
@@ -118,12 +119,12 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
 end
 
 #=============================================================================
- LoopOp → ForOp (direct, for iteration protocol patterns)
+ LoopOp to ForOp (direct, for iteration protocol patterns)
 =============================================================================#
 
 """
 Simplify a LoopOp body that has the iteration protocol exit pattern:
-  inner_if(cond) → done-flag → getfields → not_int → outer_if(continue/break)
+  inner_if(cond), done-flag, getfields, not_int, outer_if(continue/break)
 into a single IfOp:
   if(cond) { break } else { body; continue }
 Returns a new Block with the simplified body, or nothing if the pattern doesn't match.
@@ -172,13 +173,13 @@ function simplify_loop_exit(body::Block)
     inner_result isa SSAValue || return nothing
     flag_pos = flag_stmt.args[3]::Int
 
-    # inner_result should be an IfOp in the body
+    # inner_result should be an IfOp in the body.
     inner_entry = get(body.body, inner_result.id, nothing)
     inner_entry === nothing && return nothing
     inner = inner_entry.stmt
     inner isa IfOp || return nothing
 
-    # Verify: inner yield[flag_pos] is boolean constant in both branches
+    # Verify inner yield[flag_pos] is a boolean constant in both branches.
     inner.then_region.terminator isa YieldOp || return nothing
     inner.else_region.terminator isa YieldOp || return nothing
     then_yield = inner.then_region.terminator::YieldOp
@@ -188,15 +189,15 @@ function simplify_loop_exit(body::Block)
     else_flag = else_yield.values[flag_pos]
     (then_flag isa Bool && else_flag isa Bool && then_flag != else_flag) || return nothing
 
-    # Determine which inner branch is "done" (flag=true) and which is "not done"
+    # Determine which inner branch is "done" (flag=true) and which is "not done".
     done_yield = then_flag ? then_yield : else_yield
     cont_yield = then_flag ? else_yield : then_yield
     done_body_region = then_flag ? inner.then_region : inner.else_region
     cont_body_region = then_flag ? inner.else_region : inner.then_region
 
-    # Determine which outer branch is "continue" and which is "break"
-    # inverted=false: outer condition = flag, so true=done → break
-    # inverted=true:  outer condition = not_int(flag), so true=not_done → continue
+    # Determine which outer branch is "continue" and which is "break".
+    # inverted=false: outer condition = flag, so true=done means break.
+    # inverted=true:  outer condition = not_int(flag), so true=not_done means continue.
     if inverted
         cont_term = then_t
         break_term = else_t
@@ -206,7 +207,7 @@ function simplify_loop_exit(body::Block)
     end
     cont_term isa ContinueOp || return nothing
 
-    # Build getfield→inner_yield substitution maps
+    # Build getfield-to-inner_yield substitution maps.
     cont_subs = Dict{Int, Any}()
     break_subs = Dict{Int, Any}()
     for (sidx, sentry) in body.body
@@ -224,7 +225,7 @@ function simplify_loop_exit(body::Block)
     cont_values = IRValue[subst_val(v, cont_subs) for v in cont_term.values]
     break_values = IRValue[subst_val(v, break_subs) for v in break_term.values]
 
-    # Build merged IfOp: inner condition true → done → break, false → continue
+    # Build merged IfOp: inner condition true means done means break, false means continue.
     merged_then = Block()
     for (sidx, sentry) in done_body_region.body
         push!(merged_then.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
@@ -304,8 +305,8 @@ function _refs_ssa(@nospecialize(val), ssa::SSAValue)
     return false
 end
 
-"""Deep `_refs_ssa`: also recurses into nested control-flow regions and a
-`Block`, so a use buried in a nested IfOp/loop body still counts."""
+"""Deep `_refs_ssa` that also recurses into nested control-flow regions and a
+`Block`, so a use buried in a nested IfOp or loop body still counts."""
 function _refs_ssa_deep(@nospecialize(val), ssa::SSAValue)
     if val isa IfOp
         return _refs_ssa(val.condition, ssa) ||
@@ -335,11 +336,12 @@ Returns (ForOp, removed_positions) or (loop, Int[]) if promotion fails.
 """
 function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
                                     new_body::SSAMap, ctx::StructurizeCtx)
-    # Try simplifying the exit structure (returns new Block, doesn't modify original)
+    # Simplify the exit structure (returns a new Block, original is untouched).
     body = simplify_loop_exit(loop.body)
     body === nothing && return (loop, Int[], Dict{Int,Int}())
 
-    # After simplification: body should end with IfOp(cond, break, continue) or vice versa
+    # After simplification the body should end with IfOp(cond, break, continue)
+    # or vice versa.
     isempty(body.body) && return (loop, Int[], Dict{Int,Int}())
     last_stmt = body.body.stmts[end]
     last_stmt isa IfOp || return (loop, Int[], Dict{Int,Int}())
@@ -348,7 +350,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     then_t = if_op.then_region.terminator
     else_t = if_op.else_region.terminator
 
-    # Determine break/continue branches (either polarity)
+    # Determine break/continue branches (either polarity).
     if then_t isa BreakOp && else_t isa ContinueOp
         break_op, continue_op = then_t, else_t
         cont_region = if_op.else_region
@@ -359,7 +361,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         return (loop, Int[], Dict{Int,Int}())
     end
 
-    # Condition must be a comparison: ===, slt_int, sle_int on block_arg vs bound
+    # Condition must be a comparison (===, slt_int, sle_int) on block_arg vs bound.
     cond_val = if_op.condition
     cond_val isa SSAValue || return (loop, Int[], Dict{Int,Int}())
     cond_entry = get(body.body, cond_val.id, nothing)
@@ -373,7 +375,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     bound = cond_expr.args[3]
 
     # Only handle === with break-on-true (the iteration protocol pattern).
-    # slt_int/sle_int patterns are handled by the WhileOp→ForOp path.
+    # slt_int/sle_int patterns are handled by the WhileOp-to-ForOp path.
     is_eq = (func isa GlobalRef && func.name === :(===)) || func === :(===)
     (is_eq && then_t isa BreakOp) || return (loop, Int[], Dict{Int,Int}())
 
@@ -381,7 +383,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     iv_pos = findfirst(a -> a.id == iv_candidate.id, body.args)
     iv_pos === nothing && return (loop, Int[], Dict{Int,Int}())
 
-    # Find step: add_int(iv_arg, step) in the continue branch at iv_pos
+    # Find step: add_int(iv_arg, step) in the continue branch at iv_pos.
     iv_pos <= length(continue_op.values) || return (loop, Int[], Dict{Int,Int}())
     step_val = continue_op.values[iv_pos]
     step = nothing
@@ -402,10 +404,10 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
     step === nothing && return (loop, Int[], Dict{Int,Int}())
 
-    # ForOp requires positive step (ascending loops only)
+    # ForOp requires positive step (ascending loops only).
     step isa Integer && step < 0 && return (loop, Int[], Dict{Int,Int}())
 
-    # Step and bound must be loop-invariant
+    # Step and bound must be loop-invariant.
     if step isa SSAValue && haskey(body.body, step.id)
         return (loop, Int[], Dict{Int,Int}())
     end
@@ -414,7 +416,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
 
     # Shadow IV detection: other args whose continue value is the same SSA as
-    # the IV's continue value (they track the same induction variable)
+    # the IV's continue value (they track the same induction variable).
     removed = Int[iv_pos]
     for (i, arg) in enumerate(body.args)
         i == iv_pos && continue
@@ -426,8 +428,8 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     # Duplicate carry detection: among non-removed positions, find args with
     # identical continue values. Remove the Undef-initialized duplicate and
     # redirect its getfield to the real carry.
-    carry_redirect = Dict{Int, Int}()  # removed_pos → surviving_pos
-    seen_continues = Dict{Any, Int}()  # continue_value → first non-removed pos
+    carry_redirect = Dict{Int, Int}()  # removed_pos => surviving_pos
+    seen_continues = Dict{Any, Int}()  # continue_value => first non-removed pos
     for i in 1:length(body.args)
         i ∈ removed && continue
         i <= length(continue_op.values) || continue
@@ -450,8 +452,8 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 
     # Safety: for non-removed positions where break != continue,
     # verify no getfield at that position is actually used in the parent block.
-    # Pre-scan parent block once to map getfield positions → SSA indices.
-    gf_ssa_for_pos = Dict{Int, Int}()  # loop result position → getfield SSA idx
+    # Pre-scan parent block once to map getfield positions to SSA indices.
+    gf_ssa_for_pos = Dict{Int, Int}()  # loop result position => getfield SSA idx
     for (pidx, pentry) in parent_block.body
         s = pentry.stmt
         s isa Expr || continue
@@ -469,22 +471,22 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
 
     # Partition `removed` by whether each position escapes. A removed position (the
-    # IV or one of its value#1 shadows) would otherwise be aliased to `upper`
-    # post-loop, which is wrong for an empty loop whose final IV is the init. So any
-    # escaping position becomes a real kept carry (read back normally) and the rest
-    # stay removed (their `upper` alias is then provably dead). A duplicate-carry
-    # redirect stays removed; an Undef-init dup is folded into its survivor, not a
-    # value that escapes on its own.
+    # IV or one of its shadows) would otherwise be aliased to `upper` post-loop, which
+    # is wrong for an empty loop whose final IV is the init. So any escaping position
+    # becomes a real kept carry (read back normally) and the rest stay removed (their
+    # `upper` alias is then provably dead). A duplicate-carry redirect stays removed;
+    # an Undef-init dup is folded into its survivor, not a value that escapes on its own.
     kept = Int[]
     for r in removed
         haskey(carry_redirect, r) && continue
         loop_result_pos_escapes(idx, r, parent_block) && push!(kept, r)
     end
-    removed = setdiff(removed, kept)   # run before any count(p<…, removed)/carry_types
+    # Drop kept positions from `removed` before any index adjustment below reads it.
+    removed = setdiff(removed, kept)
 
-    # --- Build ForOp ---
+    # Build ForOp.
     lower = loop.init_values[iv_pos]
-    # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step
+    # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step.
     adj_ssa = alloc_ssa!(ctx)
     anchor_line!(ctx, adj_ssa, cond_val.id)
     upper_type = iv_candidate.type
@@ -496,7 +498,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     for_body = Block()
     arg_remap = Dict{Int, BlockArgument}()
 
-    # Map (still-)removed IV / shadow IVs to ForOp's iv_arg (skip duplicate carries)
+    # Map (still-)removed IV / shadow IVs to ForOp's iv_arg (skip duplicate carries).
     for r in removed
         haskey(carry_redirect, r) && continue
         arg_remap[body.args[r].id] = iv_arg
@@ -517,7 +519,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         push!(non_iv_inits, loop.init_values[i])
     end
 
-    # Map duplicate carries to their surviving equivalent's BlockArgument
+    # Map duplicate carries to their surviving equivalent's BlockArgument.
     for (dup_pos, surv_pos) in carry_redirect
         arg_remap[body.args[dup_pos].id] = arg_remap[body.args[surv_pos].id]
     end
@@ -526,9 +528,9 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     # lifted continue. The iterate protocol advances the state before re-checking, so
     # the lifted continue is the advanced value `iv+step`, which equals `upper` (the
     # post-loop bound). Carrying `iv_arg` makes the kept carry's last value the last
-    # in-body IV (`upper - step`), matching the LoopOp's break, which is the
-    # pre-advance current value. The empty range is guarded by the outer `if`, so the
-    # init is read only when the loop ran.
+    # in-body IV (`upper - step`), matching the LoopOp's break, the pre-advance current
+    # value. The empty range is guarded by the outer `if`, so the init is read only
+    # when the loop ran.
     cont_values = IRValue[]
     for (i, v) in enumerate(continue_op.values)
         i ∈ removed && continue
@@ -559,7 +561,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         end
     end
 
-    # Body: stmts before the exit IfOp + continue branch stmts (minus dead increment)
+    # Body: stmts before the exit IfOp plus continue branch stmts (minus dead increment).
     for (sidx, sentry) in body.body
         sidx == last_idx && break
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
@@ -578,7 +580,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 end
 
 #=============================================================================
- LoopOp → WhileOp
+ LoopOp to WhileOp
 =============================================================================#
 
 """
@@ -587,7 +589,7 @@ Try to promote a LoopOp to WhileOp if the body has the form:
 """
 function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     body = loop.body
-    # The body should end with an IfOp (the last stmt)
+    # The body should end with an IfOp (the last stmt).
     isempty(body.body) && return nothing
 
     last_idx = body.body.ssa_idxes[end]
@@ -596,7 +598,7 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
 
     if_op = last_stmt
 
-    # Determine which branch continues and which breaks
+    # Determine which branch continues and which breaks.
     then_term = if_op.then_region.terminator
     else_term = if_op.else_region.terminator
 
@@ -613,27 +615,27 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     stay_region = is_then_continue ? if_op.then_region : if_op.else_region
     exit_region = is_then_continue ? if_op.else_region : if_op.then_region
 
-    # Only promote when cond=true → stay (standard while pattern).
-    # Inverted patterns (cond=true → break) would require condition negation.
+    # Only promote when cond=true means stay (the standard while pattern).
+    # Inverted patterns (cond=true means break) would require condition negation.
     if is_else_continue
         return nothing
     end
 
-    # Standard pattern: cond=true → continue, cond=false → break
+    # Standard pattern: cond=true means continue, cond=false means break.
     continue_op = stay_region.terminator::ContinueOp
 
     # Guard: ContinueOp values must only reference block args or values defined
     # in the stay region. If they reference header SSAs (which go into `before`),
-    # the WhileOp's `after` region can't see them — keep as LoopOp.
+    # the WhileOp's `after` region can't see them, so keep as LoopOp.
     for val in continue_op.values
         if val isa SSAValue && !haskey(stay_region.body, val.id)
             return nothing
         end
     end
 
-    # Before region: header stmts (everything before the IfOp)
+    # Before region: header stmts (everything before the IfOp).
     before = Block()
-    for (i, (sidx, sentry)) in enumerate(body.body)
+    for (sidx, sentry) in body.body
         sidx == last_idx && break
         push!(before.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
@@ -641,11 +643,11 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
         push!(before.args, arg)
     end
 
-    # ConditionOp args = before block args (passed to after region when cond is true)
+    # ConditionOp args = before block args, passed to the after region when cond is true.
     cond_args = IRValue[arg for arg in before.args]
     before.terminator = ConditionOp(cond, cond_args)
 
-    # After region: stay_region body + YieldOp with carried values (back to before)
+    # After region: stay_region body plus YieldOp with carried values (back to before).
     after = Block()
     arg_remap = Dict{Int, BlockArgument}()
     for arg in body.args
@@ -658,15 +660,15 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
     end
     after.terminator = YieldOp(copy(continue_op.values))
 
-    # Remap before-region block arg references to after-region block args.
-    # Each region must reference its own args (MLIR's ownership principle).
+    # Remap before-region block arg references to after-region block args, so each
+    # region references its own args (MLIR's ownership principle).
     remap_block_args!(after, arg_remap)
 
     return WhileOp(before, after, loop.init_values)
 end
 
 #=============================================================================
- WhileOp → ForOp
+ WhileOp to ForOp
 =============================================================================#
 
 """
@@ -684,12 +686,12 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
                           ctx::StructurizeCtx)
     op isa WhileOp || return (op, Int[])
 
-    # Look for: condition is slt_int/sle_int on a block arg vs loop-invariant bound
+    # Look for a condition that is slt_int/sle_int on a block arg vs a loop-invariant bound.
     before = op.before
     before.terminator isa ConditionOp || return (op, Int[])
     cond_op = before.terminator
 
-    # Find the condition expression
+    # Find the condition expression.
     cond_val = cond_op.condition
     cond_val isa SSAValue || return (op, Int[])
     cond_entry = get(before.body, cond_val.id, nothing)
@@ -702,15 +704,16 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     iv_candidate = cond_expr.args[2]
     bound = cond_expr.args[3]
 
-    # Check condition function (=== is not a counting pattern; handled by Path A)
+    # Check condition function. `===` is not a counting pattern (try_promote_for_from_loop
+    # handles it).
     is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
     is_sle = func isa GlobalRef && func.name === :sle_int
     (is_slt || is_sle) || return (op, Int[])
 
-    # IV must be a block argument
+    # IV must be a block argument.
     iv_candidate isa BlockArgument || return (op, Int[])
 
-    # Find IV's position in args
+    # Find IV's position in args.
     iv_pos = findfirst(a -> a.id == iv_candidate.id, before.args)
     iv_pos === nothing && return (op, Int[])
 
@@ -720,7 +723,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # cases. If the IV does not escape, drop it; it is redundant with the range.
     keep_iv = loop_result_pos_escapes(idx, iv_pos, parent_block)
 
-    # Find step: look in the after region for add_int(iv_arg, step)
+    # Find step: look in the after region for add_int(iv_arg, step).
     after = op.after
     iv_pos <= length(after.args) || return (op, Int[])
     after_iv_arg = after.args[iv_pos]
@@ -747,25 +750,25 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     end
     step === nothing && return (op, Int[])
 
-    # ForOp requires positive step (ascending loops only)
+    # ForOp requires positive step (ascending loops only).
     step isa Integer && step < 0 && return (op, Int[])
 
-    # Step must be loop-invariant (not defined inside the loop body)
+    # Step must be loop-invariant (not defined inside the loop body).
     if step isa SSAValue && (haskey(op.after.body, step.id) || haskey(op.before.body, step.id))
         return (op, Int[])
     end
 
-    # Bound must be loop-invariant (not a block arg of this loop)
+    # Bound must be loop-invariant (not a block arg of this loop).
     if bound isa BlockArgument && any(a -> a.id == bound.id, before.args)
         return (op, Int[])
     end
 
-    # Build ForOp
+    # Build ForOp.
     lower = op.init_values[iv_pos]
     upper = bound
     is_inclusive = is_sle
 
-    # Exclusive upper bound: add 1 if inclusive
+    # Exclusive upper bound: add 1 if inclusive.
     if is_inclusive
         adj_ssa = alloc_ssa!(ctx)
         anchor_line!(ctx, adj_ssa, cond_val.id)
@@ -786,7 +789,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
 
     iv_arg = BlockArgument(alloc_arg!(ctx), iv_candidate.type)
 
-    # Build ForOp body: copy after region, remove IV increment, remap args
+    # Build ForOp body: copy the after region, remove the IV increment, remap args.
     for_body = Block()
     arg_remap = Dict{Int, BlockArgument}()
 
@@ -795,7 +798,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         for_arg = BlockArgument(alloc_arg!(ctx), arg.type)
         push!(for_body.args, for_arg)
         arg_remap[arg.id] = for_arg
-        # Also map corresponding before arg
+        # Also map the corresponding before arg.
         if i <= length(before.args)
             arg_remap[before.args[i].id] = for_arg
         end

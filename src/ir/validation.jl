@@ -1,4 +1,4 @@
-# structured IR validation
+# Structured IR validation.
 
 export UnstructuredControlFlowError
 
@@ -126,7 +126,7 @@ function ifop_expected_yield_types(@nospecialize(result_type))
     result_type <: Tuple || return nothing
     # Reject the unparameterized `Tuple` (no per-position info) and vararg
     # tuples (arity isn't fixed). Concrete abstract-element tuples like
-    # `Tuple{Real}` are fine — their parameters are positionally indexable.
+    # `Tuple{Real}` are fine: their parameters are positionally indexable.
     result_type === Tuple && return nothing
     Base.isvatuple(result_type) && return nothing
     return result_type.parameters
@@ -137,9 +137,8 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
-    # Both regions must have explicit terminators
-    # Having `nothing` as terminator is always invalid for IfOp regions
-    # Valid terminators: YieldOp, ReturnNode, ContinueOp, BreakOp (for IfOps inside loops)
+    # Both regions must have an explicit terminator; `nothing` is always invalid.
+    # Valid terminators: YieldOp, ReturnNode, ContinueOp, BreakOp (for IfOps inside loops).
     if then_term === nothing
         push!(errors, "IfOp at %$idx: then region must have explicit terminator, got nothing")
     end
@@ -151,7 +150,7 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
     #
     # Julia's own IR verifier (Compiler/src/ssair/verify.jl) only requires that
     # each phi edge value's type be a sublattice element of the phi's declared
-    # type — it never compares edge values to each other. Branches may yield
+    # type; it never compares edge values to each other. Branches may yield
     # values whose types are disjoint (e.g. `Int` and `String` joining to
     # `Union{Int,String}`, or `Int` and `Float64` joining to `Real`); what
     # matters is that each yield conforms to the declared join.
@@ -171,7 +170,7 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
         expected = ifop_expected_yield_types(result_type)
         if expected !== nothing
             arity = min(then_arity, else_arity)
-            # Flag yield arity not matching the declared result tuple.
+            # Flag yield arity that does not match the declared result tuple.
             if then_arity == else_arity && then_arity != length(expected)
                 push!(errors, "IfOp at %$idx: yield arity ($then_arity) does not match declared result type $result_type (expected $(length(expected)))")
             end
@@ -183,17 +182,15 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
         end
     end
 
-    # Recursively validate nested ops
     validate_terminators!(errors, sci, op.then_region)
     validate_terminators!(errors, sci, op.else_region)
 end
 
 # Check a single yield value against the IfOp's declared per-position type.
-# `Undef` placeholders (used for uninitialized slots on one branch) are skipped
-# — their recorded type is already the declared slot type, so the <: check is
-# trivially satisfied, but an explicit skip keeps intent clear. `block` is the
-# yielding region, so `value_type` walks the parent chain and resolves SSAs
-# defined in the surrounding scope.
+# `Undef` placeholders (used for uninitialized slots on one branch) are skipped:
+# their recorded type is already the declared slot type, so the <: check is
+# trivially satisfied. `block` is the yielding region, so `value_type` walks the
+# parent chain and resolves SSAs defined in the surrounding scope.
 function check_yield_type!(errors::Vector{String}, block::Block,
                             @nospecialize(value), @nospecialize(expected),
                             idx::Int, pos::Int, branch::String)
@@ -211,7 +208,6 @@ function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode
         push!(errors, "ForOp at %$idx: body must have ContinueOp, got $(typeof(term))")
     end
 
-    # Recursively validate nested ops
     validate_terminators!(errors, sci, op.body)
 end
 
@@ -226,7 +222,6 @@ function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCo
         push!(errors, "WhileOp at %$idx: after region must have YieldOp, got $(typeof(after_term))")
     end
 
-    # Recursively validate nested ops
     validate_terminators!(errors, sci, op.before)
     validate_terminators!(errors, sci, op.after)
 end
@@ -235,12 +230,11 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
     n_init = length(op.init_values)
     n_args = length(op.body.args)
 
-    # init_values must match body.args
     if n_init != n_args
         push!(errors, "LoopOp at %$idx: init_values length ($n_init) != body.args length ($n_args)")
     end
 
-    # Validate all reachable ContinueOps and BreakOps match loop-carry length
+    # Every reachable ContinueOp and BreakOp must match the loop-carry length.
     for term in reachable_terminators(op.body)
         if term isa ContinueOp
             nc = length(term.values)
@@ -251,7 +245,6 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
         end
     end
 
-    # Recursively validate nested ops
     validate_terminators!(errors, sci, op.body)
 end
 
@@ -264,7 +257,7 @@ end
 
 Validate that all SSAValue references in the structured IR have definitions
 visible in their scope. Uses scope-aware checking: defs inside IfOp branches,
-LoopOp/WhileOp/ForOp bodies are NOT visible to the enclosing scope — only
+LoopOp/WhileOp/ForOp bodies are NOT visible to the enclosing scope; only
 the op's result SSA index is visible.
 
 Errors if any SSAValue is used but not defined in its scope (indicates a bug in structurization).
@@ -287,9 +280,9 @@ function is_defined_in_scope(scope_stack::Vector{Set{Int}}, id::Int)
     return false
 end
 
-# Check an SSAValue use against the scope stack, recording violations
+# Check an SSAValue use against the scope stack, recording violations.
 function check_use!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val)
-    # non-SSAValue — nothing to check
+    # non-SSAValue: nothing to check
 end
 
 function check_use!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val::SSAValue)
@@ -299,12 +292,11 @@ end
 function validate_ssa_defs_scoped!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, block::Block)
     current = scope_stack[end]
 
-    # Pre-collect all defs in this block (within a scope, order doesn't matter)
+    # Collect all defs in this block (within a scope, order doesn't matter).
     for (idx, _) in block.body
         push!(current, idx)
     end
 
-    # Now check uses
     for (_, entry) in block.body
         check_stmt_uses!(scope_stack, violations, entry.stmt)
     end
@@ -315,7 +307,7 @@ end
 # --- Statement use checking (scope-aware) ---
 
 function check_stmt_uses!(::Vector{Set{Int}}, ::Vector{Int}, stmt)
-    # Leaf types — no SSAValue references
+    # Leaf types: no SSAValue references.
 end
 
 function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, val::SSAValue)
@@ -341,12 +333,12 @@ end
 function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::IfOp)
     check_use!(scope_stack, violations, op.condition)
 
-    # Then region: new scope
+    # Then region: new scope.
     push!(scope_stack, Set{Int}())
     validate_ssa_defs_scoped!(scope_stack, violations, op.then_region)
     pop!(scope_stack)
 
-    # Else region: new scope (sibling, NOT shared with then)
+    # Else region: new scope, sibling, NOT shared with then.
     push!(scope_stack, Set{Int}())
     validate_ssa_defs_scoped!(scope_stack, violations, op.else_region)
     pop!(scope_stack)
@@ -392,7 +384,7 @@ end
 # --- Terminator use checking ---
 
 function check_terminator_uses!(::Vector{Set{Int}}, ::Vector{Int}, term)
-    # nothing terminator or unrecognized — no uses
+    # nothing terminator or unrecognized: no uses.
 end
 
 function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
@@ -419,8 +411,8 @@ check_terminator_uses!(s::Vector{Set{Int}}, v::Vector{Int}, term::ReturnNode) =
     validate_ssa_uniqueness(sci::StructuredIRCode) -> Bool
 
 Validate that no SSA index is defined in more than one block.
-Holds by construction — the structurizer allocates fresh indices for inner defs.
-Any duplicates indicate a bug in the structurizer.
+Holds by construction, since the structurizer allocates fresh indices for inner
+defs. Any duplicates indicate a bug in the structurizer.
 """
 function validate_ssa_uniqueness(sci::StructuredIRCode)
     seen = Set{Int}()

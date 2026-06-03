@@ -1,55 +1,52 @@
-# structured IR pretty printing
+# Structured IR pretty printing.
 
 function Base.show(io::IO, ::MIME"text/plain", sci::StructuredIRCode)
-    color = get(io, :color, false)::Bool
-
-    # Print header
     println(io, "StructuredIRCode(")
 
-    # Create printer with │ prefix for the entry block (2 chars, not 4)
-    # Show debug info if line_map is populated (use empty!(sci.line_map) to strip).
+    # Show debug info only when line_map is populated (empty!(sci.line_map) strips it).
     lineinfo = isempty(sci.line_map) ? nothing : LineInfoTracker(sci)
     base_p = IRPrinter(io, sci.max_ssa_idx; lineinfo)
+    # The entry block uses a "│ " prefix (2 chars, not 4).
     p = child_printer(base_p, sci.entry, "│ ")
 
-    # Print entry block body - use is_closing_self=true so the last item
-    # replaces │ with └── instead of adding └── after │
+    # is_closing_self=true makes the last item replace │ with └── rather than
+    # appending └── after │.
     print_block_body(p, sci.entry; is_closing_self=true)
 
     print(io, ")")
 end
 
-# Use detailed format for string() as well (like CodeInfo does)
+# string() uses the same detailed format, as CodeInfo does.
 function Base.show(io::IO, sci::StructuredIRCode)
     show(io, MIME"text/plain"(), sci)
 end
 
-"""
-    IRPrinter
-
-Context for printing structured IR with proper indentation and value formatting.
-Uses Julia's IRCode style with box-drawing characters.
-"""
 mutable struct LineInfoTracker
     sci::StructuredIRCode
-    last_loc::SourceLocation      # last printed location (to suppress duplicates)
+    last_loc::SourceLocation      # last printed location, to suppress duplicates
 end
 
 LineInfoTracker(sci::StructuredIRCode) =
     LineInfoTracker(sci, SourceLocation(nothing, Symbol(""), Int32(0)))
 
+"""
+    IRPrinter
+
+Context for printing structured IR with indentation and value formatting,
+following Julia's IRCode style with box-drawing characters.
+"""
 mutable struct IRPrinter
     io::IO
     indent::Int
-    line_prefix::String    # Prefix for continuation lines (│, spaces)
-    max_idx_width::Int     # Max width of "%N = " for alignment
-    color::Bool            # Whether to use colors
+    line_prefix::String    # prefix for continuation lines (│, spaces)
+    max_idx_width::Int     # width of "%N = " for alignment
+    color::Bool
     lineinfo::Union{Nothing, LineInfoTracker}
 end
 
 function IRPrinter(io::IO, max_ssa_idx::Int; lineinfo=nothing)
-    # Compute max index width for alignment: "%N = " where N is the max index
-    max_idx_width = ndigits(max_ssa_idx) + 4  # % + digits + space + = + space
+    # Width of "%N = " for the widest index: % + digits + space + = + space.
+    max_idx_width = ndigits(max_ssa_idx) + 4
     color = get(io, :color, false)::Bool
     IRPrinter(io, 0, "", max_idx_width, color, lineinfo)
 end
@@ -59,13 +56,12 @@ function indent(p::IRPrinter, n::Int=1)
     return IRPrinter(p.io, p.indent + n, new_prefix, p.max_idx_width, p.color, p.lineinfo)
 end
 
-# Create a child printer for a nested Block
+# Child printer for a nested Block. SSA indices are global, so max_idx_width carries over.
 function child_printer(p::IRPrinter, nested_block::Block, cont_prefix::String)
-    # Use parent's max_idx_width since SSA indices are global
     IRPrinter(p.io, p.indent + 1, p.line_prefix * cont_prefix, p.max_idx_width, p.color, p.lineinfo)
 end
 
-# Emit a "@ file:line within `method`" annotation if the location changed
+# Emit a "@ file:line within `method`" annotation when the location changed.
 function emit_lineinfo!(p::IRPrinter, ssa_idx::Int)
     li = p.lineinfo
     li === nothing && return
@@ -84,7 +80,7 @@ function emit_lineinfo!(p::IRPrinter, ssa_idx::Int)
     println(p.io)
 end
 
-# Print region header: "├ label:" or "└ label:" for last/empty region
+# Print a region header: "├ label:", or "└ label:" for the last/empty region.
 function print_region_header(p::IRPrinter, label::String, args::Vector{BlockArgument}; is_last::Bool=false)
     print_indent(p)
     print_colored(p, is_last ? "└" : "├", :light_black)
@@ -102,11 +98,10 @@ function print_region_header(p::IRPrinter, label::String, args::Vector{BlockArgu
 end
 
 function print_indent(p::IRPrinter)
-    # Color the line prefix (box-drawing characters from parent blocks)
+    # Color the line prefix (box-drawing characters from parent blocks).
     print_colored(p, p.line_prefix, :light_black)
 end
 
-# Helper for colored output
 function print_colored(p::IRPrinter, s, color::Symbol)
     if p.color
         printstyled(p.io, s; color=color)
@@ -115,7 +110,7 @@ function print_colored(p::IRPrinter, s, color::Symbol)
     end
 end
 
-# Print an IR value (no special coloring, like Julia's code_typed)
+# Print an IR value (no special coloring, like Julia's code_typed).
 function print_value(p::IRPrinter, v::SSAValue)
     print(p.io, "%", v.id)
 end
@@ -125,7 +120,7 @@ function print_value(p::IRPrinter, v::BlockArgument)
 end
 
 function print_value(p::IRPrinter, v::Argument)
-    # Print argument as _N (IRCode doesn't have slot names)
+    # IRCode has no slot names, so print arguments as _N.
     print(p.io, "_", v.n)
 end
 
@@ -149,49 +144,15 @@ function print_value(p::IRPrinter, v)
     print(p.io, repr(v))
 end
 
-# String versions for places that need strings (e.g., join)
-function format_value(p::IRPrinter, v::SSAValue)
-    string("%", v.id)
-end
-function format_value(p::IRPrinter, v::BlockArgument)
-    string("%arg", v.id)
-end
-function format_value(p::IRPrinter, v::Argument)
-    string("_", v.n)
-end
-function format_value(p::IRPrinter, v::SlotNumber)
-    string("slot#", v.id)
-end
-function format_value(p::IRPrinter, v::Undef)
-    "undef"
-end
-function format_value(p::IRPrinter, v::QuoteNode)
-    repr(v.value)
-end
-function format_value(p::IRPrinter, v::GlobalRef)
-    string(v.mod, ".", v.name)
-end
-function format_value(p::IRPrinter, v)
-    repr(v)
-end
-
-# Format type for printing (compact form)
+# Format a type for printing (compact form).
 function format_type(t)
     if t isa Core.Const
         string("Const(", repr(t.val), ")")
-    elseif t isa Type
-        string(t)
     else
         string(t)
     end
 end
 
-# Print type annotation
-function print_type_annotation(p::IRPrinter, t)
-    print_colored(p, string("::", format_type(t)), :cyan)
-end
-
-# Check if a function reference is an intrinsic
 function is_intrinsic_call(func)
     if func isa GlobalRef
         try
@@ -204,12 +165,11 @@ function is_intrinsic_call(func)
     return false
 end
 
-# Print an expression (RHS of a statement)
+# Print an expression (RHS of a statement).
 function print_expr(p::IRPrinter, expr::Expr)
     if expr.head == :call
         func = expr.args[1]
         args = expr.args[2:end]
-        # Check if this is an intrinsic call
         if is_intrinsic_call(func)
             print_colored(p, "intrinsic ", :light_black)
         end
@@ -227,13 +187,13 @@ function print_expr(p::IRPrinter, expr::Expr)
         print_colored(p, "invoke ", :light_black)
         if mi isa Core.MethodInstance
             print(p.io, mi.def.name)
-            # Get argument types from MethodInstance signature
+            # Argument types from the MethodInstance signature.
             sig = mi.specTypes isa DataType ? mi.specTypes.parameters : ()
             print(p.io, "(")
             for (i, a) in enumerate(args)
                 i > 1 && print(p.io, ", ")
                 print_value(p, a)
-                # Print type annotation if available (sig includes function type at position 1)
+                # sig position 1 is the function type, so argument i is at sig[i+1].
                 if i + 1 <= length(sig)
                     print_colored(p, string("::", sig[i + 1]), :cyan)
                 end
@@ -272,22 +232,7 @@ function print_expr(p::IRPrinter, v)
     print_value(p, v)
 end
 
-# Print block arguments (for loops and structured control flow)
-function print_block_args(p::IRPrinter, args::Vector{BlockArgument})
-    if isempty(args)
-        return
-    end
-    print(p.io, "(")
-    for (i, a) in enumerate(args)
-        i > 1 && print(p.io, ", ")
-        print(p.io, "%arg", a.id)
-        # Block args are always "used" within their scope
-        print_colored(p, string("::", format_type(a.type)), :cyan)
-    end
-    print(p.io, ")")
-end
-
-# Print initial values (carries) with their types
+# Print initial values (carries) with their types.
 function print_init_values(p::IRPrinter, carry_args::Vector{BlockArgument}, init_values::Vector{IRValue})
     if isempty(carry_args)
         return
@@ -295,7 +240,7 @@ function print_init_values(p::IRPrinter, carry_args::Vector{BlockArgument}, init
     print(p.io, " init(")
     for (i, (arg, init)) in enumerate(zip(carry_args, init_values))
         i > 1 && print(p.io, ", ")
-        # Use same naming as BlockArgument print_value for consistency
+        # Same %arg naming as print_value(BlockArgument).
         print(p.io, "%arg", arg.id, " = ")
         print_value(p, init)
         print_colored(p, string("::", format_type(arg.type)), :cyan)
@@ -307,8 +252,8 @@ function print_loop_args(p::IRPrinter, block_args::Vector{BlockArgument}, init_v
     print_init_values(p, block_args, init_values)
 end
 
-# Print a terminator
-# is_last_in_block: if true, replace trailing │ with └ to close the block
+# Print a terminator. When is_last_in_block is true, replace the trailing │
+# with └ to close the block.
 function print_terminator(p::IRPrinter, term::ReturnNode; is_last_in_block::Bool=false)
     if is_last_in_block && endswith(p.line_prefix, "│   ")
         closing_prefix = chop(p.line_prefix; tail=4)
@@ -338,12 +283,12 @@ function print_terminator(p::IRPrinter, term::Union{YieldOp,ContinueOp,BreakOp,C
 end
 
 function print_terminator(p::IRPrinter, ::Nothing; is_last_in_block::Bool=false)
-    # No terminator
+    # No terminator.
 end
 
-# Print terminator when closing the block itself (replace trailing │ with └)
+# Print a terminator that closes the block itself: replace the trailing │ with └.
 function print_terminator_closing_self(p::IRPrinter, term)
-    # Replace trailing "│ " or "│   " with "└ " in the prefix
+    # Replace a trailing "│ " or "│   " in the prefix with "└ ".
     if endswith(p.line_prefix, "│   ")
         closing_prefix = chop(p.line_prefix; tail=4)
         print_colored(p, closing_prefix, :light_black)
@@ -359,27 +304,26 @@ function print_terminator_closing_self(p::IRPrinter, term)
     println(p.io)
 end
 
-# Print expression with type annotation (no box-drawing, just indent)
+# Print an expression with its type annotation (no box-drawing, just indent).
 function print_expr_with_type(p::IRPrinter, idx::Int, expr, typ)
     print_indent(p)
 
-    # Print %N = assignment
+    # The "%N = " assignment, padded to align the widest index. -4 covers "% = ".
     idx_s = string(idx)
-    pad = " "^(p.max_idx_width - length(idx_s) - 4)  # -4 for "% = "
+    pad = " "^(p.max_idx_width - length(idx_s) - 4)
     print(p.io, "%", idx_s, pad, " = ")
     print_expr(p, expr)
 
-    # Print type annotation
     print_colored(p, string("::", format_type(typ)), :cyan)
     println(p.io)
 end
 
-# Print a Block's contents
-# is_last_in_parent: if true, the terminator should close with └── (added after prefix)
-# is_closing_self: if true, the last item replaces the trailing │ with └── (for entry block)
+# Print a Block's contents.
+# is_last_in_parent: the terminator closes with └── (added after the prefix).
+# is_closing_self: the last item replaces the trailing │ with └── (for the entry block).
 function print_block_body(p::IRPrinter, block::Block; is_last_in_parent::Bool=false, is_closing_self::Bool=false)
     items = []
-    for (i, (idx, entry)) in enumerate(block.body)
+    for (idx, entry) in block.body
         if entry.stmt isa ControlFlowOp
             push!(items, (:nested, idx, entry.stmt, entry.type))
         else
@@ -397,21 +341,20 @@ function print_block_body(p::IRPrinter, block::Block; is_last_in_parent::Bool=fa
             print_expr_with_type(p, item[2], item[3], item[4])
         elseif item[1] == :nested
             emit_lineinfo!(p, item[2])
-            # Control flow ops handle their own box-drawing
+            # Control flow ops handle their own box-drawing.
             print_control_flow(p, item[3], item[2], item[4]; is_last=is_last && is_last_in_parent)
         else  # :term
             if is_last && is_closing_self
-                # Closing this block itself: replace trailing │ with └──
                 print_terminator_closing_self(p, item[2])
             else
-                # Terminators get └── only if this is the last item AND we're closing the parent block
+                # The terminator gets └── only as the last item while closing the parent.
                 print_terminator(p, item[2]; is_last_in_block=is_last && is_last_in_parent)
             end
         end
     end
 end
 
-# Print just the terminator content (keyword + values), no prefix or newline
+# Print just the terminator content (keyword + values), no prefix or newline.
 function print_terminator_content(p::IRPrinter, term::YieldOp)
     print_colored(p, "yield", :yellow)
     print_terminator_values(p, term.values)
@@ -449,21 +392,20 @@ function print_terminator_values(p::IRPrinter, values)
     end
 end
 
-# Print ControlFlowOp (final type, dispatches via multiple dispatch)
+# Print a ControlFlowOp, dispatching on the concrete op type.
 print_control_flow(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_if_op_final(p, op, pos, result_type; is_last)
 print_control_flow(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_for_op_final(p, op, pos, result_type; is_last)
 print_control_flow(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_while_op_final(p, op, pos, result_type; is_last)
 print_control_flow(p::IRPrinter, op::LoopOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_loop_op_final(p, op, pos, result_type; is_last)
 
 function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
-    # Print the if header (no box-drawing prefix for the op itself)
+    # The if header (no box-drawing prefix for the op itself).
     print_indent(p)
     idx_s = string(pos)
     pad = " "^(p.max_idx_width - length(idx_s) - 4)
     print(p.io, "%", idx_s, pad, " = if ")
     print_value(p, op.condition)
 
-    # Show return type annotation
     if result_type !== nothing
         print_colored(p, " -> ", :light_black)
         print_colored(p, string(result_type), :cyan)
@@ -471,24 +413,18 @@ function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(resul
 
     println(p.io)
 
-    # Check if else region is empty (no body, no terminator)
     else_is_empty = isempty(op.else_region.body) && op.else_region.terminator === nothing
-    # Check if else has only a terminator (no body statements)
-    else_is_just_terminator = isempty(op.else_region.body) && op.else_region.terminator !== nothing
 
-    # Print "then:" region header (at same level as the if)
+    # "then:" region header at the same level as the if, then its body one level in.
+    # When else is empty, then's last item closes the if with └──.
     print_region_header(p, "then", op.then_region.args; is_last=false)
-    # Print then region body (indented one level)
-    # If else is empty, then's last item closes the if with └──
     then_body_p = child_printer(p, op.then_region, "│   ")
     print_block_body(then_body_p, op.then_region; is_last_in_parent=else_is_empty)
 
-    # Handle else region
     if else_is_empty
-        # Empty else: just print └ else: to close the if
+        # Empty else: a lone "└ else:" closes the if.
         print_region_header(p, "else", op.else_region.args; is_last=true)
     else
-        # Else has content: print region header and body
         print_region_header(p, "else", op.else_region.args; is_last=false)
         else_body_p = child_printer(p, op.else_region, "│   ")
         print_block_body(else_body_p, op.else_region; is_last_in_parent=true)
@@ -498,7 +434,7 @@ end
 function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
-    # Print the for header (no box-drawing prefix)
+    # The for header (no box-drawing prefix).
     print_indent(p)
     idx_s = string(pos)
     pad = " "^(p.max_idx_width - length(idx_s) - 4)
@@ -515,7 +451,6 @@ function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(res
         print_loop_args(p, op.body.args, op.init_values)
     end
 
-    # Show return type annotation
     if result_type !== nothing
         print_colored(p, " -> ", :light_black)
         print_colored(p, string(result_type), :cyan)
@@ -523,7 +458,7 @@ function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(res
 
     println(p.io)
 
-    # Body content - the terminator (continue) closes the for block with └──
+    # The body's continue terminator closes the for block with └──.
     body_p = child_printer(p, op.body, cont_prefix)
     print_block_body(body_p, op.body; is_last_in_parent=true)
 end
@@ -531,54 +466,48 @@ end
 function print_loop_op_final(p::IRPrinter, op::LoopOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
     cont_prefix = is_last ? "    " : "│   "
 
-    # Print the loop header (no box-drawing prefix)
+    # The loop header (no box-drawing prefix).
     print_indent(p)
     idx_s = string(pos)
     pad = " "^(p.max_idx_width - length(idx_s) - 4)
     print(p.io, "%", idx_s, pad, " = ")
     print_colored(p, "loop", :yellow)
     print_loop_args(p, op.body.args, op.init_values)
-    # Show return type annotation
     if result_type !== nothing
         print_colored(p, " -> ", :light_black)
         print_colored(p, string(result_type), :cyan)
     end
     println(p.io)
 
-    # Body content - the terminator closes the loop block with └──
+    # The body's terminator closes the loop block with └──.
     body_p = child_printer(p, op.body, cont_prefix)
     print_block_body(body_p, op.body; is_last_in_parent=true)
 end
 
 function print_while_op_final(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
-    # Print the while header (no box-drawing prefix)
+    # The while header (no box-drawing prefix).
     print_indent(p)
     idx_s = string(pos)
     pad = " "^(p.max_idx_width - length(idx_s) - 4)
     print(p.io, "%", idx_s, pad, " = ")
     print_colored(p, "while", :yellow)
     print_loop_args(p, op.before.args, op.init_values)
-    # Show return type annotation
     if result_type !== nothing
         print_colored(p, " -> ", :light_black)
         print_colored(p, string(result_type), :cyan)
     end
     println(p.io)
 
-    # Check if "do" region is empty
     do_is_empty = isempty(op.after.body) && op.after.terminator === nothing
 
-    # Print "before" region header (at same level as the while)
+    # "before" region header at the same level as the while, then its body one level in.
+    # When the do region is empty, before's last item closes the while with └──.
     print_region_header(p, "before", op.before.args; is_last=false)
-    # Print before region body (indented one level)
-    # If do is empty, before's last item closes the while with └──
     before_body_p = child_printer(p, op.before, "│   ")
     print_block_body(before_body_p, op.before; is_last_in_parent=do_is_empty)
 
-    # Print "do" region header
-    # Use └ if empty (nothing follows), ├ if has content
+    # "do" region header: └ when empty (nothing follows), ├ when it has content.
     print_region_header(p, "do", op.after.args; is_last=do_is_empty)
-    # Print do region body
     if !do_is_empty
         after_body_p = child_printer(p, op.after, "│   ")
         print_block_body(after_body_p, op.after; is_last_in_parent=true)

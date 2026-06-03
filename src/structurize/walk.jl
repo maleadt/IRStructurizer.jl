@@ -1,25 +1,22 @@
 #=============================================================================
- Core Algorithm — the lift, reading the explicit-edge `MBlock` form directly.
+ The lift, reading the explicit-edge `MBlock` form directly.
 
- Block arguments + per-edge operands replace Julia phi nodes (the MLIR model), so
- "what value does predecessor P contribute to block B's k-th argument" is just the
- operand on edge P→B (`edge_operands`) — no phi-node scanning, no dense round-trip.
+ Block arguments and per-edge operands replace Julia phi nodes (the MLIR model), so
+ the value predecessor P contributes to block B's k-th argument is just the operand
+ on edge P to B (`edge_operands`).
 =============================================================================#
 
 """
     MergeInfo
 
-The merge/continuation block of an `IfOp`, in native block-argument form. `merge`
-is the block id; `positions` are the indices of its block args that are *live*
-(some predecessor edge carries a real, non-`Undef` operand) and so become `IfOp`
-results; `ids`/`types` are those args' stable ids and (widened) types. Built once
-by [`merge_info`](@ref).
+The merge/continuation block of an `IfOp`, in block-argument form. `merge` is the
+block id; `positions` are the indices of its block args that are live (some
+predecessor edge carries a real, non-`Undef` operand) and so become `IfOp` results;
+`ids` and `types` are those args' stable ids and widened types. Built by
+[`merge_info`](@ref).
 
-Each arm's `YieldOp` is then just the operands *its own* exit edge carries to
-`merge` — `edge_operands(m, arm_exit, merge)` read position by position — instead
-of a predecessor-keyed phi reconstruction with a reverse edge lookup. "What value
-does this arm contribute to the merge's k-th arg" *is* the k-th operand on the
-arm's edge (the MLIR model).
+Each arm's `YieldOp` is then the operands its own exit edge carries to `merge`,
+read position by position via `edge_operands(m, arm_exit, merge)`.
 """
 struct MergeInfo
     merge::Int
@@ -41,8 +38,8 @@ struct LoopCtx
     break_values::Vector{IRValue}
 end
 
-"""The operands edge `src`→`dst` carries (parallel to `dst`'s block arguments), or
-`nothing` if `src` has no edge to `dst`. A degenerate `GotoIfNot` whose two edges
+"""The operands edge `src` to `dst` carries (parallel to `dst`'s block arguments),
+or `nothing` if `src` has no edge to `dst`. A degenerate `GotoIfNot` whose two edges
 target the same block is split away by [`split_duplicate_edges!`](@ref) before the
 lift, so each predecessor reaches a block by at most one edge here."""
 function edge_operands(m, src::Int, dst::Int)
@@ -56,9 +53,9 @@ function edge_operands(m, src::Int, dst::Int)
     return nothing
 end
 
-"""The stable id of a block's last / first body statement (0 if the body is
-empty), used as a debug-info anchor for synthesized ops — the branch condition
-(last body stmt) for an IfOp, the header's first stmt for a loop."""
+"""The stable id of a block's last or first body statement (0 if the body is
+empty), used as a debug-info anchor for synthesized ops: the branch condition (last
+body stmt) for an IfOp, the header's first stmt for a loop."""
 last_body_id(ctx::StructurizeCtx, b::Int) =
     (body = (ctx.m::MCFG).blocks[b].body; isempty(body) ? 0 : last(body).id)
 first_body_id(ctx::StructurizeCtx, b::Int) =
@@ -80,27 +77,25 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
     current = entry
     last_block = entry
 
-    # Advance the walker toward `target`, resolving loop boundaries
-    # (back-edge → ContinueOp, exit → BreakOp); returns nothing if `target`
-    # leaves the region.
+    # Advance the walker toward `target`, resolving loop boundaries (back-edge to
+    # ContinueOp, exit to BreakOp); returns nothing if `target` leaves the region.
     advance = target -> resolve_dest(target, region_blocks, loop_ctx, block, ctx)
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
 
-        # A block argument with a single predecessor is a "phi with one edge" — a
-        # pure copy left by an edge multiplexer's dispatch. Rename it to that
-        # edge's operand (the MBlock equivalent of materialize_single_edge_phi!);
-        # header / merge args (≥2 preds) are owned by the loop / branch machinery
+        # A block argument with a single predecessor is a copy of that edge's
+        # operand, left by an edge multiplexer's dispatch; rename it to the operand.
+        # Header and merge args (>=2 preds) are owned by the loop/branch machinery
         # and left untouched here.
         bind_single_pred_args!(block, ctx, current)
 
-        # --- Loop header? (only if not already inside this loop) ---
+        # Loop header (only if not already inside this loop)?
         if loop_ctx === nothing || current != loop_ctx.header
             loop_body = get_loop_at(ctx, current, region_blocks)
             if loop_body !== nothing
                 loop_exit = emit_loop!(block, ctx, current, loop_body, region_blocks)
-                # Update last_block to the loop's exit predecessor (for merge phi lookup)
+                # Track last_block at the loop's exit predecessor, for merge phi lookup.
                 if loop_exit !== nothing
                     for b in loop_body
                         loop_exit ∈ ctx.cfg.blocks[b].succs && (last_block = b)
@@ -111,10 +106,10 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             end
         end
 
-        # --- Emit body statements (block args are not statements) ---
+        # Emit body statements (block args are not statements).
         emit_block_stmts!(block, ctx, current)
 
-        # --- Handle terminator ---
+        # Handle terminator.
         term = m.blocks[current].term
         if term isa MReturn
             block.terminator = make_return(ctx, term)
@@ -128,9 +123,9 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
         end
     end
 
-    # Region ended — yield to the merge if not already terminated. The arm's exit
+    # Region ended: yield to the merge if not already terminated. The arm's exit
     # block is the walk's tracked `last_block`; its edge to the merge carries the
-    # yield operands directly.
+    # yield operands.
     if block.terminator === nothing && merge_phis !== nothing
         yield_to_merge!(block, ctx, last_block, merge_phis)
     end
@@ -138,8 +133,8 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
     return block
 end
 
-"""Reconstruct the SCI return terminator from an `MReturn` (a value return, a bare
-`return`, or an unreachable dead-end)."""
+"""The SCI return terminator for an `MReturn` (a value return, a bare `return`, or
+an unreachable dead-end)."""
 make_return(ctx::StructurizeCtx, t::MReturn) =
     t.has_val ? ReturnNode(remap_ssa_ref(t.val, ctx.ssa_remap)) : ReturnNode()
 
@@ -160,12 +155,12 @@ end
 
 """Resolve a loop boundary on the edge to `dest`, setting `block`'s terminator.
 Returns `true` if `dest` is a loop boundary (handled), `false` if it is inside the
-loop (a normal forward edge). Two cases — back edge to the header → `ContinueOp`;
-any edge leaving the loop → `BreakOp`. The single-exiting latch (`normalize_cf`)
-unified every loop to one exit edge, so there is no "primary vs secondary" exit to
-distinguish and no re-materialization: an early `return`/`throw` is routed through
-the latch into the post-loop dispatch (a multi-exit loop is latched) or *is* the
-single exit (then the post-loop walk re-emits it), never dropped to a bare break."""
+loop (a normal forward edge). A back edge to the header becomes a `ContinueOp`; any
+edge leaving the loop becomes a `BreakOp`. `normalize_cf` unifies every loop to a
+single exit edge, so there is no primary vs secondary exit to distinguish: an early
+`return`/`throw` is routed through the latch into the post-loop dispatch (a
+multi-exit loop is latched), or is the single exit (then the post-loop walk re-emits
+it), never dropped to a bare break."""
 function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
                             loop_ctx::LoopCtx)
     if dest == loop_ctx.header
@@ -196,12 +191,12 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, b::Int)
 end
 
 """Bind the single-predecessor block arguments of `b`. A block argument fed by
-exactly one predecessor edge is a pure copy (`arg := that edge's operand`) — left
-by an edge multiplexer's dispatch (an entry reached from one dispatch arm). An
-SSA-valued operand becomes a rename (`ssa_remap`); a constant/argument/undef
-operand is materialized as a copy at the arg's id. Multi-predecessor args (loop
-headers, branch merges) carry ≥2 distinct edge operands and are resolved by the
-loop / branch machinery instead, so they are skipped here."""
+exactly one predecessor edge is a copy of that edge's operand, left by an edge
+multiplexer's dispatch. An SSA-valued operand becomes a rename (`ssa_remap`); a
+constant/argument/undef operand is materialized as a copy at the arg's id.
+Multi-predecessor args (loop headers, branch merges) carry >=2 distinct edge
+operands and are resolved by the loop/branch machinery instead, so they are skipped
+here."""
 function bind_single_pred_args!(block::Block, ctx::StructurizeCtx, b::Int)
     m = ctx.m::MCFG
     args = m.blocks[b].args
@@ -242,25 +237,20 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     false_dest = condbr.f.target
     cond = remap_ssa_ref(condbr.cond, ctx.ssa_remap)
 
-    # Determine branch regions and merge block using dominance + exclusion.
-    # A multi-entry continuation (the short-circuit shape `if a||b { body }`,
-    # nested gated bodies, N-way merges) is collapsed to a single entry upstream
-    # by `normalize_cf`'s continuation multiplexer, so by here the continuation is
-    # always single-entry: `merge` is the unique entry, or `nothing` iff both arms
-    # diverge (zero continuation edges). The lift therefore has one branch path —
-    # no shape-matching (`find_gated_body` is gone; invariant I4).
+    # Determine branch regions and merge block using dominance and exclusion. A
+    # multi-entry continuation (short-circuit `if a||b { body }`, nested gated
+    # bodies, N-way merges) is collapsed to a single entry upstream by
+    # `normalize_cf`'s continuation multiplexer, so here the continuation is always
+    # single-entry: `merge` is the unique entry, or `nothing` iff both arms diverge
+    # (zero continuation edges).
     then_blocks, else_blocks, merge = find_branch_regions(
         ctx.cfg, ctx.domtree, current, true_dest, false_dest, region_blocks, loop_ctx)
 
     # If merge exists and is in region, read its block args (the "phis") as a
-    # MergeInfo. Skip args at loop headers: a header is never a branch merge now —
-    # the pre-header (`normalize_one_preheader!`) routes every multi-entry header's
-    # entry edges through a pre-header, so the branch's continuation is that
-    # pre-header, not the header itself.
-    #
-    # Continuation-by-exclusion finds the *real* merge directly, so a no-arg merge
-    # is genuinely arg-free: the walk continues through it without a separate
-    # pass-through step. A no-arg merge yields `nothing` here.
+    # MergeInfo. Skip args at loop headers: a header is never a branch merge,
+    # because the pre-header routes every multi-entry header's entry edges through a
+    # pre-header, so the branch's continuation is that pre-header, not the header.
+    # A no-arg merge yields `nothing` here; the walk continues through it.
     merge_phis = if merge !== nothing && merge ∈ region_blocks && !haskey(ctx.loop_map, merge)
         merge_info(ctx, merge)
     else
@@ -275,7 +265,7 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         outer_merge_phis  # propagate outer merge phis
     end
 
-    # Build then/else blocks recursively (propagate loop_ctx for break/continue)
+    # Build then/else blocks recursively (propagate loop_ctx for break/continue).
     then_blk = if !isempty(then_blocks)
         structurize_region!(ctx, true_dest, then_blocks;
                              merge_phis=sub_merge_phis, loop_ctx=loop_ctx)
@@ -294,7 +284,7 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     branch_anchor = last_body_id(ctx, current)
 
     if merge !== nothing && merge ∈ region_blocks && merge_phis !== nothing
-        # --- Inner merge exists: standard IfOp ---
+        # Inner merge exists: standard IfOp.
         set_branch_yields!(then_blk, ctx, merge_phis, then_blocks, current)
         set_branch_yields!(else_blk, ctx, merge_phis, else_blocks, current)
 
@@ -310,14 +300,14 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         push!(block, if_ssa, if_op, Tuple{})
         anchor_line!(ctx, if_ssa, branch_anchor)
         # If merge is the loop header, both branches already handle the loop flow
-        # (break/continue inside). Don't continue walking at the header.
+        # (break/continue inside), so don't continue walking at the header.
         if loop_ctx !== nothing && merge == loop_ctx.header
             return nothing
         end
         return merge
     else
-        # --- Both branches exit/diverge ---
-        # sub_merge_phis was already passed to recursive calls, so YieldOps are set
+        # Both branches exit/diverge. sub_merge_phis was already passed to the
+        # recursive calls, so the YieldOps are set.
         set_yield_if_needed!(then_blk)
         set_yield_if_needed!(else_blk)
 
@@ -326,12 +316,12 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
         if outer_merge_phis !== nothing
             phi_types = outer_merge_phis.types
             # The IfOp yields the outer-merge values only if at least one arm
-            # actually yields (reaches the outer continuation). If BOTH arms
-            # diverge (return/break/continue), the IfOp has no results — and this
-            # block, reached only through it, is itself unreachable past the IfOp.
-            # `getfield`-ing a result-less IfOp can't be lowered (its results
-            # vector is empty), so yield `Undef` placeholders instead: the
-            # YieldOp is dead (never reached), so the values are never observed.
+            # actually yields (reaches the outer continuation). If both arms diverge
+            # (return/break/continue), the IfOp has no results, and this block,
+            # reached only through it, is itself unreachable past the IfOp.
+            # `getfield`-ing a result-less IfOp can't be lowered (its results vector
+            # is empty), so yield `Undef` placeholders instead: the YieldOp is dead
+            # (never reached), so the values are never observed.
             if_ssa = alloc_ssa!(ctx)
             anchor_line!(ctx, if_ssa, branch_anchor)
             if then_blk.terminator isa YieldOp || else_blk.terminator isa YieldOp
@@ -358,15 +348,14 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
 end
 
 """Set `blk`'s terminator to the `YieldOp` carrying what `exit_block` contributes
-to `minfo.merge`: for each live merge-arg position, the operand on edge `exit_block
-→ merge` (`edge_operands`), remapped through `ssa_remap`. The arm yields *its own*
-edge — no predecessor-keyed reconstruction.
+to `minfo.merge`: for each live merge-arg position, the operand on edge `exit_block`
+to `merge` (`edge_operands`), remapped through `ssa_remap`.
 
-`Undef` (an unassigned phi slot) or a missing edge (`exit_block` does not reach the
-merge — an arm that diverged, whose yield is then dead) becomes a typed `Undef`. If
-the arm already redefines a merge arg at its (remapped) id — e.g. a nested IfOp on
-the same merge emitted the `getfield` there — that in-block definition is preferred
-over the raw edge operand."""
+An `Undef` (an unassigned phi slot) or a missing edge (`exit_block` does not reach
+the merge, e.g. a diverged arm whose yield is dead) becomes a typed `Undef`. If the
+arm already redefines a merge arg at its (remapped) id, e.g. a nested IfOp on the
+same merge emitted the `getfield` there, that in-block definition is preferred over
+the raw edge operand."""
 function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo)
     ops = edge_operands(ctx.m::MCFG, exit_block, minfo.merge)
     vals = IRValue[]
@@ -384,10 +373,10 @@ function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo
 end
 
 """The arm's exit block: the seed (in `blocks`, else the branch source `fallback`)
-whose edge targets `merge`. Single-entry continuations (post `normalize_cf`)
-guarantee the arm's exit is a *direct* merge predecessor, so a seed lookup
-suffices — no reachability search. `fallback` is returned when no seed reaches the
-merge (an arm that diverged); `yield_to_merge!` then yields dead `Undef`s."""
+whose edge targets `merge`. After `normalize_cf`, single-entry continuations
+guarantee the arm's exit is a direct merge predecessor, so a seed lookup suffices.
+`fallback` is returned when no seed reaches the merge (a diverged arm);
+`yield_to_merge!` then yields dead `Undef`s."""
 function branch_exit_block(ctx::StructurizeCtx, merge::Int, blocks::Set{Int}, fallback::Int)
     m = ctx.m::MCFG
     for b in (isempty(blocks) ? (fallback,) : blocks)
@@ -396,7 +385,7 @@ function branch_exit_block(ctx::StructurizeCtx, merge::Int, blocks::Set{Int}, fa
     return fallback
 end
 
-"""Set the yield terminator on an arm block, if not already set (a `ReturnNode` /
+"""Set the yield terminator on an arm block, if not already set (a `ReturnNode` or
 inner yield takes precedence). The exit block is the arm block that reaches the
 merge directly."""
 function set_branch_yields!(blk::Block, ctx::StructurizeCtx, minfo::MergeInfo,
@@ -409,8 +398,8 @@ function set_yield_if_needed!(blk::Block)
     blk.terminator === nothing && (blk.terminator = YieldOp())
 end
 
-"""Create an empty branch arm's block. The arm is just the edge `from → dest`, so
-when `dest` is the merge the block yields the operands that edge carries
+"""Create an empty branch arm's block. The arm is just the edge `from` to `dest`,
+so when `dest` is the merge the block yields the operands that edge carries
 (`from`'s edge to the merge); a loop boundary becomes a break/continue instead."""
 function make_empty_branch_block(ctx::StructurizeCtx, dest::Int, from::Int,
                                   minfo::Union{Nothing, MergeInfo},

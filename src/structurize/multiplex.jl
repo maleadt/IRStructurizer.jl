@@ -1,40 +1,35 @@
-# Mutate-then-lift CFG normalization (MLIR CFGToSCF's EdgeMultiplexer).
+# CFG normalization via edge multiplexers (port of MLIR CFGToSCF's EdgeMultiplexer).
 #
-# The structurizer lifts only *single-entry* regions. To get there for the hard
-# cases — irreducible (multi-entry) loop headers and multi-predecessor branch
-# continuations (short-circuits) — we first MUTATE the CFG so every such region
-# becomes single-entry, then run the ordinary lift on the result. This is MLIR's
-# architecture (`CFGToSCF.cpp`): insert a single "multiplexer" block, redirect all
-# the incoming edges through it, and dispatch from it by an integer discriminator.
+# The structurizer lifts only single-entry regions. To get there for the hard
+# cases (irreducible multi-entry loop headers and multi-predecessor branch
+# continuations, i.e. short-circuits) the CFG is mutated so every such region
+# becomes single-entry, then the ordinary lift runs on the result. The mechanism:
+# insert a single "multiplexer" block, redirect all incoming edges through it, and
+# dispatch from it by an integer discriminator.
 #
-# Julia's `IRCode` is dense (SSA value == position) and fallthrough-sensitive
-# (`GotoIfNot` falls through to the next block on `true`), so "mutate the CFG"
-# means "rebuild the IRCode". We work on a mutable, explicit-edge block form
-# (`MBlock`) carrying *stable ids* through mutation, and only remap stable→dense
-# at `emit`. Block arguments + per-edge operands replace SSA phi nodes here (the
-# MLIR model), so redirecting an edge is local — `ingest`/`emit` are the only two
-# places that convert between phi-form and block-argument-form.
+# We work on a mutable, explicit-edge block form (`MBlock`) carrying stable ids.
+# Block arguments and per-edge operands replace SSA phi nodes, so redirecting an
+# edge is local; `ingest` converts IRCode's phi-form into this block-argument form.
 #
-# The mux's N-way dispatch is emitted as a compare-chain of `GotoIfNot` on the
-# discriminator (Julia IR has no switch). The mutated CFG is therefore ordinary
-# reducible IRCode that the existing lift handles with no new concepts; for N=2
-# the chain is a single `GotoIfNot` → one `IfOp`.
+# The mux's N-way dispatch is emitted as a GotoIfNot compare-chain on the
+# discriminator, since Julia IR has no switch. The mutated CFG is ordinary
+# reducible IR that the existing lift handles with no new concepts; for N=2 the
+# chain is a single GotoIfNot, lifting to one IfOp.
 
-# The `MBlock`/`MCFG` type definitions live in `structurize/mcfg.jl` (included
-# before the lift so its method signatures can name them). This file holds the
-# operations: `ingest`/`emit` (the IRCode boundary), the `EdgeMultiplexer`, and
+# The `MBlock`/`MCFG` type definitions live in `structurize/mcfg.jl`. This file
+# holds the operations: `ingest` (the IRCode boundary), the `EdgeMultiplexer`, and
 # the `normalize_cf!` mutate fixpoint.
 
 #=============================================================================
- ingest: IRCode → MCFG  (phi → block-arg + edge-operands)
+ ingest: IRCode -> MCFG  (phi -> block-arg + edge-operands)
 =============================================================================#
 
 const _NOLOC = (Int32(0), Int32(0), Int32(0))
 
 # Per-statement debug location, captured at ingest into each `MStmt.codeloc`.
-# 1.12+: the `(line, inlined_at, ?)` triple from the `DebugInfoStream`. 1.11: the
-# single linetable index `stmts.line[pc]` stashed in slot 1 (slots 2/3 unused),
-# so `capture_debuginfo` can rebuild the SCI line map without a dense round-trip.
+# On 1.12+ this is the `(line, inlined_at, ?)` triple from the `DebugInfoStream`.
+# On 1.11 it is the single linetable index `stmts.line[pc]` stashed in slot 1
+# (slots 2/3 unused), which `capture_debuginfo` uses to rebuild the SCI line map.
 @static if VERSION >= v"1.12-"
     _codeloc(ir::IRCode, pc::Int) = CC.getdebugidx(ir.debuginfo, pc)::NTuple{3, Int32}
 else
@@ -55,12 +50,12 @@ function ingest(ir::IRCode)
     types = Dict{Int, Any}()
     codelocs = Dict{Int, NTuple{3, Int32}}()
 
-    # Per block: parallel to args, the phi's (pred_bb → value) map. Transient,
+    # Per block: parallel to args, the phi's (pred_bb -> value) map. Transient,
     # consumed below to fill edge operands.
-    phivals = [Dict{Int, Dict{Int, Any}}() for _ in 1:nb]  # arg_id → (pred → value)
+    phivals = [Dict{Int, Dict{Int, Any}}() for _ in 1:nb]  # arg_id -> (pred -> value)
 
-    # Pass 1: split each block into args / body / terminator (edges with empty
-    # operand vectors; filled in pass 2).
+    # Pass 1: split each block into args / body / terminator. Edges get empty
+    # operand vectors here, filled in pass 2.
     for i in 1:nb
         bb = ir.cfg.blocks[i]
         mb = blocks[i]
@@ -121,8 +116,8 @@ function _ingest_term(term_stmt, i::Int, bb, nb::Int)
     end
 end
 
-# For each edge i→B, fill operands = [phivals[B][arg].get(i, Undef) for arg in B.args].
-# A predecessor with no phi value (a dead/undef edge) carries Undef → becomes an
+# For each edge i->B, fill operands = [phivals[B][arg].get(i, Undef) for arg in B.args].
+# A predecessor with no phi value (a dead/undef edge) carries Undef, becoming an
 # unassigned phi slot at emit.
 function _fill_edge_operands!(term::MTerm, i::Int, blocks, phivals, types)
     if term isa MGoto
@@ -145,13 +140,12 @@ function _fill_edge!(e::MEdge, src::Int, blocks, phivals, types)
 end
 
 #=============================================================================
- capture_debuginfo: MCFG → (debuginfo table, line_map)
+ capture_debuginfo: MCFG -> (debuginfo table, line_map)
 
- The SCI resolves a statement's source location by `line_map[ssa_idx]` (negative =
- direct PC into the table; positive = anchor to another id to follow) + the table.
- Build both from the `MBlock` codelocs: each statement keeps its location at its
- own stable id, so there is no dense round-trip. The dual of `emit`'s debug-info
- rebuild — but the lift reads `MBlock` directly, so this is all that survives.
+ The SCI resolves a statement's source location from `line_map[ssa_idx]` (negative
+ means a direct PC into the table, positive means an anchor to another id to
+ follow) plus the table. Both are built from the `MBlock` codelocs, where each
+ statement keeps its location at its own stable id.
 =============================================================================#
 
 @static if VERSION >= v"1.12-"
@@ -218,12 +212,12 @@ function split_duplicate_edges!(m::MCFG)
 end
 
 #=============================================================================
- EdgeMultiplexer  (port of CFGToSCF.cpp EdgeMultiplexer::create/redirectEdge/
+ EdgeMultiplexer (port of CFGToSCF.cpp EdgeMultiplexer::create/redirectEdge/
  createSwitch). One block that all incoming edges are routed through; it
  dispatches to the original distinct targets ("entries") by an integer
- discriminator. The dispatch is a GotoIfNot compare-chain (Julia has no switch),
- last entry = default. This collapses every multi-entry/-predecessor situation
- to single-entry: each entry ends up with the mux as its only predecessor.
+ discriminator. The dispatch is a GotoIfNot compare-chain (Julia has no switch)
+ with the last entry as the default. This makes every multi-entry situation
+ single-entry: each entry ends up with the mux as its only predecessor.
 =============================================================================#
 
 """A reference to one outgoing edge of a block: which terminator slot it is.
@@ -256,14 +250,14 @@ end
 per-entry argument-slice offset into the mux's args, the discriminator arg id
 (0 if a single entry), and any extra arg ids appended at the tail.
 
-`absorb` distinguishes the two roles. When `true` (a loop-header mux: the entries
-are dispatch arms reached *only* from the mux, e.g. irreducible headers), the
-mux reuses the entries' own arg ids and the entries are left arg-less, so each
-entry's body references the mux's carries directly — the dispatch passes nothing
-(disc-as-carried-value). When `false` (a branch-continuation mux: an entry may
-also be reached from inside the continuation, e.g. a short-circuit merge), the
-mux's slice args are fresh and the dispatch forwards them into the entries' phis,
-which the merge-phi machinery then resolves."""
+`absorb` selects between two roles. When `true` (a loop-header mux, whose entries
+are dispatch arms reached only from the mux, e.g. irreducible headers) the mux
+reuses the entries' own arg ids and the entries are left arg-less, so each entry's
+body references the mux's carries directly and the dispatch passes nothing. When
+`false` (a branch-continuation mux, where an entry may also be reached from inside
+the continuation, e.g. a short-circuit merge) the mux's slice args are fresh and
+the dispatch forwards them into the entries' phis for the merge-phi machinery to
+resolve."""
 struct EdgeMux
     mux_id::Int
     entries::Vector{Int}
@@ -276,11 +270,11 @@ struct EdgeMux
 end
 
 entry_index(mux::EdgeMux, e::Int) = findfirst(==(e), mux.entries)::Int - 1   # 0-based
-# Values the dispatch forwards to entry `e`. Empty under `absorb` (the entry has
-# no args; its body reads the mux's carries directly). `live` is the set of mux
-# arg positions that some redirected edge assigned a real (non-`Undef`) value; a
-# position absent from `live` is forwarded as `Undef` — its mux phi would be empty
-# (e.g. a value only the body defines, never the skipped continuation entry).
+# Values the dispatch forwards to entry `e`. Empty under `absorb`, since the entry
+# has no args and its body reads the mux's carries directly. `live` is the set of
+# mux arg positions that some redirected edge assigned a real (non-`Undef`) value;
+# a position absent from `live` is forwarded as `Undef`, since its mux phi would be
+# empty (e.g. a value only the body defines, never the skipped continuation entry).
 function slice_vals(mux::EdgeMux, e::Int, live::Union{Nothing, Set{Int}})
     mux.absorb && return Any[]
     off = mux.offset[e]
@@ -293,7 +287,8 @@ end
 arguments are the union of the entries' block arguments (each entry's slice
 recorded by offset), followed by a discriminator (only if >1 distinct entry),
 followed by `extra_types` block args. See [`EdgeMux`](@ref) for `absorb`. Does
-not yet redirect edges or dispatch — see [`redirect_edge!`](@ref)/[`dispatch!`](@ref)."""
+not yet redirect edges or dispatch; see [`redirect_edge!`](@ref) and
+[`dispatch!`](@ref)."""
 function create_mux!(m::MCFG, entry_list::Vector{Int}; absorb::Bool=false,
                      extra_types::Vector=Any[])
     entries = Int[]
@@ -407,7 +402,7 @@ function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
 end
 
 # Mux arg positions that some incoming (redirected) edge assigned a real value.
-# A position never assigned is "dead" — its phi would be empty; the dispatch
+# A position never assigned is dead: its phi would be empty, so the dispatch
 # forwards `Undef` for it instead of referencing the empty phi.
 function _live_positions(m::MCFG, mux::EdgeMux, refs::Vector{EdgeRef})
     live = Set{Int}()
@@ -420,9 +415,10 @@ function _live_positions(m::MCFG, mux::EdgeMux, refs::Vector{EdgeRef})
 end
 
 """Route every edge in `edge_refs_list` through a fresh mux for their distinct
-targets, then emit the dispatch — MLIR's `createSingleEntryBlock`. Returns the
-mux. `extra` supplies (type, per-edge-value-fn) for an extra carried arg (the
-latch's `shouldRepeat`); `excluded` entries are left out of the dispatch."""
+targets, then emit the dispatch (MLIR's `createSingleEntryBlock`). Returns the
+mux. `extra_types`/`extra_for` supply the type and per-edge value of an extra
+carried arg (the latch's `shouldRepeat`); `excluded` entries are left out of the
+dispatch."""
 function single_entry_mux!(m::MCFG, edge_refs_list::Vector{EdgeRef};
                            absorb::Bool=false,
                            extra_types::Vector=Any[],
@@ -443,12 +439,11 @@ function single_entry_mux!(m::MCFG, edge_refs_list::Vector{EdgeRef};
 end
 
 #=============================================================================
- normalize_cf — the mutate-then-lift driver.
+ normalize_cf: the mutate-then-lift driver.
 
- Repeatedly find one multi-entry situation and collapse it to single-entry with
- an EdgeMultiplexer, until none remain. The lift (`structurize_region!`) then
- only ever sees single-entry regions. Currently handles irreducible (multi-entry)
- loop headers; continuation muxing is added in a later milestone.
+ Repeatedly find one multi-entry situation and collapse it to single-entry with an
+ EdgeMultiplexer, until none remain. The lift (`structurize_region!`) then only
+ ever sees single-entry regions.
 =============================================================================#
 
 _term_targets(t::MGoto) = (t.edge.target,)
@@ -473,8 +468,9 @@ function build_cfg(m::MCFG)
 end
 
 """Find one irreducible (multi-entry) SCC and collapse its entry blocks to a
-single entry with a mux, MLIR's `createSingleEntryBlock` over entry∪back edges.
-Returns `true` if it muxed one, `false` if the CFG has no irreducible SCC."""
+single entry with a mux (MLIR's `createSingleEntryBlock` over entry and back
+edges). Returns `true` if it muxed one, `false` if the CFG has no irreducible
+SCC."""
 function normalize_one_irreducible!(m::MCFG)
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
@@ -490,17 +486,16 @@ function normalize_one_irreducible!(m::MCFG)
     end
     isempty(by_scc) && return false
 
-    # Deterministic pick (no block-index leak into structure beyond a stable
-    # tie-break): smallest SCC id, entry blocks sorted (I1 / D74999).
+    # Deterministic pick: smallest SCC id, entry blocks sorted.
     S = by_scc[minimum(keys(by_scc))]
     Sset = Set(S)
     entry_blocks = sort!([b for b in S if any(p -> p ∉ Sset, cfg.blocks[b].preds)])
     @assert length(entry_blocks) >= 1 "irreducible SCC with no entry block"
 
     # Separate the edges into entry blocks: external (entry edges) and in-SCC
-    # (back edges). Both route through the entry mux so every in-edge — including
-    # back edges — lands on the single header (MLIR's `createSingleEntryBlock`
-    # passing entryEdges *and* backEdges).
+    # (back edges). Both route through the entry mux so every in-edge, back edges
+    # included, lands on the single header (MLIR's `createSingleEntryBlock` passing
+    # both entryEdges and backEdges).
     entry_refs = EdgeRef[]
     back_refs = EdgeRef[]
     for src in sort!(collect(1:nb)), e in entry_blocks
@@ -508,21 +503,20 @@ function normalize_one_irreducible!(m::MCFG)
         append!(dst, edge_refs(m, src, e))
     end
 
-    # Entry mux: collapse the multiple entry blocks to one header. It *absorbs* the
-    # entries' args (becomes the loop header carrying them); each entry, a dispatch
-    # arm reached only from the mux, reads them directly. The header now has
-    # several back-edge predecessors; unifying those into one back edge is the
-    # single-exiting latch's job (RESEARCH_ANSWER_3 §C4) — fired next by
-    # `normalize_one_loop_latch!` on the ≥2-back-edge trigger — so there is no
-    # separate back-edge mux here to collide with it.
+    # Entry mux: collapse the multiple entry blocks to one header. It absorbs the
+    # entries' args (becoming the loop header that carries them); each entry is a
+    # dispatch arm reached only from the mux and reads them directly. The header now
+    # has several back-edge predecessors; unifying those into one back edge is the
+    # single-exiting latch's job, fired next by `normalize_one_loop_latch!` on the
+    # >=2-back-edge trigger, so there is no separate back-edge mux here.
     single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
     return true
 end
 
-# M4 SPIKE: single-exiting latch ----------------------------------------------
+# single-exiting latch ---------------------------------------------------------
 
-"""Natural loops on the MBlock CFG: header id → set of in-loop block ids. A back
-edge is `src→header` where `header` dominates `src`."""
+"""Natural loops on the MBlock CFG: header id to set of in-loop block ids. A back
+edge is `src->header` where `header` dominates `src`."""
 function natural_loops_m(m::MCFG)
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
@@ -549,11 +543,11 @@ _edge_refs_of(src::Int, t::MGoto)   = (EdgeRef(src, :goto),)
 _edge_refs_of(src::Int, t::MCondBr) = (EdgeRef(src, :t), EdgeRef(src, :f))
 _edge_refs_of(src::Int, t::MReturn) = ()
 
-"""Route a loop's back edges and exit edges through one latch — MLIR's
-`createSingleExitingLatch`. Back edges carry `shouldRepeat=1`, exit edges `=0`;
-the latch branches on `shouldRepeat` back to `header` (the single back edge) or
-to a fresh exit-dispatch block that switches to the original exit targets (the
-single exit edge). The loop is then single-back-edge / single-exit-edge."""
+"""Route a loop's back edges and exit edges through one latch (MLIR's
+`createSingleExitingLatch`). Back edges carry `shouldRepeat=1`, exit edges `=0`;
+the latch branches on `shouldRepeat` back to `header` (the single back edge) or to
+a fresh exit-dispatch block that switches to the original exit targets (the single
+exit edge). The loop is then single-back-edge and single-exit-edge."""
 function single_exiting_latch!(m::MCFG, header::Int,
                                back_refs::Vector{EdgeRef}, exit_refs::Vector{EdgeRef})
     exit_targets = Int[]
@@ -561,7 +555,7 @@ function single_exiting_latch!(m::MCFG, header::Int,
         t = edge_of(m, r).target
         t in exit_targets || push!(exit_targets, t)
     end
-    targets = vcat([header], exit_targets)          # header first → entry_index 0
+    targets = vcat([header], exit_targets)          # header first, so entry_index 0
 
     mux = create_mux!(m, targets; absorb=false, extra_types=Any[Int])
     sr_id = mux.extra_ids[1]                          # shouldRepeat
@@ -627,21 +621,23 @@ function _rewrite_mblock!(b::MBlock, f)
 end
 
 """Reduce form (the latch-arg half of MLIR's `transformToReduceLoop`). For every
-value defined inside the loop and used *outside* it, add a latch block argument
-fed `value`-or-`undef` from each latch predecessor by dominance (§C2.ii), and
-rewrite the outside uses to that latch arg. After this every loop-internal value
-read downstream is a latch block arg, so the lift threads it out as a `BreakOp`
-result with no escape scan. Our `LoopOp` has separate `Break`/`Continue` values,
-so only this latch-arg half is needed — no header arg, no exit-block arg.
+value defined inside the loop and used outside it, add a latch block argument fed
+`value`-or-`undef` from each latch predecessor by dominance, and rewrite the
+outside uses to that latch arg. After this every loop-internal value read
+downstream is a latch block arg, so the lift threads it out as a `BreakOp` result
+with no escape scan. `LoopOp` has separate `Break`/`Continue` values, so only this
+latch-arg half is needed: no header arg, no exit-block arg.
 
-Excludes the latch's own block args (the mux slices / discriminator already become
-loop results through the post-loop dispatch). `loop_blocks` must include `latch`."""
+Excludes the latch's own block args (the mux slices and discriminator already
+become loop results through the post-loop dispatch). `loop_blocks` must include
+`latch`."""
 function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
     domtree = construct_domtree(build_cfg(m))
 
     # Definition site and type of each SSA id. Block-arg types live in `m.types`;
-    # body-statement types live in the `MStmt` (NOT `m.types`), so capture both —
-    # else a reduce arg for a body def gets `Any` and breaks the result phi's type.
+    # body-statement types live in the `MStmt`, not `m.types`, so capture both.
+    # Otherwise a reduce arg for a body def gets `Any` and breaks the result phi's
+    # type.
     def_block = Dict{Int, Int}()
     def_type = Dict{Int, Any}()
     for (bid, b) in enumerate(m.blocks)
@@ -689,11 +685,10 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
     end
 end
 
-"""Find one natural loop with ≥2 exit edges *or* ≥2 back edges and collapse it to
-a single-exiting latch in reduce form. ≥2 exit edges is the multi-exit shape the
-old `find_loop_exit` heuristic mishandled; ≥2 back edges is the post-entry-mux
-irreducible loop, whose back edges the one latch unifies (RESEARCH_ANSWER_3 §C4 —
-no separate back-edge mux). Returns `true` if it transformed one."""
+"""Find one natural loop with >=2 exit edges or >=2 back edges and collapse it to
+a single-exiting latch in reduce form. The >=2-exit-edge case is a multi-exit
+loop; the >=2-back-edge case is a post-entry-mux irreducible loop, whose back
+edges the one latch unifies. Returns `true` if it transformed one."""
 function normalize_one_loop_latch!(m::MCFG)
     loops = natural_loops_m(m)
     for h in sort!(collect(keys(loops)))
@@ -716,17 +711,17 @@ end
 #=============================================================================
  Continuation multiplexer.
 
- A conditional whose two arms reconverge at MORE THAN ONE block (the short-circuit
- shape `if a||b { body }`: `body` is reached from both arms, and so is the merge)
- has a multi-entry continuation. Route every edge into that continuation through
- one mux so the continuation becomes single-entry; the lift then structurizes it
- with the ordinary IfOp path (no shape-matching). Reuses the lift's own
- `branch_continuation` exclusion analysis (loop-aware) directly on the MBlock CFG.
+ A conditional whose two arms reconverge at more than one block (the short-circuit
+ shape `if a||b { body }`, where `body` is reached from both arms, and so is the
+ merge) has a multi-entry continuation. Route every edge into that continuation
+ through one mux so it becomes single-entry; the lift then structurizes it with the
+ ordinary IfOp path (no shape-matching). Reuses the lift's own `branch_continuation`
+ exclusion analysis (loop-aware) directly on the MBlock CFG.
 =============================================================================#
 
-# Minimal LoopCtx for the innermost loop enclosing `E` — `branch_continuation`
-# uses only `header`/`loop_blocks` (to skip the loop's back edge and exit edges,
-# which are not part of a branch's forward continuation).
+# Minimal LoopCtx for the innermost loop enclosing `E`. `branch_continuation` uses
+# only `header`/`loop_blocks`, to skip the loop's back edge and exit edges, which
+# are not part of a branch's forward continuation.
 function enclosing_loop_ctx(loops::Dict{Int, Set{Int}}, E::Int)
     best_h = 0; best_body = nothing; best_size = typemax(Int)
     for (h, body) in loops
@@ -742,7 +737,8 @@ end
 that continuation through one mux (MLIR `createSingleEntryBlock` for the
 continuation), making it single-entry. Returns `true` if it muxed one. After this
 the lift's ordinary IfOp path handles short-circuits, N-way merges, and nested
-gated bodies uniformly — `find_branch_regions` always finds a singleton merge."""
+gated bodies uniformly, with `find_branch_regions` always finding a singleton
+merge."""
 function normalize_one_continuation!(m::MCFG)
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
@@ -778,28 +774,26 @@ end
  Loop pre-header.
 
  A loop header reached by more than one entry edge (an `if/else` before the loop,
- or the absorbed entry-dispatch of an irreducible loop) is *also* a branch merge.
+ or the absorbed entry-dispatch of an irreducible loop) is also a branch merge.
  Route those entry edges through one pre-header so the header gains a single
- non-back predecessor — MLIR's `newLoopParentBlock` (`CFGToSCF.cpp:854`), built
- here in the mutate phase rather than during the lift.
+ non-back predecessor (MLIR's `newLoopParentBlock`), built here in the mutate
+ phase rather than during the lift.
 =============================================================================#
 
-"""Find one loop header with ≥2 entry edges and route them through a single
-pre-header, leaving the back edge on the header. MLIR fires its entry mux on
-`entryEdges.size() > 1` (`CFGToSCF.cpp:821`, per-edge), covering a reducible
-header with several outside predecessors as well as an irreducible one.
+"""Find one loop header with >=2 entry edges and route them through a single
+pre-header, leaving the back edge on the header. This covers a reducible header
+with several outside predecessors as well as an irreducible one.
 
-Making the header single-entry-from-outside is what lets the lift treat the
-branch's continuation as the *pre-header* (whose args receive the merged entry
-values — an `if`/`else` selection, or an irreducible discriminator — and feed the
-loop init) while the loop *results* stay on the header's own args. Keeping the two
-distinct is what removes the lift's "merge that is a loop header" special case and
-fixes the entry-value-returned-as-result miscompile (ISSUES.md #2).
+Making the header single-entry-from-outside lets the lift treat the branch's
+continuation as the pre-header (whose args receive the merged entry values, an
+`if`/`else` selection or an irreducible discriminator, and feed the loop init)
+while the loop results stay on the header's own args. Keeping the two distinct
+removes the lift's "merge that is a loop header" special case and avoids returning
+an entry value as a loop result.
 
 `absorb=false`, entry edges only: the pre-header forwards into the header's
-existing args, and the single-exiting latch still owns back/exit unification
-(RESEARCH_ANSWER_3 §C4 — no collision). Runs after irreducible + latch so it sees
-the final (mux) header."""
+existing args, and the single-exiting latch still owns back/exit unification.
+Runs after irreducible + latch so it sees the final (mux) header."""
 function normalize_one_preheader!(m::MCFG)
     loops = natural_loops_m(m)
     cfg = build_cfg(m)
@@ -820,7 +814,7 @@ end
 """Mutate `m` until no multi-entry situation remains. Each step collapses one
 multi-entry header (irreducible), one multi-exit loop (the single-exiting latch +
 reduce form), one multi-predecessor branch continuation, or one multi-entry loop
-header (the pre-header) — all strictly reduce the remaining count (the mux block is
+header (the pre-header). All strictly reduce the remaining count (the mux block is
 single-entry by construction), so this terminates. The lift then only ever
 structurizes single-entry regions."""
 function normalize_cf!(m::MCFG)
@@ -841,9 +835,9 @@ end
 
 Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
 loops, multi-predecessor continuations) to single-entry via edge multiplexers, so
-the lift only structurizes single-entry regions. One `ingest`, one mutate fixpoint
-over the `MCFG`, no dense round-trip — the lift (`lift_mcfg`) reads the returned
-`MCFG` directly.
+the lift only structurizes single-entry regions. One `ingest`, then one mutate
+fixpoint over the `MCFG`; the lift (`lift_mcfg`) reads the returned `MCFG`
+directly.
 """
 function normalize_cf(ir::IRCode)
     m = ingest(ir)
@@ -873,8 +867,9 @@ function lift_mcfg(m::MCFG; validate::Bool=true, promote::Bool=true)
     sci.max_arg_idx = max_arg
     merge!(sci.line_map, updated_line_map)
 
-    # Parent chain (entry → SCI, sub-blocks → containing block) after structurize +
-    # promote, since promote_loops! replaces block.body without going through push!.
+    # Parent chain (entry to SCI, sub-blocks to containing block) after structurize
+    # and promote, since promote_loops! replaces block.body without going through
+    # push!.
     sci.entry.parent = sci
     fix_parents!(sci.entry)
 

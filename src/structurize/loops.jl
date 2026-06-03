@@ -1,9 +1,9 @@
 #=============================================================================
  Branch Region Splitting (dominance-based)
 
- These analyses read only CFG topology + dominance (`cfg`/`domtree`), so they run
- unchanged whether the CFG comes from `ir.cfg` or `build_cfg(m)`. The lift passes
- `ctx.cfg`/`ctx.domtree`; `normalize_one_continuation!` passes a fresh pair.
+ These analyses read only CFG topology and dominance (`cfg`/`domtree`), so they
+ run unchanged whether the CFG comes from `ir.cfg` or `build_cfg(m)`. The lift
+ passes `ctx.cfg`/`ctx.domtree`; `normalize_one_continuation!` passes a fresh pair.
 =============================================================================#
 
 """
@@ -17,12 +17,12 @@ A successor with a single non-backedge predecessor gets all blocks it dominates
 (MLIR's edge-domination test, `CFGToSCF.cpp:981`). A successor with multiple
 predecessors is a merge block (empty arm region).
 
-The merge is the *single* common target of the edges leaving the branch — i.e.
+The merge is the single common target of the edges leaving the branch, i.e.
 `branch_continuation` returning exactly one entry. When the continuation is
 absent (both arms diverge) or has more than one entry (a multi-entry
 continuation that needs the edge multiplexer), `merge` is `nothing` and the
 caller routes accordingly. Post-dominance never enters as an ordering key, so
-the result depends only on CFG topology + dominance (invariant I1).
+the result depends only on CFG topology and dominance.
 """
 function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
@@ -33,10 +33,10 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
     then_blocks = Set{Int}()
     else_blocks = Set{Int}()
 
-    # Collect blocks dominated by each successor (if single-entry from outside).
-    # A successor is "single-entry" if only one predecessor from the region is
-    # NOT a loop backedge to it. Loop backedges don't count because the loop body
-    # is structurally inside the branch, not a separate entry path.
+    # Collect blocks dominated by each successor, if single-entry from outside.
+    # A successor is single-entry if only one predecessor from the region is not
+    # a loop backedge to it. Loop backedges don't count because the loop body is
+    # structurally inside the branch, not a separate entry path.
     if true_dest ∈ region_blocks && true_dest <= nblocks &&
        count_non_backedge_preds(cfg, domtree, true_dest, region_blocks) == 1
         collect_dominated!(then_blocks, domtree, true_dest, region_blocks)
@@ -53,8 +53,8 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
 
     # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
     # merge is the single distinct target of the edges leaving `current ∪ then ∪
-    # else`. A unique target → that's the merge; zero targets → both arms diverge;
-    # multiple targets → a multi-entry continuation handled by the multiplexer.
+    # else`. A unique target is the merge; zero targets means both arms diverge;
+    # multiple targets is a multi-entry continuation handled by the multiplexer.
     entries, _ = branch_continuation(cfg, domtree, current, true_dest, false_dest,
                                      then_blocks, else_blocks, region_blocks, loop_ctx)
     merge = length(entries) == 1 ? only(entries) : nothing
@@ -70,27 +70,26 @@ end
 Compute the branch continuation MLIR-style, mirroring
 `transformToStructuredCFBranches` in CFGToSCF.cpp (~lines 969-1098).
 
-`notContinuation` (CFGToSCF.cpp `notContinuation`) = `current` plus every block
-SOLELY dominated by one of the branch successors — exactly `then_blocks` and
-`else_blocks` (each is the dominator subtree of a single-predecessor successor,
-which is how `find_branch_regions` already computes them; CFGToSCF.cpp lines
-977-990).
+`notContinuation` is `current` plus every block solely dominated by one of the
+branch successors, exactly `then_blocks` and `else_blocks` (each is the dominator
+subtree of a single-predecessor successor, which is how `find_branch_regions`
+already computes them; CFGToSCF.cpp lines 977-990).
 
-The continuation is then derived from the **edges leaving `notContinuation`**
-(CFGToSCF.cpp lines 1054-1090, the `continuationEdges` loop), NOT from
-post-dominance. This is the part that makes the analysis robust to virtual exits
-(throw/`÷`/undef paths give `ipdom == 0`) and to bodies that fan into the
-continuation at several internal points: every such region-exit edge target is a
-continuation entry. Region-exit/return-like blocks (no successors, CFGToSCF.cpp
-`isRegionExitBlock`) contribute nothing here — they stay as case-2 unstructured
-sub-regions handled by the recursive walk. The distinct edge targets are the
-continuation entry blocks, deduplicated preserving first-seen order.
+The continuation is derived from the edges leaving `notContinuation`
+(CFGToSCF.cpp lines 1054-1090, the `continuationEdges` loop), not from
+post-dominance. Using edge targets rather than post-dominance keeps the analysis
+robust to virtual exits (throw/`÷`/undef paths give `ipdom == 0`) and to bodies
+that fan into the continuation at several internal points: every such region-exit
+edge target is a continuation entry. Region-exit/return-like blocks (no
+successors, CFGToSCF.cpp `isRegionExitBlock`) contribute nothing here; they stay
+as unstructured sub-regions handled by the recursive walk. The distinct edge
+targets are the continuation entry blocks, deduplicated preserving first-seen order.
 
 A continuation entry may leave `region_blocks` entirely: when a gated body is
-NESTED in another, the inner branch's skip path targets the SHARED outer merge,
-which the outer multiplexer left out of the inner region. We therefore keep
-out-of-region targets as entries, but DROP loop boundaries (`loop_ctx`): a
-back-edge to the header is a continue and an edge out of the loop is a break —
+nested in another, the inner branch's skip path targets the shared outer merge,
+which the outer multiplexer left out of the inner region. So out-of-region
+targets are kept as entries, but loop boundaries (`loop_ctx`) are dropped: a
+back-edge to the header is a continue and an edge out of the loop is a break,
 neither is part of this branch's forward continuation.
 """
 function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
@@ -101,8 +100,8 @@ function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
     nblocks = length(cfg.blocks)
 
     # notContinuation = branch entry ∪ arm regions; continuation = distinct
-    # targets of edges leaving it (edge targets, not post-dominance → survives
-    # virtual exits). MLIR transformToStructuredCFBranches:
+    # targets of edges leaving it (edge targets, not post-dominance, so it
+    # survives virtual exits). MLIR transformToStructuredCFBranches:
     # https://github.com/llvm/llvm-project/blob/cabad14763b27802296b44b3b5e507f6a4f7a3c5/mlir/lib/Transforms/Utils/CFGToSCF.cpp
     notContinuation = Set{Int}((current,))
     union!(notContinuation, then_blocks)
@@ -120,7 +119,7 @@ function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
         isempty(bb.succs) && continue   # return-like block: no continuation edge
         for succ in bb.succs
             succ ∈ notContinuation && continue
-            # loop boundary (continue/break) — handled by the loop machinery
+            # loop boundary (continue/break), handled by the loop machinery
             if loop_ctx !== nothing &&
                (succ == loop_ctx.header || succ ∉ loop_ctx.loop_blocks)
                 continue
@@ -140,9 +139,9 @@ function count_non_backedge_preds(cfg::CFG, domtree::DomTree, block::Int, region
     count = 0
     for pred in cfg.blocks[block].preds
         pred ∈ region || continue
-        # A backedge is an edge where the target dominates the source
+        # A backedge is an edge where the target dominates the source; skip it.
         if dominates(domtree, block, pred)
-            continue  # skip loop backedge
+            continue
         end
         count += 1
     end
@@ -163,13 +162,12 @@ end
  Merge result shape (block args + per-edge operands)
 =============================================================================#
 
-"""Read the merge block `merge_idx`'s block arguments as a [`MergeInfo`](@ref): the
-*live* arg positions — those some predecessor edge assigns a real (non-`Undef`)
-operand — become the `IfOp`'s results. An arg every predecessor leaves `Undef` is a
-dead phi slot and is dropped (no result). Returns `nothing` if no arg is live. The
-MBlock analogue of reading a merge block's leading phi nodes, but recording only
-the result *shape*: each arm later yields its own edge's operands directly
-(`yield_to_merge!`), so there is no per-predecessor value map here."""
+"""Read the merge block `merge_idx`'s block arguments as a [`MergeInfo`](@ref). The
+live arg positions, those some predecessor edge assigns a real (non-`Undef`)
+operand, become the `IfOp`'s results. An arg every predecessor leaves `Undef` is a
+dead phi slot and is dropped (no result). Returns `nothing` if no arg is live. This
+records only the result shape: each arm later yields its own edge's operands
+directly (`yield_to_merge!`), so there is no per-predecessor value map here."""
 function merge_info(ctx::StructurizeCtx, merge_idx::Int)
     m = ctx.m::MCFG
     1 <= merge_idx <= length(m.blocks) || return nothing
@@ -189,7 +187,8 @@ end
 =============================================================================#
 
 """Push an IfOp and generate getfield statements at each phi index.
-`line_anchor` is the SSA index to inherit debug info from (typically the branch terminator)."""
+`line_anchor` is the SSA index to inherit debug info from (typically the branch
+terminator)."""
 function emit_ifop_result!(block::Block, if_op::IfOp, phi_indices::Vector{Int},
                             phi_types::AbstractVector, ctx::StructurizeCtx,
                             line_anchor::Int=0)
@@ -227,16 +226,14 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     # 1. Header block arguments (the loop's phis), as entry/carried value pairs.
     phi_info = extract_loop_phis(ctx, header, loop_blocks)
 
-    # 2. The loop's single exit — its one non-loop successor. The single-exiting
+    # 2. The loop's single exit: its one non-loop successor. The single-exiting
     #    latch (normalize_cf) unified every multi-exit loop to one exit edge, so
-    #    there is no choice to make: no post-dominance preference, no block-index
-    #    tie-break (the old `find_loop_exit` I1 leak — gone).
+    #    there is no choice to make.
     exit_dest = single_loop_exit(ctx, loop_blocks)
 
-    # 3. Escaping values: every loop-internal value used outside the loop. After
-    #    reduce form (normalize_cf) the latch carries the escapees as block args,
-    #    so this is a flat used-outside scan — no post-loop BFS, no remap-vs-merge
-    #    collision (the old `find_extra_exit_values`).
+    # 3. Escaping values: every loop-internal value used outside the loop. The
+    #    latch (normalize_cf) carries the escapees as block args, so this is a
+    #    flat used-outside scan.
     already_exported = Set{Int}(p.ssa_idx for p in phi_info)
     extra_exits = loop_escaping_values(ctx, loop_blocks, already_exported)
 
@@ -251,7 +248,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     for phi in phi_info
         # The entry value comes through the pre-header: a header is single-entry
         # from outside (`normalize_one_preheader!`), so its one entry edge carries
-        # the merged init (a branch selection / irreducible discriminator computed
+        # the merged init (a branch selection or irreducible discriminator computed
         # by the IfOp that yields into the pre-header). Remap through `ssa_remap`
         # (a single-edge pre-header arg may have been renamed, not emitted at its
         # own index).
@@ -272,7 +269,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         fresh = alloc_ssa!(ctx)
         ctx.ssa_remap[ex.ssa_idx] = fresh
         anchor_line!(ctx, fresh, ex.ssa_idx)
-        # `ex.type` is already widened (`ctx.types`), but stay robust.
+        # `ex.type` is already widened (`ctx.types`); widen again to stay robust.
         ext = widenconst(ex.type)
         push!(init_values, Undef(ext))
         push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
@@ -314,8 +311,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     for (i, (phi_idx, phi_type)) in enumerate(zip(phi_indices, phi_types))
         # The loop result lands at the header arg's own id: a header is never a
         # branch merge (the pre-header is), so `phi_idx` is not pre-defined by an
-        # enclosing IfOp — no fresh-index dance, and post-loop uses of `phi_idx`
-        # resolve to this result (ISSUES.md #2 fixed).
+        # enclosing IfOp, and post-loop uses of `phi_idx` resolve to this result.
         push!(block, phi_idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
     end
 
@@ -328,7 +324,8 @@ end
 
 """
 Build the body of a LoopOp using `structurize_region!` with a LoopCtx.
-The LoopCtx makes the region walk loop-aware: back-edges → ContinueOp, exits → BreakOp.
+The LoopCtx makes the region walk loop-aware: back-edges become ContinueOp, exits
+become BreakOp.
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, carried_values::Vector{IRValue},
@@ -342,10 +339,9 @@ function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
     end
     lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
 
-    # Use structurize_region! with loop context for the entire loop body
     content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)
 
-    # Merge content into the pre-existing body (which already has args)
+    # Merge content into the pre-existing body (which already has args).
     merge_block_into!(body, content)
 end
 
@@ -370,9 +366,9 @@ end
 
 """Extract a loop header's block arguments, separating each into its entry value
 (operand on an edge from outside the loop) and carried value (operand on the back
-edge from inside the loop). The single-exiting latch / entry mux guarantee one of
-each, so an argument with only one side is malformed (a dead edge the optimizer
-left, or unexpected loop structure) — error rather than emit wrong carries."""
+edge from inside the loop). The single-exiting latch and entry mux guarantee one
+of each, so an argument with only one side is malformed (a dead edge the optimizer
+left, or unexpected loop structure); error rather than emit wrong carries."""
 function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     m = ctx.m::MCFG
     result = LoopPhiInfo[]
@@ -404,10 +400,9 @@ function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{In
 end
 
 """The loop's single exit: its one successor outside `loop_blocks`, or `nothing`
-(a statically-infinite loop / all escapes are region-exits). The single-exiting
+(a statically-infinite loop, or all escapes are region-exits). The single-exiting
 latch (`normalize_cf`) unifies every multi-exit loop to one exit edge, so this is
-unambiguous — no post-dominance preference, no block-index tie-break (the old
-`find_loop_exit` I1 leak). More than one would mean the latch failed to fire."""
+unambiguous. More than one would mean the latch failed to fire."""
 function single_loop_exit(ctx::StructurizeCtx, loop_blocks::Set{Int})
     exits = find_loop_exits(ctx, loop_blocks)
     isempty(exits) && return nothing
@@ -429,19 +424,17 @@ end
 
 """
 Loop-internal SSA values referenced from outside the loop, threaded out as loop
-results. A value escapes when it is used at a position *not strictly inside* the
+results. A value escapes when it is used at a position not strictly inside the
 loop, classified by where the operand is consumed:
 
-- a body statement / terminator operand of a **non-loop** block, or
-- an **edge operand on an edge whose target is non-loop** — a value carried out of
-  the loop into a successor's block argument (the MBlock form of the old "exit
-  phi": the loop-exit edge's operand lives on the *in-loop* latch, but it feeds a
-  *non-loop* block's arg, so it escapes).
+- a body statement or terminator operand of a non-loop block, or
+- an edge operand on an edge whose target is non-loop: a value carried out of the
+  loop into a successor's block argument. The loop-exit edge's operand lives on
+  the in-loop latch, but it feeds a non-loop block's arg, so it escapes.
 
-Deterministic block/operand order; `already_exported` skips the header phis (which
-are already loop-carried). Over-approximation is impossible — every reported value
-genuinely has an outside use — and `promote_loops!` drops any that the LoopOp
-doesn't need.
+Deterministic block/operand order. `already_exported` skips the header phis (which
+are already loop-carried). Every reported value genuinely has an outside use, and
+`promote_loops!` drops any that the LoopOp doesn't need.
 """
 function loop_escaping_values(ctx::StructurizeCtx, loop_blocks::Set{Int},
                               already_exported::Set{Int})

@@ -14,14 +14,14 @@ using Base: code_ircode
 include("ir/types.jl")
 include("ir/show.jl")
 
-# explicit-edge mutable CFG types (MBlock/MCFG) — defined before the lift so its
-# StructurizeCtx and method signatures can name them; operations live in multiplex.jl
+# explicit-edge mutable CFG types (MBlock/MCFG). Defined before the lift so that
+# StructurizeCtx and its method signatures can name them; operations live in multiplex.jl.
 include("structurize/mcfg.jl")
 
-# substitution machinery (phi refs → block args)
+# substitution machinery (phi refs to block args)
 include("structurize/substitutions.jl")
 
-# structurization: IRCode → StructuredIRCode
+# structurization: IRCode to StructuredIRCode
 include("structurize.jl")
 include("structurize/promote.jl")
 
@@ -29,7 +29,7 @@ include("structurize/promote.jl")
 include("ir/utilities.jl")
 include("ir/validation.jl")
 
-# unstructurize: StructuredIRCode → IRCode
+# unstructurize: StructuredIRCode to IRCode
 include("unstructurize.jl")
 
 # mutate-then-lift CFG normalization (EdgeMultiplexer)

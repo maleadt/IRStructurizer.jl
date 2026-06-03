@@ -2,8 +2,8 @@
 #
 # Block mutation: parent, root, push!, pushfirst!, insert_before!, insert_after!,
 #                 delete!, new_block_arg!
-# Statement mutation: block[ssa_idx] = (; stmt, type, flag)  — partial NamedTuple
-#                     inst[:stmt] = …, inst[:type] = …, inst[:flag] = …
+# Statement mutation: block[ssa_idx] = (; stmt, type, flag) (partial NamedTuple)
+#                     inst[:stmt], inst[:type], inst[:flag]
 # Block traversal: eachblock, findblock
 # Use tracking: uses(), replace_uses!
 # Loop carries: carries()
@@ -62,7 +62,7 @@ Base.haskey(block::Block, ssa_idx::Int) = haskey(block.body, ssa_idx)
 
 Append a new instruction to the block, auto-allocating an SSA index.
 Requires `block.parent` to be set (see `_set_parent!`). Optional `flag` is
-the per-statement `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`);
+the per-statement `IR_FLAG_*` bitmask (defaults to 0 / `IR_FLAG_NULL`). It is
 keyword-only to avoid ambiguity with the explicit-idx `push!(block, idx, stmt, type)`.
 """
 function Base.push!(block::Block, @nospecialize(stmt), @nospecialize(type);
@@ -108,14 +108,14 @@ function Base.pushfirst!(block::Block, @nospecialize(stmt), @nospecialize(type);
 end
 
 #=============================================================================
- Statement access — Symbol-keyed on Instruction, NamedTuple-keyed on Block
+ Statement access: Symbol-keyed on Instruction, NamedTuple-keyed on Block
 
  Modeled on Core.Compiler.Instruction (`Compiler/src/ssair/ir.jl`): each
  `Instruction` is a thin handle, and reads/writes resolve to the live
  SSAMap entry on every access.
 
  When swapping a stmt for one with a different opcode, the old `flag` bits
- describe the OLD op and may be stale for the new one. Pass `flag=IR_FLAG_NULL`
+ describe the old op and may be stale for the new one. Pass `flag=IR_FLAG_NULL`
  to clear, mirroring LLVM's "fresh instruction, then opt-in `copyIRFlags`"
  pattern (see `Instruction.h:copyIRFlags`). Same-opcode rewrites (only
  operands change) keep the flag.
@@ -195,8 +195,8 @@ For `GlobalRef`, queries the binding partition at the SCI's
 For constants, returns `typeof(val)`.
 Returns `nothing` only for an `SSAValue` or `Argument` whose type cannot be found.
 
-The widened-type view over [`argextype`](@ref); call `const_value` for the
-static value (when known).
+This is the widened-type view over [`argextype`](@ref); call `const_value` for
+the static value when known.
 """
 function value_type(block::Block, @nospecialize(val))
     lat = argextype(block, val)
@@ -313,7 +313,7 @@ end
 
 
 #=============================================================================
- UseRef — handle to a single use site (operand slot)
+ UseRef: handle to a single use site (operand slot)
 =============================================================================#
 
 """
@@ -341,7 +341,7 @@ _useref_set!(v::Vector, i::Int, @nospecialize(val)) = (v[i] = val)
 _useref_set!(e::Expr, i::Int, @nospecialize(val)) = (e.args[i] = val)
 
 #=============================================================================
- walk_uses! — visitor over all use sites (multiple dispatch)
+ walk_uses!: visitor over all use sites (multiple dispatch)
 =============================================================================#
 
 # UseRef for mutable struct fields (IfOp.condition, ForOp.lower, etc.)
@@ -353,7 +353,7 @@ end
 Base.getindex(r::MutableFieldUseRef) = getfield(r.obj, r.field)
 Base.setindex!(r::MutableFieldUseRef, @nospecialize(v)) = setfield!(r.obj, r.field, v)
 
-# Special UseRef for ReturnNode (immutable — replacement creates new ReturnNode)
+# UseRef for ReturnNode. ReturnNode is immutable, so replacement creates a new one.
 struct ReturnNodeUseRef <: UseRef
     stmts::Vector{Any}
     pos::Int
@@ -382,7 +382,7 @@ function Base.setindex!(r::TerminatorReturnNodeUseRef, @nospecialize(v))
     r.block.terminator = ReturnNode(v)
 end
 
-# UseRef for PiNode as a statement (immutable — replacement reconstructs it).
+# UseRef for PiNode as a statement. PiNode is immutable, so replacement reconstructs it.
 struct PiNodeUseRef <: UseRef
     stmts::Vector{Any}
     pos::Int
@@ -400,7 +400,7 @@ Visit every use site (operand slot) in `node` and everything nested below it.
 The callback `f` receives a `UseRef` handle for each operand.
 
 Works on any IR node: `Block`, `ControlFlowOp`, `Expr`, terminators.
-Always recurses — calling `walk_uses!(f, some_for_op)` walks that ForOp's
+Always recurses: calling `walk_uses!(f, some_for_op)` walks that ForOp's
 own operands plus everything in its body block.
 """
 function walk_uses! end
@@ -427,27 +427,26 @@ function walk_uses!(f, block::Block)
     end
     term = block.terminator
     if term isa ReturnNode
-        # ReturnNode is immutable — use a specialized UseRef that replaces block.terminator
+        # ReturnNode is immutable; the UseRef replaces block.terminator.
         isdefined(term, :val) && f(TerminatorReturnNodeUseRef(block))
     else
         walk_uses!(f, term)
     end
 end
 
-"""A statement whose raw value IS the operand — alias/forwarding form."""
+"""A statement whose raw value IS the operand (alias/forwarding form)."""
 is_value_like_stmt(@nospecialize(s)) =
     s isa SSAValue || s isa BlockArgument || s isa Argument || s isa SlotNumber
 
 # Fallback for unknown statement types (no-op)
 walk_uses!(f, ::Any) = nothing
 
-# Expr: walk operands. For `:invoke`, args are [CodeInstance/MI, callee, args…];
+# Expr: walk operands. For `:invoke`, args are [CodeInstance/MI, callee, args...];
 # the callee (args[2]) is a real SSA use (e.g. a closure being applied) and must
-# be walked — so start at 2. The CodeInstance/MI at args[1] is not a value, so
-# skipping it (by starting at 2) is correct for both `:invoke` and `:call`.
+# be walked, so start at 2. The CodeInstance/MI at args[1] is not a value, so
+# skipping it is correct for both `:invoke` and `:call`.
 function walk_uses!(f, expr::Expr)
-    start = 2
-    for i in start:length(expr.args)
+    for i in 2:length(expr.args)
         f(IndexedUseRef(expr.args, i))
     end
 end
@@ -483,7 +482,7 @@ function walk_uses!(f, term::ConditionOp)
     for i in 1:length(args); f(IndexedUseRef(args, i)); end
 end
 
-# ReturnNode as terminator — handled in Block walk, not here
+# ReturnNode as terminator is handled in the Block walk, not here.
 walk_uses!(f, ::ReturnNode) = nothing
 
 # Nothing terminator
@@ -491,7 +490,7 @@ walk_uses!(f, ::Nothing) = nothing
 
 
 #=============================================================================
- UseIndex — dict-like index mapping values to their use sites
+ UseIndex: dict-like index mapping values to their use sites
 =============================================================================#
 
 """
@@ -521,7 +520,7 @@ normalize_key(@nospecialize(v)) = v
 
 
 #=============================================================================
- uses() — the public API
+ uses(): the public API
 =============================================================================#
 
 export uses, users, replace_uses!
@@ -548,8 +547,8 @@ end
 """
     uses(block::Block, val) -> Vector{UseRef}
 
-Find all use sites of `val` in `block` (recursively). Linear scan — for
-repeated queries, prefer building a `UseIndex` via `uses(block)`.
+Find all use sites of `val` in `block` (recursively). This is a linear scan;
+for repeated queries, prefer building a `UseIndex` via `uses(block)`.
 """
 function uses(block::Block, @nospecialize(val))
     result = UseRef[]
@@ -577,7 +576,7 @@ end
     users(block::Block, val) -> Vector{Instruction}
 
 Find all instructions in `block` (recursively) that reference `val` as an
-operand. Returns `Instruction` objects — the analog of MLIR's
+operand. Returns `Instruction` objects, the analog of MLIR's
 `Value::getUsers()` which maps use-sites to owning operations.
 
 See also `uses(block, val)` which returns `UseRef`s (use-sites).
@@ -602,8 +601,7 @@ function _references(@nospecialize(stmt), @nospecialize(target))
     if stmt isa Expr
         # `:invoke` callee (args[2]) is a real use; the MI at args[1] is not a
         # value, so start at 2 for both `:invoke` and `:call`.
-        start = 2
-        for i in start:length(stmt.args)
+        for i in 2:length(stmt.args)
             normalize_key(stmt.args[i]) == target && return true
         end
     elseif stmt isa ControlFlowOp
@@ -646,8 +644,8 @@ const LoopOps = Union{ForOp, LoopOp, WhileOp}
 """
     LoopCarries(op::Union{ForOp, LoopOp, WhileOp})
 
-View over a loop op's carried values. Encapsulates the 4-way positional
-coupling between init_values, body args, and terminator values.
+View over a loop op's carried values. Encapsulates the positional coupling
+between init_values, body args, and terminator values.
 
 Supports iteration (yields `CarryRef` handles), indexed access, and
 bulk removal via `filter!`/`deleteat!`.
@@ -813,7 +811,7 @@ function Base.push!(carries::LoopCarries, init_val, @nospecialize(body_arg_type)
 
     # WhileOp: also add to after block args
     if op isa WhileOp
-        after_arg = new_block_arg!(op.after, body_arg_type)
+        new_block_arg!(op.after, body_arg_type)
     end
 
     return CarryRef(carries, length(op.init_values))
@@ -836,8 +834,7 @@ ContinueOp/BreakOp are visible through nested IfOps.
 function reachable_terminators(outer::Block)
     result = Terminator[]
 
-    # outer terminator.
-    # we have to include yield/condition here because outer may be an IfOp
+    # Outer terminator. Include yield/condition here because outer may be an IfOp.
     let
         term = outer.terminator
         if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
@@ -845,8 +842,8 @@ function reachable_terminators(outer::Block)
         end
     end
 
-    # nested terminators reachable through nested IfOps.
-    # we have to ignore yield/condition here because that's inner to the IfOp
+    # Nested terminators reachable through nested IfOps. Ignore yield/condition
+    # here because those are inner to the IfOp.
     function collect_terminators!(inner::Block)
         term = inner.terminator
         if term isa ContinueOp || term isa BreakOp
@@ -914,7 +911,7 @@ end
 
 
 #=============================================================================
- walk — operation/block walker with control flow (cf. MLIR walk())
+ walk: operation/block walker with control flow (cf. MLIR walk())
 =============================================================================#
 
 """
@@ -923,9 +920,9 @@ end
 Walk all instructions, calling `f(inst, block)` for each. The callback
 returns a `Symbol` controlling traversal:
 
-- `:advance` — continue normally (default if callback returns `nothing`)
-- `:skip` — do not recurse into this op's sub-blocks (only meaningful for `ControlFlowOp`s)
-- `:interrupt` — stop the walk immediately
+- `:advance`: continue normally (default if callback returns `nothing`)
+- `:skip`: do not recurse into this op's sub-blocks (only meaningful for `ControlFlowOp`s)
+- `:interrupt`: stop the walk immediately
 
 Supports `:preorder` (visit before recursing, default) and `:postorder`
 (visit after recursing). Analogous to MLIR's `walk()` with `WalkOrder`
@@ -980,7 +977,7 @@ Extract the resolved function and operands from a `:call` or `:invoke` Expr.
 For `:call`, `stmt.args[1]` is the function reference and args 2+ are operands.
 For `:invoke`, `stmt.args[2]` is the function reference and args 3+ are operands.
 
-The callee is resolved via its inferred type using `singleton_type` — the same
+The callee is resolved via its inferred type using `singleton_type`, the same
 mechanism Julia's compiler uses during inlining. This handles GlobalRef, literal
 values, and SSAValue callees whose type is a singleton function type.
 
@@ -1010,7 +1007,7 @@ resolve_call(block::Block, inst::Instruction) = resolve_call(block, inst[:stmt])
 Resolve a callee reference to a concrete function value. Uses `singleton_type`
 on the inferred type (mirroring Julia's compiler) for symbolic refs (SSAValue,
 Argument, BlockArgument, SlotNumber). Falls back to evaluating GlobalRef and
-literal values directly — necessary for non-singleton types like
+literal values directly, which is necessary for non-singleton types like
 `Core.IntrinsicFunction` where all intrinsics share one type and
 `singleton_type` returns `nothing`. Julia's inliner sometimes substitutes a
 `GlobalRef(Core.Intrinsics, :sub_float)` callee with the literal
@@ -1023,7 +1020,7 @@ function resolve_callee(block::Block, @nospecialize(ref))
         T === nothing && return nothing
         return Core.Compiler.singleton_type(T)
     end
-    # GlobalRefs in optimized IR are guaranteed valid — inference rejects undefined bindings.
+    # GlobalRefs in optimized IR are guaranteed valid: inference rejects undefined bindings.
     ref isa GlobalRef && return getfield(ref.mod, ref.name)
     ref isa QuoteNode && return ref.value
     # Literal callable embedded directly as args[1] (e.g. an IntrinsicFunction
@@ -1050,7 +1047,7 @@ iscall(inst::Instruction) = iscall(inst[:stmt])
 
 Get the raw function reference from a `:call` or `:invoke` expression.
 For `:call`, returns `stmt.args[1]`. For `:invoke`, returns `stmt.args[2]`.
-Does NOT resolve GlobalRef — use `resolve_call` for that.
+Does NOT resolve GlobalRef; use `resolve_call` for that.
 """
 function callee(stmt::Expr)
     if stmt.head === :call
@@ -1099,7 +1096,7 @@ callargs(inst::Instruction) = callargs(inst[:stmt]::Expr)
     operands(block::Block, inst::Instruction) -> Vector{Any}
     operands(block::Block, stmt) -> Vector{Any}
 
-Extract data operands from an instruction's statement — the values the
+Extract data operands from an instruction's statement, the values the
 instruction consumes. Handles `PiNode` and `ControlFlowOp` types natively.
 Returns `Any[]` for unknown statement types.
 
@@ -1204,7 +1201,7 @@ Check whether `val` is defined outside a block (and all its descendants),
 or outside a loop operation's regions.
 
 The loop-op overloads handle values that are conceptually "inside" the loop
-but not stored in a block's args — e.g., `ForOp.iv_arg`.
+but not stored in a block's args, such as `ForOp.iv_arg`.
 
 `Argument`s (function parameters), constants, `GlobalRef`s, and other
 non-SSA values are always considered outside.
@@ -1212,12 +1209,7 @@ non-SSA values are always considered outside.
 Analogous to MLIR's `LoopLikeOpInterface::isDefinedOutsideOfLoop`.
 """
 function is_defined_outside(@nospecialize(val), block::Block)
-    if val isa SSAValue
-        for b in eachblock(block)
-            val ∈ b && return false
-        end
-        return true
-    elseif val isa BlockArgument
+    if val isa SSAValue || val isa BlockArgument
         for b in eachblock(block)
             val ∈ b && return false
         end
@@ -1315,12 +1307,12 @@ literal itself otherwise.
 
 `GlobalRef` lookups are anchored on `sci.valid_worlds` (captured at
 structurization from `IRCode.valid_worlds`) and read only binding-
-partition metadata — never `getfield(mod, name)`. So on 1.12+ this
+partition metadata, never `getfield(mod, name)`. So on 1.12+ this
 neither triggers the "access-to-binding-prior-to-its-definition-world"
 warning nor reflects post-inference rebinds.
 
-The static-value view over [`argextype`](@ref); call `value_type` for the
-widened type instead.
+This is the static-value view over [`argextype`](@ref); call `value_type`
+for the widened type instead.
 """
 const_value(sci::StructuredIRCode, @nospecialize(x)) = from_type(argextype(sci, x))
 
@@ -1344,9 +1336,9 @@ function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
     val isa Undef && return val.type
     val isa Instruction && return val[:type]
     # `MethodInstance` and `CodeInstance` appear as the first operand of
-    # `:invoke` Exprs but they're inference artifacts, not values — match
-    # `static_eval` (codegen.cpp:3245–46) by rejecting them explicitly so
-    # they don't fall through to the literal branch.
+    # `:invoke` Exprs but they're inference artifacts, not values. Match
+    # `static_eval` (codegen.cpp) by rejecting them explicitly so they don't
+    # fall through to the literal branch.
     (val isa Core.MethodInstance || val isa Core.CodeInstance) && return nothing
     val isa QuoteNode && return Core.Compiler.Const(val.value)
     val isa SSAValue && return _argextype_ssa(src, val)
@@ -1355,12 +1347,12 @@ function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
     val isa Argument && return 1 <= val.n <= length(sci.argtypes) ? sci.argtypes[val.n] : nothing
     val isa SlotNumber && return 1 <= val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
     val isa GlobalRef && return global_lattice_element(val, sci.valid_worlds.max_world)
-    # Anything else — `val` is a literal; wrap as `Const` so widenconst /
-    # from_type recover `typeof(val)` / `Some(val)` respectively.
+    # Anything else is a literal; wrap as `Const` so widenconst / from_type
+    # recover `typeof(val)` / `Some(val)` respectively.
     return Core.Compiler.Const(val)
 end
 
-# SSA type lookup: parent-chain walk (Block, structured scope) vs
+# SSA type lookup: parent-chain walk (Block, structured scope) vs.
 # flat scan via `def` (SCI, no scope info available).
 function _argextype_ssa(block::Block, val::SSAValue)
     entry = get(block.body, val.id, nothing)
@@ -1406,7 +1398,7 @@ end
 else
     # 1.11 lacks the binding-partition API. Delegate to the existing
     # `abstract_eval_globalref_type`, which returns `Const(value)` for
-    # const bindings, the binding's declared type otherwise — same
+    # const bindings, the binding's declared type otherwise: the same
     # `from_type`-friendly shape as the 1.12+ path. Reading via
     # `getfield(mod, name)` unconditionally would erase the const-vs-
     # mutable distinction (every binding becomes `Const`), which lets

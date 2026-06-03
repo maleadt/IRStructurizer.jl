@@ -1,11 +1,8 @@
-# CFGToSCF-style structurization
-#
-# Replaces the pattern-matching structural analysis with a principled two-phase
-# algorithm inspired by MLIR's CFGToSCF (Bahmann et al. 2015):
-#   Phase 1: Lift cycles to LoopOps (via natural loop detection)
-#   Phase 2: Lift branches to IfOps (via dominance-based region splitting)
-# Both phases are applied recursively until no unstructured CF remains.
-# A post-pass promotes LoopOps to WhileOp/ForOp where possible.
+# CFGToSCF-style structurization, after MLIR's CFGToSCF (Bahmann et al. 2015):
+#   Phase 1: lift cycles to LoopOps (via natural loop detection)
+#   Phase 2: lift branches to IfOps (via dominance-based region splitting)
+# Both phases recurse until no unstructured CF remains. A post-pass promotes
+# LoopOps to WhileOp/ForOp where possible.
 
 #=============================================================================
  Context
@@ -16,14 +13,14 @@ mutable struct StructurizeCtx
                                  # included after this file; annotate `ctx.m::MCFG` locally)
     cfg::CFG                     # build_cfg(m), cached (block index == MBlock id)
     domtree::DomTree
-    # header → set of block indices in the natural loop
+    # header => set of block indices in the natural loop
     loop_map::Dict{Int, Set{Int}}
     next_ssa::Int
     next_arg::Int
-    types::Dict{Int, Any}       # ssa id → widened type (block args + body stmts + synthesized)
-    def_block::Dict{Int, Int}   # ssa id → defining MBlock id (block args + body stmts)
-    ssa_remap::Dict{Int, Int}   # original → fresh (for inner defs)
-    line_map::Dict{Int, Int}    # ssa_idx → anchor PC/linetable index
+    types::Dict{Int, Any}       # ssa id => widened type (block args + body stmts + synthesized)
+    def_block::Dict{Int, Int}   # ssa id => defining MBlock id (block args + body stmts)
+    ssa_remap::Dict{Int, Int}   # original => fresh (for inner defs)
+    line_map::Dict{Int, Int}    # ssa_idx => anchor PC/linetable index
 end
 
 function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
@@ -32,8 +29,8 @@ function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
     loops = natural_loops_m(m)
     # `ctx.types` feeds structural positions (op result / block-arg / Undef types),
     # which must be concrete `Type`s. Widen so a lattice element (e.g. `Core.Const`
-    # on a single-literal-edge arg) can't land there. Block-arg / synthesized types
-    # live in `m.types`; body-statement types live in each `MStmt`.
+    # on a single-literal-edge arg) can't land there. Block-arg and synthesized
+    # types live in `m.types`; body-statement types live in each `MStmt`.
     types = Dict{Int, Any}()
     def_block = Dict{Int, Int}()
     for (id, t) in m.types
@@ -58,18 +55,18 @@ alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 """Map a synthesized SSA index to the same source location as an existing SSA index."""
 function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
     haskey(ctx.line_map, source_ssa) || return
-    ctx.line_map[new_ssa] = source_ssa  # positive anchor → follow to resolve
+    ctx.line_map[new_ssa] = source_ssa  # positive anchor: follow to resolve
 end
 
 """
     remap_ssa(stmt, f) -> stmt
 
 Rebuild `stmt` with every value operand passed through `f` (a value-mapping
-closure). The single SSA-substitution primitive shared by the walk
-(`remap_stmt`), `emit` (multiplex), and `assemble_ircode` (unstructurize) — each
-supplies its own `f`. Handles every operand-bearing node: `Expr`, `PiNode`,
-`PhiNode` (unassigned slots left unassigned), `GotoIfNot` (cond), `ReturnNode`
-(val), and a bare `SSAValue`. Clones rather than mutates, so shared IR is safe.
+closure). The SSA-substitution primitive shared by `remap_stmt` (the walk),
+`emit` (multiplex), and `assemble_ircode` (unstructurize); each supplies its own
+`f`. Handles every operand-bearing node: `Expr`, `PiNode`, `PhiNode` (unassigned
+slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), and a bare
+`SSAValue`. Clones rather than mutates, so shared IR is safe.
 """
 function remap_ssa(@nospecialize(stmt), f)
     if stmt isa Expr
@@ -118,13 +115,12 @@ include("structurize/loops.jl")
     structurize(m::MCFG, line_map; promote=true) -> (Block, max_ssa, max_arg, line_map)
 
 Convert the (already-normalized) explicit-edge `MCFG` into a structured Block with
-nested IfOp/LoopOp/WhileOp/ForOp. The lift reads the `MBlock` form directly — block
-arguments + per-edge operands replace Julia phi nodes — so there is no dense
-round-trip.
+nested IfOp/LoopOp/WhileOp/ForOp. The lift reads the `MBlock` form directly: block
+arguments and per-edge operands replace Julia phi nodes.
 
-The core walk emits only the generic `LoopOp` (invariant I6); `WhileOp`/`ForOp`
-recognition lives entirely in the `promote_loops!` post-pass. Pass `promote=false`
-to get the pre-promotion form (every loop is a `LoopOp`) — used to test I6.
+The core walk emits only the generic `LoopOp`; `WhileOp`/`ForOp` recognition lives
+in the `promote_loops!` post-pass. Pass `promote=false` to get the pre-promotion
+form, where every loop is a `LoopOp`.
 """
 function structurize(m, line_map::Dict{Int, Int}=Dict{Int, Int}();
                      promote::Bool=true)
