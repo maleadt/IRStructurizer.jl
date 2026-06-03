@@ -57,6 +57,7 @@ function ingest(ir::IRCode)
             elseif stmt isa GotoNode || stmt isa GotoIfNot || stmt isa ReturnNode
                 term_stmt = stmt
                 mb.term_codeloc = loc
+                mb.term_id = si
             else
                 push!(mb.body, MStmt(si, stmt, ir.stmts.type[si], loc, ir.stmts.flag[si]))
             end
@@ -140,6 +141,13 @@ end
             for a in b.args
                 setloc!(a, get(m.codelocs, a, _NOLOC)); line_map[a] = -a
             end
+            # The terminator (e.g. a `GotoIfNot`) is not a body statement, but it
+            # carries the source location for the lifted control-flow op (IfOp,
+            # YieldOp, …). Anchor it at its own PC so the op resolves a location
+            # even when the block has no body (e.g. `if arg`).
+            if b.term_id != 0 && b.term_codeloc[1] != 0
+                setloc!(b.term_id, b.term_codeloc); line_map[b.term_id] = -b.term_id
+            end
         end
         di = CC.DebugInfoStream(line)
         if m.debuginfo isa CC.DebugInfoStream
@@ -158,6 +166,9 @@ else
             end
             for a in b.args
                 li = Int(get(m.codelocs, a, _NOLOC)[1]); li != 0 && (line_map[a] = -li)
+            end
+            if b.term_id != 0
+                li = Int(b.term_codeloc[1]); li != 0 && (line_map[b.term_id] = -li)
             end
         end
         debuginfo_table = m.debuginfo isa Vector ? copy(m.debuginfo) : Core.LineInfoNode[]
