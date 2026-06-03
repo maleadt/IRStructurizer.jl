@@ -299,19 +299,17 @@ end
     end
 end
 
-@testset "empty counted while-loop returns its init, not its bound (ISSUES #3)" begin
+@testset "empty counted while-loop returns its init, not its bound" begin
     # A `while x < n` whose induction value starts at or above the bound runs zero
-    # times, so the loop result must be the *init* (the unchanged IV), not the
-    # bound. A ForOp does not carry its IV as a result, so an earlier promotion
-    # aliased a post-loop read of the IV to the loop's exclusive `upper` — correct
-    # only when the body ran; for the empty case (init ≥ bound) the final IV is the
-    # init, so the alias returned the bound: a silent miscompile (`fixed(5) → 5`,
-    # should be 100 — ISSUES.md #3). It now promotes to a ForOp that *keeps* the
-    # escaping IV as an ordinary carried value (PLAN7): the result is read normally
-    # and is correct for both the empty (= init) and non-empty (= last continue =
-    # upper) cases. The standing loop fuzzers all start the IV *below* the bound
-    # (`for k in 1:n`), so they miss this; the exec-over-empty checks below are what
-    # actually guard it — never remove them.
+    # times, so the loop result must be the init (the unchanged IV), not the bound.
+    # A ForOp does not carry its IV as a result, so promotion keeps the escaping IV
+    # as an ordinary carried value rather than dropping it and aliasing the post-loop
+    # read to `upper`. That alias would equal the IV only when the body ran; for the
+    # empty case (init >= bound) the final IV is the init. The carried value reads
+    # back normally and is correct for both the empty (= init) and non-empty
+    # (= last continue = upper) cases. The standing loop fuzzers all start the IV
+    # below the bound (`for k in 1:n`), so they miss this; the exec-over-empty checks
+    # below are what guard it, so never remove them.
     fixed(n::Int) = (x = 100; while x < n; x += 1; end; x)
     ir, _ = only(code_ircode(fixed, Tuple{Int}))
     # init=100 spans empty (n ≤ 100) and non-empty (n > 100); both promote modes.
@@ -321,8 +319,8 @@ end
             @test execute(sci, n) == fixed(n)
         end
     end
-    # The IV escapes (`return x`), but the kept-carry promotion makes it a correct
-    # ForOp (lower = init 100, step 1) rather than demoting it.
+    # The IV escapes (`return x`) and is kept as a carry, so this is a correct ForOp
+    # (lower = init 100, step 1).
     sci_p = StructuredIRCode(ir; promote=true)
     @test count_stmts(sci_p.entry, s -> s isa WhileOp) == 0
     @test count_stmts(sci_p.entry, s -> s isa ForOp) == 1
@@ -336,16 +334,16 @@ end
         @test @roundtrip fixed_le(n)
     end
 
-    # Step > 1 with a separate accumulator carried alongside the escaping IV — both
+    # Step > 1 with a separate accumulator carried alongside the escaping IV. Both
     # the kept IV carry and the accumulator ride the ForOp correctly.
     fixed_step(n::Int) = (x = 100; s = 0; while x < n; s += x; x += 2; end; x + s)
     for n in (0, 50, 100, 150, 200)
         @test @roundtrip fixed_step(n)
     end
 
-    # A genuine counted `for i in 1:n` does NOT read `i` after the loop (Julia
-    # scopes it), so the gate must not fire — it still promotes to a ForOp. Empty
-    # range (n < 1) included to confirm the well-behaved counted case is untouched.
+    # A genuine counted `for i in 1:n` does not read `i` after the loop (Julia
+    # scopes it out), so the IV is dropped and it still promotes to a ForOp. The
+    # empty range (n < 1) confirms the well-behaved counted case is untouched.
     forsum(n::Int) = (acc = 0; for i in 1:n; acc += i; end; acc)
     ir_for, _ = only(code_ircode(forsum, Tuple{Int}))
     sci_for = StructuredIRCode(ir_for; promote=true)
@@ -355,9 +353,9 @@ end
     end
 end
 
-@testset "escaping IV ForOp: step>1 and inclusive <= bound (PLAN7)" begin
+@testset "escaping IV ForOp: step>1 and inclusive <= bound" begin
     # The kept-IV ForOp must be correct for a non-unit step and for an inclusive
-    # `<=` bound (which adjusts the *range* control by +1 but not the carried value).
+    # `<=` bound (which adjusts the range control by +1 but not the carried value).
 
     # step 2: counted2(5) iterates i=0,2,4 then continues to 6 (the first value
     # failing i<5), so the escaping IV result is 6; empty (n≤0) returns init 0.
@@ -739,12 +737,12 @@ end
         while x < n; x += 1; end
         return x
     end
-    # The pre-header fix lives in the core lift, so assert it across every n —
-    # including the empty-loop cases (init already ≥ bound) where the result is the
-    # branch selection (10/100) itself. Both promote modes: the empty case once
-    # exposed a separate promotion bug (an empty counted while-loop returned its
-    # bound instead of its init — ISSUES.md #3), now closed by the IV-escape gate,
-    # so promote=true must agree across the full range too.
+    # The pre-header fix lives in the core lift, so assert it across every n,
+    # including the empty-loop cases (init already >= bound) where the result is the
+    # branch selection (10/100) itself. Both promote modes are checked: the empty
+    # case once exposed a separate promotion bug where an empty counted while-loop
+    # returned its bound instead of its init, now closed by keeping the escaping IV
+    # as a carry, so promote=true must agree across the full range too.
     ir_np, _ = only(code_ircode(meh1, Tuple{Bool, Int}))
     for promote in (false, true)
         sci_m = StructuredIRCode(ir_np; promote)

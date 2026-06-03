@@ -61,11 +61,11 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     result2, removed2 = try_promote_for(promoted, idx, block, new_body, ctx)
                     if result2 isa ForOp
                         if isempty(removed2)
-                            # IV kept as an ordinary carry because it escapes (PLAN7
-                            # Phase 1): arity/order are unchanged, so post-loop
-                            # getfields read it directly — no for_promotions entry and
-                            # no getfield rewrite. The empty-case value comes out right
-                            # for free from carried-value semantics (empty ⇒ init).
+                            # The escaping IV is kept as an ordinary carry, so the
+                            # arity and order are unchanged and post-loop getfields
+                            # read it directly. No for_promotions entry, no getfield
+                            # rewrite. Carried-value semantics give the empty-loop
+                            # case its init, which is the value we want there.
                             push!(new_body, (idx, result2, entry.type, entry.flag))
                         else
                             for_promotions[idx] = (removed2, result2, Dict{Int,Int}())
@@ -93,11 +93,11 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                     push!(new_body, (idx, new_gf, entry.type, entry.flag))
                 else
-                    # `upper` alias for a removed IV/shadow position. Since PLAN7
-                    # keeps every *escaping* removed position as a real carry, this
-                    # branch is reachable only for a provably-dead getfield (the
-                    # IV-escape gate returned false), so the alias is never observed.
-                    @assert !_ssa_used_in_block(SSAValue(idx), idx, block) "escaping removed position aliased to upper (PLAN7 invariant violated)"
+                    # `upper` alias for a removed IV/shadow position. Every escaping
+                    # removed position is kept as a real carry instead, so this branch
+                    # is only reachable for a provably-dead getfield (the IV-escape
+                    # check returned false) and the alias is never observed.
+                    @assert !_ssa_used_in_block(SSAValue(idx), idx, block) "escaping removed position aliased to upper"
                     push!(new_body, (idx, for_op.upper, entry.type, entry.flag))
                 end
             else
@@ -252,17 +252,15 @@ function simplify_loop_exit(body::Block)
     return result
 end
 
-"""Does a post-loop read of the loop result's `pos`-th field survive in the parent
-block? A `ForOp` does not carry its induction variable as a result — it is implicit
-in the range — so `promote_loops!` aliases any post-loop `getfield` at the IV
-position to the loop's exclusive `upper` bound. That alias equals the final IV only
-when the loop body ran (`for i in lo:hi` exits with `i == hi`); for an *empty* loop
-(init ≥ bound, zero trips) the final IV is the **init** (`lower`), not `upper`, so
-the alias silently returns the bound (ISSUES.md #3). When the IV escapes we must
-therefore *not* promote to `ForOp`; the `WhileOp` form carries the IV as a genuine
-result and stays correct for the empty case. A true counted `for i in lo:hi` never
-reads `i` after the loop (Julia scopes it), so this gate does not demote real
-counted loops — only `while`-shaped loops whose tested value is read afterwards."""
+"""Is the loop result's `pos`-th field read anywhere in the parent block? A `ForOp`
+does not carry its induction variable as a result; the IV is implicit in the range.
+Promotion can drop the IV carry and serve a post-loop `getfield` at that position
+from the exclusive `upper` bound, but `upper` equals the final IV only when the body
+ran at least once. An empty (zero-trip) loop leaves the IV at its init (`lower`), so
+the `upper` alias is wrong there. Callers use this per position to decide whether to
+keep an escaping IV or shadow as a real carry (read back normally) or to drop it
+(safe only when no live read remains). A genuine counted `for i in lo:hi` never reads
+`i` afterwards, since Julia scopes it out, so a counted loop is unaffected."""
 function loop_result_pos_escapes(loop_idx::Int, pos::Int, parent_block::Block)
     for (pidx, pentry) in parent_block.body
         s = pentry.stmt
@@ -470,13 +468,13 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         _ssa_used_in_block(SSAValue(gf_idx), gf_idx, parent_block) && return (loop, Int[], Dict{Int,Int}())
     end
 
-    # IV-escape gate (ISSUES.md #3 / PLAN7 Phase 2): removed positions (the IV and
-    # its value#1 shadows) would otherwise be aliased to `upper` post-loop — wrong
-    # for an empty loop, whose final IV is the init. Rather than decline the whole
-    # promotion, *partition* `removed`: any escaping position becomes a real kept
-    # carry (read back normally), while the rest stay removed (their `upper` alias
-    # is then provably dead). Duplicate-carry redirects stay removed (an Undef-init
-    # dup is not a meaningful escaping value; it is folded into its survivor).
+    # Partition `removed` by whether each position escapes. A removed position (the
+    # IV or one of its value#1 shadows) would otherwise be aliased to `upper`
+    # post-loop, which is wrong for an empty loop whose final IV is the init. So any
+    # escaping position becomes a real kept carry (read back normally) and the rest
+    # stay removed (their `upper` alias is then provably dead). A duplicate-carry
+    # redirect stays removed; an Undef-init dup is folded into its survivor, not a
+    # value that escapes on its own.
     kept = Int[]
     for r in removed
         haskey(carry_redirect, r) && continue
@@ -504,12 +502,12 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         arg_remap[body.args[r].id] = iv_arg
     end
 
-    # Retained carries — genuine carries AND kept escaping IV/shadows (no longer in
-    # `removed`) — get fresh BlockArguments in original index order, each with its
-    # own init. A kept escaping IV/shadow is the current IV *in-body* (e.g. the same
-    # value an `acc += i` reads), so its in-body uses must resolve to `iv_arg`; its
-    # fresh for-arg is then a write-only carry slot that only exposes the post-loop
-    # result. A genuine carry maps its body uses to its own for-arg as usual.
+    # Retained carries get fresh BlockArguments in original index order, each with
+    # its own init. This covers genuine carries and kept escaping IV/shadows (the
+    # latter are no longer in `removed`). A kept escaping IV/shadow holds the current
+    # IV in-body, e.g. the value an `acc += i` reads, so its in-body uses resolve to
+    # `iv_arg` and its fresh for-arg is a write-only carry slot that only exposes the
+    # post-loop result. A genuine carry maps its body uses to its own for-arg.
     non_iv_inits = IRValue[]
     for (i, arg) in enumerate(body.args)
         i ∈ removed && continue
@@ -524,13 +522,13 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         arg_remap[body.args[dup_pos].id] = arg_remap[body.args[surv_pos].id]
     end
 
-    # ContinueOp values. A kept escaping position must carry `iv_arg` itself — NOT
-    # its lifted continue, which is the *advanced* value `iv+step` (the iterate
-    # protocol advances before re-checking, so that continue equals `upper`, the
+    # ContinueOp values. A kept escaping position carries `iv_arg` itself, not its
+    # lifted continue. The iterate protocol advances the state before re-checking, so
+    # the lifted continue is the advanced value `iv+step`, which equals `upper` (the
     # post-loop bound). Carrying `iv_arg` makes the kept carry's last value the last
-    # in-body IV (`upper − step`), matching the LoopOp's break (the pre-advance
-    # current value); the empty range is guarded by the outer `if`, so the init is
-    # only read when the loop ran (PLAN7 §3 — the research answer is wrong here).
+    # in-body IV (`upper - step`), matching the LoopOp's break, which is the
+    # pre-advance current value. The empty range is guarded by the outer `if`, so the
+    # init is read only when the loop ran.
     cont_values = IRValue[]
     for (i, v) in enumerate(continue_op.values)
         i ∈ removed && continue
@@ -540,7 +538,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     # The IV increment (`step_ssa = iv + step`) is implicit in the range. Kept
     # carries reference `iv_arg`, not the increment, so the statement is needed only
     # if some other retained body stmt or surviving carried value reads it. Keep it
-    # iff referenced — a dead increment is harmless, a missing one dangles.
+    # only when referenced. A dead increment is harmless; a missing one dangles.
     last_idx = body.body.ssa_idxes[end]
     incr_used = false
     if step_ssa !== nothing
@@ -675,11 +673,12 @@ end
 Try to promote a WhileOp to ForOp by detecting counting patterns.
 Returns `(promoted_op, removed)` where `removed::Vector{Int}` lists the loop-result
 positions the ForOp dropped (the caller adjusts post-loop `getfield`s accordingly):
-- `(ForOp, [iv_pos])` — the IV was removed (the usual case; it is implicit in the range).
-- `(ForOp, Int[])` — the IV escapes, so it is **kept** as an ordinary carry (PLAN7
-  Phase 1): the result arity/order match the original WhileOp and the empty (zero-trip)
-  case reads back the init, not the bound. No position is removed.
-- `(op, Int[])` with `op` still a WhileOp — not promoted.
+- `(ForOp, [iv_pos])`: the IV was removed, the usual case, since it is implicit in
+  the range.
+- `(ForOp, Int[])`: the IV escapes, so it is kept as an ordinary carry. The result
+  arity and order match the original WhileOp, and the empty (zero-trip) case reads
+  back the init rather than the bound. No position is removed.
+- `(op, Int[])` with `op` still a WhileOp: not promoted.
 """
 function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
                           ctx::StructurizeCtx)
@@ -715,11 +714,10 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     iv_pos = findfirst(a -> a.id == iv_candidate.id, before.args)
     iv_pos === nothing && return (op, Int[])
 
-    # IV-escape gate (ISSUES.md #3 / PLAN7): a ForOp does not carry its IV as a
-    # result. If the IV is read after the loop, do NOT drop it — keep it as an
-    # ordinary carry (`keep_iv`) so the post-loop read is a normal result, correct
-    # for both the empty (init) and non-empty (last continue = upper) cases. When
-    # the IV does not escape, drop it as before (it is redundant with the range).
+    # A ForOp does not carry its IV as a result. If the IV is read after the loop,
+    # keep it as an ordinary carry (`keep_iv`) so the post-loop read is a normal
+    # result, correct for both the empty (init) and non-empty (last continue = upper)
+    # cases. If the IV does not escape, drop it; it is redundant with the range.
     keep_iv = loop_result_pos_escapes(idx, iv_pos, parent_block)
 
     # Find step: look in the after region for add_int(iv_arg, step)
@@ -809,12 +807,12 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     arg_remap[after_iv_arg.id] = iv_arg
     arg_remap[before_iv_arg.id] = iv_arg
 
-    # The IV increment (`carried_val = iv + step`) is implicit in a ForOp, so it
-    # is normally dropped. But if another body statement or a surviving carried
-    # value reads it — e.g. `s += k` where `k` is the post-increment IV, or the
-    # kept-IV carry whose continue *is* the increment — it must stay, remapped
-    # below to read the ForOp's induction variable; dropping it then left a
-    # dangling SSA reference (`%k used but not defined`).
+    # The IV increment (`carried_val = iv + step`) is implicit in a ForOp, so it is
+    # normally dropped. It must stay when something else reads it: another body
+    # statement (e.g. `s += k` where `k` is the post-increment IV), or the kept-IV
+    # carry whose continue is the increment. When kept it is remapped below to read
+    # the ForOp's induction variable; dropping it in that case leaves a dangling SSA
+    # reference (`%k used but not defined`).
     incr_used = keep_iv
     if !incr_used && carried_val isa SSAValue
         for (sidx, sentry) in after.body

@@ -106,10 +106,10 @@ end  # acyclic regions
 
 @testset "simple loop structure - escaping IV is a kept-carry ForOp" begin
     # `i=0; while i<n; i+=1; return i` reads the IV after the loop. A ForOp can't
-    # carry the IV as a range result, but it *can* keep it as an ordinary carried
-    # value (PLAN7): the post-loop read is then a normal result, correct for both
-    # the empty case (= init 0) and non-empty (= n) — earlier this aliased the read
-    # to the bound and miscompiled the empty case (ISSUES.md #3).
+    # carry the IV as a range result, but it can keep it as an ordinary carried
+    # value, so the post-loop read is a normal result, correct for both the empty
+    # case (= init 0) and non-empty (= n). Dropping it and aliasing the read to the
+    # bound would miscompile the empty case.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             @check "for"
@@ -196,10 +196,10 @@ end  # CFG analysis
 
 @testset "bounded counter with escaping IV is a kept-carry ForOp" begin
     # The induction variable `i` is returned, so the ForOp keeps it as an ordinary
-    # carried value (PLAN7) instead of dropping it: the range still drives iteration
-    # (lower 0, upper n, step 1) while the kept carry exposes the post-loop value,
-    # correct for the empty case (= init 0) too. Earlier this aliased the read to
-    # the bound and miscompiled the empty case (ISSUES.md #3).
+    # carried value instead of dropping it. The range still drives iteration (lower
+    # 0, upper n, step 1) while the kept carry exposes the post-loop value, correct
+    # for the empty case (= init 0) too. Dropping it and aliasing the read to the
+    # bound would miscompile the empty case.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             @check "for"
@@ -1602,16 +1602,15 @@ end
 
 @testset "for-in-range whose loop var escapes is a kept-carry ForOp" begin
     # `for i in 1:n; last = i; end; return last` copies the loop variable into
-    # `last`. For a `1:n` range the iterate protocol makes `last` a value#1 *shadow*
-    # of the loop state, and `last` is read after the loop. An earlier promotion
-    # aliased that shadow to the range's upper bound, returning `n+1` instead of `n`
-    # — a silent miscompile (`forlast(1) → 2`) that had NO execution check, so it
-    # went unnoticed (the ISSUES.md #3 root cause via the direct iterate-protocol
-    # path). It now promotes to a ForOp that *keeps* `last` as an ordinary carried
-    # value whose continue is the induction variable (PLAN7 Phase 2 §3 — NOT the
-    # lifted continue, which is the advanced `iv+step` = the bound): the last value
-    # is the last in-body IV (= n), and the empty range is guarded by the outer
-    # `if` so the init (0) is returned for n < 1.
+    # `last`. For a `1:n` range the iterate protocol makes `last` a value#1 shadow of
+    # the loop state, and `last` is read after the loop. Promotion keeps `last` as an
+    # ordinary carried value whose continue is the induction variable, not the lifted
+    # continue (which is the advanced `iv+step`, equal to the bound). The last value
+    # is then the last in-body IV (= n), and the empty range is guarded by the outer
+    # `if`, so the init (0) is returned for n < 1. Aliasing the shadow to the range's
+    # upper bound instead would return `n+1`, a miscompile that earlier had no
+    # execution check to catch it (`forlast(1)` gave 2). The exec checks below cover
+    # the empty case, so keep them.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
             last = 0

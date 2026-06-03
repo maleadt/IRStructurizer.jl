@@ -243,14 +243,13 @@ end
 end
 
 @testset "counting loop whose IV escapes promotes to a kept-carry ForOp" begin
-    # `i=0; while i<n; i+=1; return i` reads the induction variable AFTER the loop.
-    # A ForOp does not carry its IV as a result, so an earlier promotion aliased the
-    # post-loop read to the bound — correct only when the loop ran. For the empty
-    # case (init ≥ bound, e.g. n ≤ 0) the IV keeps its init, so the alias returned
-    # the bound: a silent miscompile (ISSUES.md #3). It now promotes to a ForOp that
-    # *keeps* the escaping IV as an ordinary carried value (PLAN7), so the post-loop
-    # read is a normal result, correct for both the empty (= init 0) and non-empty
-    # (= n) cases.
+    # `i=0; while i<n; i+=1; return i` reads the induction variable after the loop.
+    # A ForOp does not carry its IV as a result, so promotion keeps the escaping IV
+    # as an ordinary carried value rather than dropping it and aliasing the post-loop
+    # read to the bound. The alias would be right only when the loop ran; for the
+    # empty case (init >= bound, e.g. n <= 0) the IV keeps its init. The carried
+    # value reads back normally and is correct for both the empty (= init 0) and
+    # non-empty (= n) cases.
     sci, _ = code_structured(Tuple{Int}) do n::Int
         i = 0
         while i < n
