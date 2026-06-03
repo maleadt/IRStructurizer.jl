@@ -13,7 +13,7 @@ julia> code_structured(f, Tuple{Int})
 1-element Vector{Pair{StructuredIRCode, DataType}}:
  StructuredIRCode(
 │ %1 = intrinsic Base.slt_int(0, _2)::Bool
-│ %2 = if %1 -> Nothing
+│ %7 = if %1 -> Nothing
 │ ├ then:
 │ │   %3 = intrinsic Base.add_int(_2, 1)::Int64
 │ │   return %3
@@ -239,54 +239,69 @@ All three return (or produce) an old→new index mapping and maintain consistenc
 
 ## Implementation
 
-The structurization pipeline converts Julia's unstructured SSA IR (with `GotoNode` and
-`GotoIfNot`) into nested control flow operations (`IfOp`, `ForOp`, `WhileOp`, `LoopOp`).
+The structurizer turns Julia's unstructured SSA IR (`GotoNode`, `GotoIfNot`, `PhiNode`)
+into nested control flow operations: `IfOp`, `ForOp`, `WhileOp`, and `LoopOp`. It uses the
+mutate-then-lift approach of MLIR's CFGToSCF pass (Bahmann et al. 2015).
 
 ```
-Julia IRCode (from code_ircode, includes CFG)
-     │
-     ▼ control_tree.jl
-Control Tree (hierarchical regions)
-     │
-     ▼ structure.jl
-Structured IR (nested Blocks with IfOp/ForOp/etc.)
+code_ircode → IRCode
+     │  ingest                       (structurize/ingest.jl)
+     ▼
+MCFG                                 explicit-edge CFG: block args + per-edge operands
+     │  normalize_cf!                (structurize/normalize.jl)
+     ▼
+MCFG  (single-entry, reducible)
+     │  lift_mcfg → structurize      (structurize.jl, walk.jl, loops.jl)
+     ▼
+StructuredIRCode                     nested Blocks with IfOp/ForOp/WhileOp/LoopOp
+     │  promote_loops!               (structurize/promote.jl)
+     ▼
+StructuredIRCode  (loops classified)
 ```
 
-### Control Tree Construction
+### The MCFG
 
-`ControlTree()` pattern-matches on the CFG (from `ir.cfg.blocks`) to identify structured
-regions. Back edges are detected using `Core.Compiler.construct_domtree()`.
+Julia's `IRCode` is dense (an SSA value is its own position) and falls through from a
+`GotoIfNot` to the next block on a true condition, so you cannot redirect an edge in place.
+`ingest` reads it once into an `MCFG`. There, each block has a stable id, explicit block
+arguments, and a terminator whose edges each carry one operand per target argument. Block
+arguments and per-edge operands replace phi nodes, so the value a predecessor P passes to
+block B's k-th argument is just the operand on the edge from P to B. Redirecting an edge
+stays local.
 
-| Region Type | Pattern |
-|-------------|---------|
-| `REGION_BLOCK` | Linear chain of blocks |
-| `REGION_IF_THEN` | Conditional with one branch |
-| `REGION_IF_THEN_ELSE` | Diamond pattern (two branches merge) |
-| `REGION_PROPER` | Multi-exit acyclic region (short-circuit `\|\|`/`&&`) |
-| `REGION_TERMINATION` | Branch where one or more paths terminate (early return) |
-| `REGION_WHILE_LOOP` | Header with back edge from body |
-| `REGION_FOR_LOOP` | While loop with detected counter pattern |
-| `REGION_NATURAL_LOOP` | General cyclic region |
+### Normalization
 
-Matched regions are contracted into single nodes, and the process repeats until the entire
-CFG reduces to a single control tree.
+The lift only handles single-entry, reducible regions, so `normalize_cf!` runs first and
+rewrites everything else into that shape. Several situations send a block more than one
+entry edge: irreducible loop headers, multi-exit loops, and short-circuit continuations
+among them. Each is routed through a single edge multiplexer (`EdgeMux`), an inserted entry
+block that picks the real target from a discriminator argument. The pass repeats to a
+fixpoint, so a region reaches the lift only once it is single-entry.
 
-For-loop detection analyzes phi nodes in loop headers to find induction variables with
-patterns like `===(iv, bound)` or `slt_int(iv, bound)`.
+### The lift
 
-### Structured IR Generation
+`structurize_region!` walks the normalized `MCFG` and emits structured ops. A natural loop
+becomes a `LoopOp` whose body re-enters with `ContinueOp` and exits with `BreakOp`. A branch
+whose arms reconverge becomes an `IfOp`, each arm a nested region, with merge values passed
+out through `YieldOp`. Phi results become `BlockArgument`s, and the value each predecessor
+feeds in reads off its outgoing edge.
 
-`control_tree_to_structured_ir()` converts the control tree into nested `Block` structures:
+### Loop promotion
 
-- **`IfOp`**: Condition + then/else blocks, results via `YieldOp`
-- **`ForOp`**: Lower/upper/step bounds + body block with induction variable as `BlockArg`
-- **`WhileOp`**: Before (condition) + after (body) regions
-- **`LoopOp`**: General loop with `ContinueOp`/`BreakOp` terminators
+The lift emits only `LoopOp`. The `promote_loops!` post-pass rewrites the ones it
+recognizes: a loop driven by an integer induction variable with a constant step becomes a
+`ForOp`, and a loop that tests its condition before the body becomes a `WhileOp`. The rest
+stay `LoopOp`.
 
-Phi nodes become explicit `BlockArg` values (like MLIR block arguments).
+### Reverse direction
+
+The reverse direction (`unstructurize.jl`) lowers a `StructuredIRCode` back to `IRCode`
+through `IRCode(sci)`. It is there for the tests, which round-trip the structurizer against
+Julia's own IR. cuTile consumes the `StructuredIRCode` directly.
 
 
 ## Acknowledgements
 
-Most of this package is based on [Cédric Belmant](https://github.com/serenity4)'s
-[SPIRV.jl](https://github.com/serenity4/SPIRV.jl) structurization code.
+This package started from [Cédric Belmant](https://github.com/serenity4)'s
+[SPIRV.jl](https://github.com/serenity4/SPIRV.jl) structurization code. The structurizer now
+follows MLIR's CFGToSCF pass (Bahmann et al. 2015).
