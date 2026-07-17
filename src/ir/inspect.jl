@@ -157,6 +157,8 @@ operands(block::Block, inst::Instruction) = operands(block, inst[:stmt])
 
 operands(::Block, s::PiNode) = Any[s.val]
 operands(::Block, s::ControlFlowOp) = operands(s)
+# The unreachable form of `ReturnNode` has no `val`.
+operands(::Block, s::ReturnNode) = isdefined(s, :val) ? Any[s.val] : Any[]
 # Alias statements (stmt IS a value) forward the value itself as their sole operand.
 operands(::Block, s::SSAValue) = Any[s]
 operands(::Block, s::BlockArgument) = Any[s]
