@@ -114,6 +114,42 @@ end
     end
 end
 
+@testset "short-circuit arms merging beside a fall-through edge" begin
+    # `if a; A elseif b || c || d; B else; C end` inlined into a user of the
+    # result. The merge has three predecessors: the `if a` arm, the `||` chain's
+    # own merge (all yielding B), and the fall-through edge that yields C. Once
+    # dropped the C edge, leaving B unconditional.
+    @inline function pick(x::Float64, y::Float64)
+        if x > 1.0 && y > 1.0
+            return 1.0
+        elseif x < 0.0 || y < 0.0 || y > 10.0
+            return -99.0
+        else
+            return x
+        end
+    end
+    use_pick(x::Float64, y::Float64) = copysign(pick(x, y), y)
+    for args in ((2.0, 2.0), (-1.0, 1.0), (0.5, 0.5), (0.5, -1.0), (0.5, 20.0), (0.0, 1.0))
+        @test @roundtrip use_pick(args...)
+    end
+end
+
+@testset "phi operand is a GlobalRef" begin
+    # A merge can carry a `GlobalRef` to a const binding as an operand (Base's
+    # math kernels yield `Inf` that way). Typing the operand as the GlobalRef
+    # object rather than the binding's value failed block-arg validation.
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 3), Any)],                     succs=[3, 2]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(PhiNode(Int32[2, 3], Any[GlobalRef(Base, :Inf), 0.0]), Float64),
+                (ReturnNode(SSAValue(4)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool])
+    sci = StructuredIRCode(ir)
+    @test execute(sci, true) === Inf
+    @test execute(sci, false) === 0.0
+end
+
 #=============================================================================
  CFG families — executable roundtrip net
 =============================================================================#
