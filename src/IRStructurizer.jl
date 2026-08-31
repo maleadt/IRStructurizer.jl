@@ -3,11 +3,12 @@ module IRStructurizer
 using Core: MethodInstance, CodeInfo, SSAValue, Argument, SlotNumber,
             GotoNode, GotoIfNot, ReturnNode, PhiNode, PiNode, QuoteNode, GlobalRef
 
-using Core.Compiler: IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
-                     construct_domtree, DomTree, dominates,
-                     CFGReachability,
-                     widenconst,
-                     WorldRange
+using Compiler: Compiler as CC, IRCode, CFG, BasicBlock, InstructionStream, StmtRange,
+                construct_domtree, DomTree, dominates,
+                CFGReachability,
+                widenconst,
+                WorldRange
+
 using Base: code_ircode
 
 # structured IR: data structures and pretty-printing

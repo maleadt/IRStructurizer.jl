@@ -70,4 +70,18 @@ end
     @test @roundtrip f_nested(0)
 end
 
+@testset "round trip preserves valid_worlds and passes verify_ir" begin
+    # `gcd` references globals from Base submodules; without the original
+    # `valid_worlds` the reconstructed IRCode defaults to the full world range
+    # and `verify_ir` rejects those as partitioned GlobalRefs on 1.12+.
+    CC = Core.Compiler
+    ir, _ = only(code_ircode(gcd, (Int, Int)))
+    sci = StructuredIRCode(ir)
+    ir2 = CC.IRCode(sci)
+    CC.verify_ir(ir2)  # should not throw
+    @static if VERSION >= v"1.12-"
+        @test ir2.valid_worlds == ir.valid_worlds
+    end
+end
+
 end  # unstructurize

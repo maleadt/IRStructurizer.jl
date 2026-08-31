@@ -751,7 +751,7 @@ end
 function source_location(sci::StructuredIRCode, ssa_idx::Int)
     pc = resolve_line(sci.line_map, ssa_idx)
     pc === nothing && return SourceLocation[]
-    debuginfo = sci.debuginfo_table::Core.Compiler.DebugInfoStream
+    debuginfo = sci.debuginfo_table::CC.DebugInfoStream
     return resolve_debuginfo(debuginfo, debuginfo.def, pc)
 end
 
@@ -761,12 +761,38 @@ function resolve_debuginfo(debuginfo, @nospecialize(def), pc::Int)
     return scopes
 end
 
-# Reimplements Compiler/src/ssair/show.jl append_scopes! for SourceLocation
+@static if VERSION >= v"1.14-"
+
+# Mirrors Compiler/src/ssair/show.jl append_scopes! for SourceLocation.
+function append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nospecialize(def))
+    doupdate = true
+    while debuginfo !== nothing
+        debuginfo.def isa Symbol || (def = debuginfo.def)
+        if pc <= 0
+            return false
+        elseif !CC.has_prev_debuginfo(debuginfo, pc)
+            line = CC.source_location(debuginfo, pc).line
+            line <= 0 && (doupdate = false; line = 0)
+            push!(scopes, SourceLocation(def, debuginfo_file(debuginfo), Int32(line)))
+        else
+            prev_debuginfo, prev_pc = CC.prev_debuginfo(debuginfo, pc)
+            doupdate &= append_scopes!(scopes, prev_pc, prev_debuginfo, def)
+        end
+        def = :var"macro expansion"
+        debuginfo, pc = CC.edge_debuginfo(debuginfo, pc)
+        doupdate |= debuginfo !== nothing
+    end
+    return doupdate
+end
+
+else
+
+# Mirrors the pre-1.14 Compiler/src/ssair/show.jl append_scopes! implementation.
 function append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nospecialize(def))
     doupdate = true
     while true
         debuginfo.def isa Symbol || (def = debuginfo.def)
-        codeloc = Core.Compiler.getdebugidx(debuginfo, pc)
+        codeloc = CC.getdebugidx(debuginfo, pc)
         line::Int = codeloc[1]
         inl_to::Int = codeloc[2]
         doupdate &= line != 0 || inl_to != 0
@@ -781,6 +807,8 @@ function append_scopes!(scopes::Vector{SourceLocation}, pc::Int, debuginfo, @nos
         debuginfo = debuginfo.edges[inl_to]
         pc = Int(codeloc[3])
     end
+end
+
 end
 
 function debuginfo_file(debuginfo)

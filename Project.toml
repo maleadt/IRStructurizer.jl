@@ -8,11 +8,13 @@ projects = ["test"]
 
 [deps]
 AbstractTrees = "1520ce14-60c1-5f80-bbc7-55ef81b5835c"
+Compiler = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
 MLStyle = "d8e11817-5142-5d16-987a-aa16d5891078"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [compat]
 AbstractTrees = "0.4"
+Compiler = "0.1"
 MLStyle = "0.4"
 PrecompileTools = "1"
 julia = "1.11"

@@ -43,6 +43,22 @@ end
     validate_scf(sci)  # Should not throw
 end
 
+@testset "exception handling is rejected, not silently dropped" begin
+    # `EnterNode` is a terminator whose catch edge has no structured
+    # counterpart; ingest must reject it outright instead of dropping the
+    # handler block.
+    trycatch(x) = try; sqrt(x); catch; -1.0; end
+    @test_throws UnstructuredControlFlowError code_structured(trycatch, (Float64,))
+
+    tryfinally(x) = try; sqrt(x); finally; global _finally_hit = true; end
+    @test_throws UnstructuredControlFlowError code_structured(tryfinally, (Float64,))
+
+    # The throw happens at ingest, before any validation pass runs
+    ir, _ = only(code_ircode(trycatch, (Float64,)))
+    @test any(s -> s isa Core.EnterNode, ir.stmts.stmt)
+    @test_throws UnstructuredControlFlowError StructuredIRCode(ir; validate=false)
+end
+
 @testset "validation: invalid terminators" begin
     # Manually construct malformed IR with missing YieldOp
     then_region = Block()
