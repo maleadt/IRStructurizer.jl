@@ -43,7 +43,13 @@ function ingest(ir::IRCode)
             stmt = ir.stmts.stmt[si]
             loc = _codeloc(ir, si)
             last_loc = loc
-            if stmt isa PhiNode
+            if stmt isa Core.EnterNode
+                # An `EnterNode` is a terminator whose implicit edge to the
+                # catch handler has no structured counterpart; ingesting it as
+                # a plain statement would silently drop the handler block.
+                throw(UnstructuredControlFlowError(
+                    "exception handling is not supported (EnterNode at statement $si)"))
+            elseif stmt isa PhiNode
                 push!(mb.args, si)
                 types[si] = ir.stmts.type[si]
                 codelocs[si] = loc
