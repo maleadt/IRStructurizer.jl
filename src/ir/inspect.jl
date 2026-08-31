@@ -51,7 +51,7 @@ function resolve_callee(block::Block, @nospecialize(ref))
     if ref isa SSAValue || ref isa Argument || ref isa BlockArgument || ref isa SlotNumber
         T = value_type(block, ref)
         T === nothing && return nothing
-        return Core.Compiler.singleton_type(T)
+        return CC.singleton_type(T)
     end
     # GlobalRefs in optimized IR are guaranteed valid: inference rejects undefined bindings.
     ref isa GlobalRef && return getfield(ref.mod, ref.name)
@@ -373,7 +373,7 @@ function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
     # `static_eval` (codegen.cpp) by rejecting them explicitly so they don't
     # fall through to the literal branch.
     (val isa Core.MethodInstance || val isa Core.CodeInstance) && return nothing
-    val isa QuoteNode && return Core.Compiler.Const(val.value)
+    val isa QuoteNode && return CC.Const(val.value)
     val isa SSAValue && return _argextype_ssa(src, val)
     # The remaining shapes need access to `sci.argtypes`/`sci.valid_worlds`.
     sci = src isa StructuredIRCode ? src : root(src)
@@ -382,7 +382,7 @@ function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
     val isa GlobalRef && return global_lattice_element(val, sci.valid_worlds.max_world)
     # Anything else is a literal; wrap as `Const` so widenconst / from_type
     # recover `typeof(val)` / `Some(val)` respectively.
-    return Core.Compiler.Const(val)
+    return CC.Const(val)
 end
 
 # SSA type lookup: parent-chain walk (Block, structured scope) vs.
@@ -410,7 +410,7 @@ end
 # Mirrors `singleton_type` + `Const`-unwrap in one helper.
 function from_type(@nospecialize(rt))
     rt === nothing && return nothing
-    rt isa Core.Compiler.Const && return Some(rt.val)
+    rt isa CC.Const && return Some(rt.val)
     if rt isa Type && isdefined(rt, :instance)
         return Some(rt.instance)
     end
@@ -423,10 +423,10 @@ end
 @static if VERSION >= v"1.12-"
     function global_lattice_element(g::GlobalRef, world::UInt)
         binding = convert(Core.Binding, g)
-        partition = Core.Compiler.lookup_binding_partition(world, binding)
+        partition = CC.lookup_binding_partition(world, binding)
         (_, (leaf_binding, leaf_partition)) =
-            Core.Compiler.walk_binding_partition(binding, partition, world)
-        return Core.Compiler.abstract_eval_partition_load(nothing, leaf_binding, leaf_partition).rt
+            CC.walk_binding_partition(binding, partition, world)
+        return CC.abstract_eval_partition_load(nothing, leaf_binding, leaf_partition).rt
     end
 else
     # 1.11 lacks the binding-partition API. Delegate to the existing
@@ -437,5 +437,5 @@ else
     # mutable distinction (every binding becomes `Const`), which lets
     # mutable host globals leak into kernel IR as compile-time values.
     global_lattice_element(g::GlobalRef, ::UInt) =
-        Core.Compiler.abstract_eval_globalref_type(g)
+        CC.abstract_eval_globalref_type(g)
 end

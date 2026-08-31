@@ -3,7 +3,6 @@
 # Lowers nested control flow ops (IfOp, ForOp, WhileOp, LoopOp) back to
 # GotoNode/GotoIfNot/PhiNode/ReturnNode for execution via OpaqueClosure.
 
-const CC = Core.Compiler
 
 #=============================================================================
  Data Structures
@@ -564,6 +563,8 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
                     pos += 1
                     pc = resolve_line(ctx.line_map, sparse_ssa)
                     pc === nothing && continue
+                    # Preserve the raw edge id/pc; the debuginfo traversal API
+                    # resolves the edge but does not expose those indices.
                     codeloc = CC.getdebugidx(sci.debuginfo_table, pc)
                     off = 3*(pos-1)
                     line[off+1] = codeloc[1]
@@ -686,5 +687,4 @@ function CC.IRCode(sci::StructuredIRCode)
 
     return assemble_ircode(ctx, sci)
 end
-
 

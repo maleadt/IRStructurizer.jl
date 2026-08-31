@@ -6,6 +6,10 @@ const _NOLOC = (Int32(0), Int32(0), Int32(0))
 
 # Per-statement debug location, captured at ingest into each `MStmt.codeloc`.
 # On 1.12+ this is the `(line, inlined_at, ?)` triple from the `DebugInfoStream`.
+# `getdebugidx` is being phased out upstream for location *resolution*
+# (JuliaLang/julia#61979), but we copy the raw codeloc triples verbatim so the
+# reconstructed IR keeps its inlining provenance — the replacement API
+# (`source_location`/`prev_debuginfo`/`edge_debuginfo`) cannot express that.
 # On 1.11 it is the single linetable index `stmts.line[pc]` stashed in slot 1
 # (slots 2/3 unused), which `capture_debuginfo` uses to rebuild the SCI line map.
 @static if VERSION >= v"1.12-"
