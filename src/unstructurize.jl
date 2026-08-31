@@ -597,7 +597,8 @@ function assemble_ircode(ctx::UnstructurizeCtx, sci::StructuredIRCode)
 
     return build_dense_ircode(all_stmts, all_types, fill(UInt32(0), n), line, bb_ranges;
                               argtypes=sci.argtypes, sptypes=sci.sptypes,
-                              debuginfo=sci.debuginfo_table)
+                              debuginfo=sci.debuginfo_table,
+                              valid_worlds=sci.valid_worlds)
 end
 
 function _cfg_edge!(blocks::Vector{BasicBlock}, from::Int, to::Int)
@@ -607,14 +608,15 @@ end
 
 """
     build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
-                       argtypes, sptypes, debuginfo) -> IRCode
+                       argtypes, sptypes, debuginfo, valid_worlds) -> IRCode
 
 Assemble a dense `IRCode` from flat statement arrays plus per-block statement
 ranges. Builds the CFG (preds/succs from each block's last statement), the
 `InstructionStream`, and the debug info, then constructs the `IRCode`.
 """
 function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
-                            argtypes, sptypes, debuginfo)
+                            argtypes, sptypes, debuginfo,
+                            valid_worlds::WorldRange=WorldRange(typemin(UInt), typemax(UInt)))
     n = length(all_stmts)
     nb = length(bb_ranges)
     bb_blocks = BasicBlock[]
@@ -650,8 +652,11 @@ function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
             di.linetable = debuginfo.linetable
             di.edges = copy(debuginfo.edges)
         end
-        return IRCode(stmts, cfg, di, copy(argtypes), meta, CC.VarState[s for s in sptypes])
+        return IRCode(stmts, cfg, di, copy(argtypes), meta, CC.VarState[s for s in sptypes],
+                      valid_worlds)
     else
+        # 1.11's IRCode has no valid_worlds field; the SCI-captured range is
+        # only used for binding-partition lookups there.
         linetable = debuginfo isa Vector ? copy(debuginfo) : Core.LineInfoNode[]
         return IRCode(stmts, cfg, linetable, copy(argtypes), meta, CC.VarState[s for s in sptypes])
     end
