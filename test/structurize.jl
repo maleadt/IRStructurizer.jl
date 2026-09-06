@@ -1578,6 +1578,44 @@ end
     @test @roundtrip f_nested_forin(3, 4)
 end
 
+@testset "nested loops with an inner value escaping the outer loop" begin
+    # A value defined in the inner loop and used after the outer loop escapes both
+    # loops. The outer lift renames it to a fresh id and carries that id, so the
+    # inner loop's post-loop result must land at the renamed id, and an inner
+    # header arg that escapes the outer loop must still bind to the inner block
+    # argument inside the inner body. Constant bounds keep the inner loop's result
+    # a direct escapee (no entry guard/merge between the loops).
+    f_const = (x) -> (for i in 1:2; for j in 1:2; x = x * (i + j); end; end; x)
+    @test @roundtrip f_const(1.5f0)
+    f_noi = (x) -> (for i in 1:2; for j in 1:2; x = x * 0.5f0; end; end; x)
+    @test @roundtrip f_noi(1.5f0)
+    f_comma = (x) -> (for i in 1:2, j in 1:2; x = x * (i + j); end; x)
+    @test @roundtrip f_comma(1.5f0)
+    f_triple = (x) -> (for i in 1:2; for j in 1:2; for k in 1:2; x = x * (i + j + k); end; end; end; x)
+    @test @roundtrip f_triple(1.5f0)
+    # the inner loop's header arg (`x`) is the value escaping the outer loop
+    f_while_in_for = (x) -> (for i in 1:2; j = 1; while j <= 2; x = x * (i + j); j += 1; end; end; x)
+    @test @roundtrip f_while_in_for(1.5f0)
+    # an inner header arg (`j`) used after the outer loop
+    f_hdr = (x) -> (j = 0; for i in 1:2; for j in 1:2; x = x * (i + j); end; end; x + j)
+    @test @roundtrip f_hdr(1.5f0)
+
+    # Both loops still promote to ForOp.
+    @test @filecheck begin
+        code_structured(Tuple{Float32}) do x
+            @check "for"
+            for i in 1:2
+                @check "for"
+                for j in 1:2
+                    @check "mul_float"
+                    x = x * (i + j)
+                end
+            end
+            return x
+        end
+    end
+end
+
 @testset "for-in-range with tuple destructuring" begin
     @test @filecheck begin
         code_structured(Tuple{Int}) do n
