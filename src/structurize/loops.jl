@@ -265,6 +265,16 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     # Save remap state and add extra-exit remappings for the loop body.
     # Inner defs get fresh indices; outer getfields keep the originals.
     saved_remap = copy(ctx.ssa_remap)
+    # Inside the body, a header arg is this loop's own block argument (`subs`),
+    # never an enclosing scope's rename of the same id. An enclosing loop renames
+    # a header arg of this loop when it also escapes that enclosing loop (it is
+    # one of the enclosing loop's extra exits); that rename names the post-loop
+    # result, emitted after the body at the renamed id (step 7), not the in-loop
+    # value. Drop such entries for the body walk so `emit_block_stmts!` leaves
+    # the id for `apply_substitutions!` to bind to the block argument.
+    for phi in phi_info
+        delete!(ctx.ssa_remap, phi.ssa_idx)
+    end
     for ex in extra_exits
         fresh = alloc_ssa!(ctx)
         ctx.ssa_remap[ex.ssa_idx] = fresh
@@ -312,7 +322,14 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         # The loop result lands at the header arg's own id: a header is never a
         # branch merge (the pre-header is), so `phi_idx` is not pre-defined by an
         # enclosing IfOp, and post-loop uses of `phi_idx` resolve to this result.
-        push!(block, phi_idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
+        # Unless an enclosing loop renamed it: when this loop is nested in another
+        # loop and `phi_idx` also escapes the enclosing loop, the enclosing
+        # `emit_loop!` already allocated a fresh id for it (`ctx.ssa_remap`, restored
+        # to the enclosing scope above) and carries that fresh id on its
+        # continue/break. The post-loop definition must land there, exactly as
+        # `emit_ifop_result!` does for a merge arg, or the enclosing carry dangles.
+        idx = get(ctx.ssa_remap, phi_idx, phi_idx)
+        push!(block, idx, Expr(:call, Core.getfield, SSAValue(loop_ssa), i), phi_type)
     end
 
     return exit_dest
