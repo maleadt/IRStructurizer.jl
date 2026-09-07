@@ -216,6 +216,28 @@ end
 
 # A custom iterator with the unit-range protocol shape whose state wraps: it starts
 # at 0xfe and stops on equality with 0x00, so it visits fe, ff, 00.
+# Effects in iterate's exit/advance arms must keep their original execution count.
+struct EffectIter{OnExit} end
+Base.iterate(::EffectIter) = (Int8(1), Int8(1))
+function Base.iterate(::EffectIter{OnExit}, i::Int8) where OnExit
+    if i == Int8(3)
+        OnExit && visit!(99)
+        nothing
+    else
+        OnExit || visit!(Int(i))
+        (i + Int8(1), i + Int8(1))
+    end
+end
+
+# Ordered entry alone does not prove that an equality recurrence reaches its end.
+struct EqualityContinues end
+Base.iterate(::EqualityContinues) = (0x01, 0x01)
+Base.iterate(::EqualityContinues, s::UInt8) = s == 0x03 ? (s + 0x01, s + 0x01) : nothing
+
+struct OffGridIter end
+Base.iterate(::OffGridIter) = (0x01, 0x01)
+Base.iterate(::OffGridIter, s::UInt8) = s == 0x02 ? nothing : (s + 0x02, s + 0x02)
+
 struct WrapIter end
 Base.iterate(::WrapIter) = (0xfe, 0xfe)
 Base.iterate(::WrapIter, s::UInt8) = s == 0x00 ? nothing : (s + 0x01, s + 0x01)
@@ -387,6 +409,37 @@ end
 end
 
 @testset "promotion requires a counted-loop proof" begin
+    consume_effect(r) = (s = 0; for i in r; s += Int(i); end; s)
+    for on_exit in (true, false)
+        r = EffectIter{on_exit}()
+        empty!(VISITS)
+        expected = consume_effect(r)
+        trace = copy(VISITS)
+        @test trace == (on_exit ? [99] : [1, 2])
+        sci, _ = only(code_structured(consume_effect, Tuple{typeof(r)}))
+        @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+        empty!(VISITS)
+        @test execute(sci, r) == expected
+        @test VISITS == trace
+    end
+
+    # Equality can select the continuation arm rather than the exit arm.
+    r = EqualityContinues()
+    sci, _ = only(code_structured(consume_effect, Tuple{typeof(r)}))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test execute(sci, r) == consume_effect(r) == 1
+
+    off_grid() = (for i in OffGridIter(); visit!(i); end; nothing)
+    empty!(VISITS)
+    @test_throws ErrorException off_grid()
+    trace = copy(VISITS)
+    @test trace == [0x01, 0x03, 0x05, 0x07]
+    sci, _ = only(code_structured(off_grid, Tuple{}))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci)
+    @test VISITS == trace
+
     # The counted-range contract (see the `ForOp` docstring) excludes wraparound, so
     # a source loop becomes a ForOp only when its entry order, endpoint reachability
     # and final update are proved. A recognizable shape alone is not a proof.
@@ -483,6 +536,17 @@ function unit_range_guard_ir(; bound::Int=3, cmp::Symbol=:slt_int, inverted::Boo
 end
 
 @testset "counted-loop proofs: acceptance and rejection" begin
+    # An abstract type is not evidence of immutable fields: Any can hold a Ref.
+    ctx = IRStructurizer.StructurizeCtx(IRStructurizer.ingest(unit_range_guard_ir()))
+    for (ty, same) in ((Tuple{Int}, true), (Base.RefValue{Int}, false), (Any, false))
+        block = Block()
+        object = BlockArgument(100, ty)
+        push!(block, 1, Expr(:call, Core.getfield, object, 1), Int)
+        push!(block, 2, Expr(:call, Core.getfield, object, 1), Int)
+        scope = IRStructurizer.PromoteScope([block], Tuple{IfOp, Symbol}[])
+        @test IRStructurizer.same_value(ctx, scope, SSAValue(1), SSAValue(2)) == same
+    end
+
     # --- the unit-range entry guard, hand-built for both polarities ---
     count_ref(first, upper) = length(first:upper)
     for inverted in (false, true)

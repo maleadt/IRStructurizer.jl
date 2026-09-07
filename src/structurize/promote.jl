@@ -231,7 +231,7 @@ Whether `a` and `b` are the same value: the same SSA value, block argument,
 argument or constant, or two `getfield` projections of the same constant field
 of the same immutable object. The latter matters for opaque ranges: Julia's
 `iterate` reads `r.start`/`r.stop` afresh for the guard, the initial state and
-the exit test, and never CSEs the reads. Fields of mutable objects are not
+the exit test without necessarily combining the reads. Fields of mutable objects are not
 followed: a body may write them between two reads.
 """
 function same_value(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(a), @nospecialize(b))
@@ -247,7 +247,7 @@ function same_value(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(a), 
         fa[2] === fb[2] || return false
         same_value(ctx, scope, fa[1], fb[1]) || return false
         T = scope_value_type(ctx, scope, fa[1])
-        return T isa DataType && !ismutabletype(T)
+        return T isa DataType && isconcretetype(T) && !ismutabletype(T)
     elseif a isa BlockArgument && b isa BlockArgument
         return a.id == b.id
     elseif a isa Argument && b isa Argument
@@ -565,7 +565,7 @@ function simplify_loop_exit(body::Block)
         if cond_entry !== nothing && cond_entry.stmt isa Expr &&
            cond_entry.stmt.head === :call && length(cond_entry.stmt.args) == 2
             func = cond_entry.stmt.args[1]
-            if func isa GlobalRef && func.name === :not_int
+            if callee_value(func) === Core.Intrinsics.not_int
                 cond = cond_entry.stmt.args[2]
                 inverted = true
             end
@@ -617,6 +617,26 @@ function simplify_loop_exit(body::Block)
     end
     cont_term isa ContinueOp || return nothing
 
+    # Only the protocol projections and flag inversion disappear between the
+    # inner decision and the outer dispatch. Other work, including work in the
+    # dispatch arms, must remain in the general loop.
+    isempty(outer.then_region.body) && isempty(outer.else_region.body) || return nothing
+    past_inner = false
+    for (sidx, sentry) in body.body
+        sidx == inner_result.id && (past_inner = true; continue)
+        past_inner || continue
+        sidx == outer_idx && break
+        s = sentry.stmt
+        projection = getfield_operands(s)
+        if projection !== nothing && projection[1] === inner_result
+            continue
+        end
+        if sidx == outer.condition.id && inverted
+            continue  # the not_int already matched above
+        end
+        return nothing
+    end
+
     # Build getfield-to-inner_yield substitution maps.
     cont_subs = Dict{Int, Any}()
     break_subs = Dict{Int, Any}()
@@ -635,7 +655,7 @@ function simplify_loop_exit(body::Block)
     cont_values = IRValue[subst_val(v, cont_subs) for v in cont_term.values]
     break_values = IRValue[subst_val(v, break_subs) for v in break_term.values]
 
-    # Build merged IfOp: inner condition true means done means break, false means continue.
+    # Preserve which value of the inner condition selects the done arm.
     merged_then = Block()
     for (sidx, sentry) in done_body_region.body
         push!(merged_then.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
@@ -648,7 +668,8 @@ function simplify_loop_exit(body::Block)
     end
     merged_else.terminator = ContinueOp(cont_values)
 
-    merged_if = IfOp(inner.condition, merged_then, merged_else)
+    merged_if = then_flag ? IfOp(inner.condition, merged_then, merged_else) :
+                            IfOp(inner.condition, merged_else, merged_then)
 
     # Build new Block with simplified body (original is not modified)
     result = Block()
@@ -770,7 +791,14 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         return (loop, Int[], Dict{Int,Int}())
     end
 
-    # Condition must be a comparison (===, slt_int, sle_int) on block_arg vs bound.
+    # Promotion drops the exit arm and executes the continuation arm on the
+    # final iteration too. Check the exit arm here; continuation speculation is
+    # checked below, once the integer recurrence has been identified.
+    exit_region = then_t isa BreakOp ? if_op.then_region : if_op.else_region
+    all(droppable_loop_def(e) for (_, e) in exit_region.body) ||
+        return (loop, Int[], Dict{Int,Int}())
+
+    # The exit condition must compare the IV with the bound.
     cond_val = if_op.condition
     cond_val isa SSAValue || return (loop, Int[], Dict{Int,Int}())
     cond_entry = get(body.body, cond_val.id, nothing)
@@ -785,7 +813,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 
     # Only handle === with break-on-true (the iteration protocol pattern).
     # slt_int/sle_int patterns are handled by the WhileOp-to-ForOp path.
-    is_eq = (func isa GlobalRef && func.name === :(===)) || func === :(===)
+    is_eq = callee_value(func) === Core.:(===)
     (is_eq && then_t isa BreakOp) || return (loop, Int[], Dict{Int,Int}())
 
     iv_candidate isa BlockArgument || return (loop, Int[], Dict{Int,Int}())
@@ -803,7 +831,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
             s = step_entry.stmt
             if s isa Expr && s.head === :call && length(s.args) >= 3
                 sfunc = s.args[1]
-                if sfunc isa GlobalRef && sfunc.name === :add_int &&
+                if callee_value(sfunc) === Core.Intrinsics.add_int &&
                    s.args[2] isa BlockArgument && s.args[2].id == iv_candidate.id
                     step = s.args[3]
                     step_ssa = step_val.id
@@ -820,6 +848,12 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     counted_loop_legal_iterate(ctx, inner_scope(scope, body, cont_region),
                                iv_candidate, lower, bound, step) === nothing &&
         return (loop, Int[], Dict{Int,Int}())
+
+    # The matched integer addition is total, including at the endpoint. Other
+    # continuation statements need the compiler's speculation guarantees.
+    all(sidx == step_ssa ||
+        (e.flag & IR_FLAGS_HOISTABLE == IR_FLAGS_HOISTABLE && terminates(e))
+        for (sidx, e) in cont_region.body) || return (loop, Int[], Dict{Int,Int}())
 
     # Step and bound must be loop-invariant: not a block argument of the loop, and
     # not defined in the body (the bound is computed in the header part of `body`,
@@ -1166,7 +1200,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
             s = step_entry.stmt
             if s isa Expr && s.head === :call && length(s.args) >= 3
                 sfunc = s.args[1]
-                if sfunc isa GlobalRef && sfunc.name === :add_int
+                if callee_value(sfunc) === Core.Intrinsics.add_int
                     # Match either after or before block arg (cross-scope reference)
                     if s.args[2] isa BlockArgument &&
                        (s.args[2].id == after_iv_arg.id || s.args[2].id == before_iv_arg.id)
