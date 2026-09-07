@@ -185,6 +185,29 @@ end
     end
 end
 
+@testset "invalid counted-loop contracts" begin
+    build_invalid(lo, up, st; inclusive) = forop_sci(
+        (body, iv, carry) -> carry, lo, up, st, Int8; inclusive, carry_init=Int8(0))
+    for (lo, up, st, inclusive) in (
+        (Int8(1), Int8(5), Int8(0), true),
+        (Int8(1), Int8(5), Int8(-1), true),
+        (Int8(1), Int8(4), Int8(2), true),
+        (Int8(126), Int8(127), Int8(2), false),
+        (1, Int8(5), Int8(1), true),
+        (Int8(1), UInt8(5), Int8(1), true),
+        (Int8(1), Int8(5), 1.0, true))
+        sci = build_invalid(lo, up, st; inclusive)
+        @test_throws ErrorException validate_terminators(sci)
+        @test_throws ErrorException expand_for_loops!(sci)
+        @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    end
+    # Inferred constants carry the same obligations as literal operands.
+    sci = build_invalid(Int8(1), Int8(4), Int8(2); inclusive=true)
+    push!(sci.entry, 6, Int8(4), Core.Const(Int8(4)))
+    sci.entry.body[4].stmt.upper = SSAValue(6)
+    @test_throws ErrorException validate_terminators(sci)
+end
+
 @testset "validation of the expanded IR" begin
     # a loop-carried Undef init (an extra exit value) survives the expansion
     forlast(n) = (last = 0; for i in 1:n; last = i; end; last)

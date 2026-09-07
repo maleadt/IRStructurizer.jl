@@ -40,6 +40,8 @@ re-promoted.
 function expand_for_loops!(sci::StructuredIRCode; validate::Bool=true)
     sci.entry.parent = sci
     fix_parents!(sci.entry)
+    # Check the producer contract before expansion erases the ForOps.
+    validate && validate_terminators(sci)
     expand_for_loops_in!(sci, sci.entry)
     if validate
         validate_scf(sci.entry)
@@ -123,8 +125,8 @@ function expand_inclusive!(sci::StructuredIRCode, block::Block, idx::Int, op::Fo
     iv = op.iv_arg
     body = op.body
     carry_types = Any[a.type for a in body.args]
-    public = ifop_expected_yield_types(result_type)
-    nresults = public === nothing ? length(carry_types) : min(length(public), length(carry_types))
+    result_types = ifop_expected_yield_types(result_type)
+    nresults = result_types === nothing ? length(carry_types) : length(result_types)
 
     # Latch: after the continuation's own values, stop on `iv === upper`, else
     # advance. Both arms diverge, so the continuation block ends in the dispatch.

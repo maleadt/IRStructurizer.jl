@@ -247,15 +247,26 @@ function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode
             push!(errors, "ForOp at %$idx: BreakOp in a counted loop body (a loop with a secondary exit must stay a LoopOp)")
         end
     end
-    # Statically contradictory constants: a non-positive or mistyped literal step,
-    # or an inclusive constant range whose end is off the step grid.
     if T !== nothing
-        st, lo, up = op.step, op.lower, op.upper
-        if st isa Integer && !(st isa T && st > zero(T))
-            push!(errors, "ForOp at %$idx: step $st is not a positive $T")
-        elseif op.inclusive && st isa T && lo isa T && up isa T && lo <= up &&
-               (big(up) - big(lo)) % big(st) != 0
-            push!(errors, "ForOp at %$idx: inclusive bound $up is not on the grid of $lo:$st")
+        for (name, operand) in ((:lower, op.lower), (:upper, op.upper), (:step, op.step))
+            ty = argextype(sci, operand)
+            if ty === nothing || widenconst(ty) !== T
+                push!(errors, "ForOp at %$idx: $name must have induction variable type $T")
+            end
+        end
+        constant(v) = (ty = argextype(sci, v); ty isa CC.Const ? ty.val : nothing)
+        st, lo, up = constant(op.step), constant(op.lower), constant(op.upper)
+        if st isa T && st <= zero(T)
+            push!(errors, "ForOp at %$idx: step $st is not positive")
+        elseif st isa T && lo isa T && up isa T
+            if op.inclusive && lo <= up && (big(up) - big(lo)) % big(st) != 0
+                push!(errors, "ForOp at %$idx: inclusive bound $up is not on the grid of $lo:$st")
+            elseif !op.inclusive && lo < up
+                last = big(lo) + div(big(up) - 1 - big(lo), big(st)) * big(st)
+                if last + big(st) > big(typemax(T))
+                    push!(errors, "ForOp at %$idx: exclusive final increment is not representable in $T")
+                end
+            end
         end
     end
 
