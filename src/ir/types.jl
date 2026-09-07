@@ -627,15 +627,20 @@ function StructuredIRCode(argtypes, sptypes, entry, max_ssa_idx)
     return sci
 end
 
+"""
+    copy(sci::StructuredIRCode) -> StructuredIRCode
+
+Structural copy: every `Block`, control-flow op, statement map, argument list
+and terminator is new, so the copy can be rewritten (statements added, removed
+or replaced, carries changed) without touching `sci`. Statements themselves are
+shared, as in `Compiler.copy(::IRCode)`; `Expr`s are not deep-copied, which also
+keeps `MethodInstance`s of `:invoke`s and `Module`s of `GlobalRef`s out of the
+copy. The debug-info table is shared read-only; the line map is copied.
+"""
 function Base.copy(sci::StructuredIRCode)
-    # Sever entry→SCI backref before deepcopy to avoid pulling in
-    # debuginfo_table (contains Module on 1.11, which can't be deepcopied)
-    sci.entry.parent = nothing
-    entry_copy = deepcopy(sci.entry)
-    sci.entry.parent = sci
     new_sci = StructuredIRCode(
         copy(sci.argtypes), copy(sci.sptypes),
-        entry_copy,
+        copy(sci.entry),
         sci.max_ssa_idx, sci.max_arg_idx,
         sci.debuginfo_table,  # shared (read-only)
         copy(sci.line_map),
@@ -645,6 +650,31 @@ function Base.copy(sci::StructuredIRCode)
     fix_parents!(new_sci.entry)
     return new_sci
 end
+
+function Base.copy(m::SSAMap)
+    return SSAMap(copy(m.ssa_idxes), Any[copy_stmt(s) for s in m.stmts], copy(m.types),
+                  copy(m.flags), copy(m.pos_by_idx))
+end
+
+"""Structural copy of a block (see `copy(::StructuredIRCode)`); the parent is
+left unset for the caller to wire (`fix_parents!`)."""
+function Base.copy(block::Block)
+    return Block(copy(block.args), copy(block.body), copy_terminator(block.terminator), nothing)
+end
+
+# Control-flow ops are copied with their blocks; other statements are shared.
+copy_stmt(@nospecialize(s)) = s
+copy_stmt(op::IfOp) = IfOp(op.condition, copy(op.then_region), copy(op.else_region))
+copy_stmt(op::ForOp) = ForOp(op.lower, op.upper, op.step, op.iv_arg, copy(op.body),
+                             copy(op.init_values))
+copy_stmt(op::WhileOp) = WhileOp(copy(op.before), copy(op.after), copy(op.init_values))
+copy_stmt(op::LoopOp) = LoopOp(copy(op.body), copy(op.init_values))
+
+copy_terminator(t::YieldOp) = YieldOp(copy(t.values))
+copy_terminator(t::ContinueOp) = ContinueOp(copy(t.values))
+copy_terminator(t::BreakOp) = BreakOp(copy(t.values))
+copy_terminator(t::ConditionOp) = ConditionOp(t.condition, copy(t.args))
+copy_terminator(@nospecialize(t)) = t   # ReturnNode (immutable) or nothing
 
 
 """
