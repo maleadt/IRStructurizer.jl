@@ -139,6 +139,10 @@ operands(block::Block, inst::Instruction) = operands(block, inst[:stmt])
 
 operands(::Block, s::PiNode) = Any[s.val]
 operands(::Block, s::ControlFlowOp) = operands(s)
+# A `ReturnNode` reads the value it returns, except in its unreachable form, which
+# has no `val` at all. This mirrors how `walk_uses!` treats it, so that `operands`
+# and the use index agree on what a return reads.
+operands(::Block, s::ReturnNode) = isdefined(s, :val) ? Any[s.val] : Any[]
 # Alias statements (stmt IS a value) forward the value itself as their sole operand.
 operands(::Block, s::SSAValue) = Any[s]
 operands(::Block, s::BlockArgument) = Any[s]
