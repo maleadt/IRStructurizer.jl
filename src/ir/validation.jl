@@ -82,8 +82,11 @@ Validate that all structured control flow ops have correct terminators.
 Errors if any terminator is missing or invalid (indicates a bug in structurization).
 
 Validation rules:
-- IfOp: both regions must have explicit terminator (never `nothing`)
-- ForOp body: must have ContinueOp
+- IfOp: both regions must have explicit terminator (never `nothing`), unless the
+  region ends in an IfOp that itself diverges on both arms (`diverges`), the shape
+  of a loop's exit dispatch inside a conditional continuation
+- ForOp: body must have ContinueOp and no BreakOp; carries agree in arity; the IV
+  type is a concrete `BitInteger`; constant bounds/step are not contradictory
 - WhileOp before: must have ConditionOp
 - WhileOp after: must have YieldOp
 - LoopOp body: recursively validate nested ops
@@ -137,12 +140,13 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
-    # Both regions must have an explicit terminator; `nothing` is always invalid.
+    # Both regions must have an explicit terminator; `nothing` is valid only when
+    # control cannot reach the end of the region (it ends in a diverging IfOp).
     # Valid terminators: YieldOp, ReturnNode, ContinueOp, BreakOp (for IfOps inside loops).
-    if then_term === nothing
+    if then_term === nothing && !diverges(op.then_region)
         push!(errors, "IfOp at %$idx: then region must have explicit terminator, got nothing")
     end
-    if else_term === nothing
+    if else_term === nothing && !diverges(op.else_region)
         push!(errors, "IfOp at %$idx: else region must have explicit terminator, got nothing")
     end
 
@@ -202,10 +206,57 @@ function check_yield_type!(errors::Vector{String}, block::Block,
     end
 end
 
+"""Whether control cannot reach the end of `block`: its last statement is an
+`IfOp` none of whose arms yields, each ending in a return, continue or break, or
+diverging itself. Such a block needs no terminator (a loop body ending in its
+exit dispatch, or a conditional continuation of an expanded `ForOp`)."""
+function diverges(block::Block)
+    isempty(block.body) && return false
+    last = block.body.stmts[end]
+    last isa IfOp || return false
+    return arm_diverges(last.then_region) && arm_diverges(last.else_region)
+end
+
+function arm_diverges(block::Block)
+    term = block.terminator
+    (term isa ReturnNode || term isa ContinueOp || term isa BreakOp) && return true
+    return term === nothing && diverges(block)
+end
+
 function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::ForOp, idx::Int)
     term = op.body.terminator
     if !(term isa ContinueOp)
         push!(errors, "ForOp at %$idx: body must have ContinueOp, got $(typeof(term))")
+    end
+
+    # Structural part of the counted-range contract (see the ForOp docstring).
+    T = forop_iv_type(op.iv_arg.type)
+    if T === nothing
+        push!(errors, "ForOp at %$idx: induction variable type $(op.iv_arg.type) is not a concrete BitInteger")
+    end
+    n_init = length(op.init_values)
+    n_args = length(op.body.args)
+    if n_init != n_args
+        push!(errors, "ForOp at %$idx: init_values length ($n_init) != body.args length ($n_args)")
+    end
+    for t in reachable_terminators(op.body)
+        if t isa ContinueOp
+            nc = length(t.values)
+            nc == n_init || push!(errors, "ForOp at %$idx: ContinueOp has $nc values, expected $n_init (loop-carry length)")
+        elseif t isa BreakOp
+            push!(errors, "ForOp at %$idx: BreakOp in a counted loop body (a loop with a secondary exit must stay a LoopOp)")
+        end
+    end
+    # Statically contradictory constants: a non-positive or mistyped literal step,
+    # or an inclusive constant range whose end is off the step grid.
+    if T !== nothing
+        st, lo, up = op.step, op.lower, op.upper
+        if st isa Integer && !(st isa T && st > zero(T))
+            push!(errors, "ForOp at %$idx: step $st is not a positive $T")
+        elseif op.inclusive && st isa T && lo isa T && up isa T && lo <= up &&
+               (big(up) - big(lo)) % big(st) != 0
+            push!(errors, "ForOp at %$idx: inclusive bound $up is not on the grid of $lo:$st")
+        end
     end
 
     validate_terminators!(errors, sci, op.body)

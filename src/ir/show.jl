@@ -444,7 +444,8 @@ function print_for_op_final(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(res
     print_value(p, op.lower)
     print(p.io, ":")
     print_value(p, op.step)
-    print(p.io, ":")
+    # Julia's `a:s:b` is inclusive; mark an exclusive bound with `<`.
+    print(p.io, op.inclusive ? ":" : ":<")
     print_value(p, op.upper)
 
     if !isempty(op.body.args)

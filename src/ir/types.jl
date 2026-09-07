@@ -440,16 +440,55 @@ function Base.show(io::IO, ::IfOp)
 end
 
 """
-    ForOp
+    ForOp(lower, upper, step, iv_arg, body, init_values; inclusive=false)
 
-Counted for-loop with lower/upper/step bounds.
-Iterates while iv < upper (exclusive upper bound).
-init_values = initial values for loop-carried variables.
+Counted loop over an integer range. The induction variable `iv_arg` takes the
+values `lower + j*step` for `j = 0, 1, ...`; `upper` bounds them, inclusively when
+`inclusive` is set and exclusively otherwise. The flag describes endpoint
+membership only, not where the source loop tested its condition.
 
-Arity contract (all equal):
-- `init_values`, `body.args` (minus IV), and `ContinueOp.values` must have equal length.
-- Extra exit values (loop-internal values used after the loop) are included as loop-carried
-  variables with `Undef` initial values.
+# Counted-range contract
+
+The op describes a finite, monotonic, non-wrapping iteration; wraparound is not
+part of its contract. In mathematical terms (no arithmetic in the IV type):
+
+| form      | empty when       | visited values                       | requirement (nonempty ranges)                  |
+|-----------|------------------|--------------------------------------|------------------------------------------------|
+| inclusive | `lower > upper`  | `lower + j*step`, ending at `upper`  | `upper - lower` is a multiple of `step`        |
+| exclusive | `lower >= upper` | `lower + j*step < upper`             | the first increment reaching or crossing `upper` is representable in the IV type |
+
+- The IV, `lower`, `upper` and `step` share one concrete `Base.BitInteger` type
+  (`Core.Const` widened). Ordering is that type's own: signed or unsigned
+  comparisons follow the IV type. Other types are refused.
+- `step` is strictly positive. Descending loops use the general ops.
+- `lower`, `upper` and `step` are loop-invariant and defined before the op.
+- An inclusive `upper` is the last visited value itself; the lowering stops on
+  equality with it and never computes `upper + step`, so a range ending at
+  `typemax` of its type is exact. An exclusive range uses an ordinary header test
+  and increment, which its representability requirement keeps from wrapping.
+
+# Results and body
+
+`init_values` are the initial loop-carried values; `body.args` are the carries
+(the IV is `iv_arg`, not a body arg); the body's `ContinueOp` supplies the next
+carried values, in the same order and count. The op's results are the final
+carried values, or the initial ones for an empty range. The IV is not a result:
+a producer that needs the escaping IV keeps it as an explicit carry (whose final
+value can differ from `upper`, e.g. the post-increment IV of a `while` loop, or
+the init of an empty loop). Extra exit values (loop-internal values used after
+the loop) ride as carries with `Undef` initial values. The body owns no `BreakOp`:
+a loop with a secondary exit stays a `LoopOp`.
+
+# Producer and consumer obligations
+
+Structural validation (`validate_terminators`) checks the IV type, arities, the
+absence of breaks, and statically contradictory constant bounds/steps. Dynamic
+legality is the producer's obligation: `promote_loops!` builds a `ForOp` only
+after proving the contract from the source loop (see `promote.jl`), and an
+external constructor takes on the same proof. Consumers may lower the op to a
+target's counted loop only when that target's extra requirements hold, and can
+otherwise use [`expand_for_loops!`](@ref), the exact expansion into `IfOp`,
+`LoopOp` and `WhileOp`.
 """
 mutable struct ForOp <: ControlFlowOp
     lower::IRValue
@@ -458,7 +497,20 @@ mutable struct ForOp <: ControlFlowOp
     iv_arg::BlockArgument
     body::Block
     init_values::Vector{IRValue}
+    inclusive::Bool
 end
+ForOp(lower, upper, step, iv_arg::BlockArgument, body::Block, init_values;
+      inclusive::Bool=false) =
+    ForOp(lower, upper, step, iv_arg, body, init_values, inclusive)
+
+"""The integer type a `ForOp` counts with: `T` widened from a `Core.Const`, if it
+is a concrete `Base.BitInteger`, else `nothing`. Bounds are compared signed or
+unsigned by this type (`forop_iv_signed`)."""
+function forop_iv_type(@nospecialize(T))
+    T = widenconst(T)
+    return T isa DataType && T <: Base.BitInteger ? T : nothing
+end
+forop_iv_signed(T::DataType) = T <: Signed
 
 function Base.show(io::IO, op::ForOp)
     print(io, "ForOp(")
@@ -666,7 +718,7 @@ end
 copy_stmt(@nospecialize(s)) = s
 copy_stmt(op::IfOp) = IfOp(op.condition, copy(op.then_region), copy(op.else_region))
 copy_stmt(op::ForOp) = ForOp(op.lower, op.upper, op.step, op.iv_arg, copy(op.body),
-                             copy(op.init_values))
+                             copy(op.init_values), op.inclusive)
 copy_stmt(op::WhileOp) = WhileOp(copy(op.before), copy(op.after), copy(op.init_values))
 copy_stmt(op::LoopOp) = LoopOp(copy(op.body), copy(op.init_values))
 

@@ -204,6 +204,22 @@ Base.iterate(r::SideRange, i::Int) = i === side_stop(r) ? nothing : (i + 1, i + 
 mutable struct MutStop; stop::Int; end
 @noinline opaque_mutstop(n) = MutStop(n)
 
+# A body that records its visits and throws after a bounded number of them, so a
+# loop that natively wraps around (or never terminates) can be observed without
+# hanging and without the compiler folding the visits away.
+const VISITS = Any[]
+@noinline function visit!(i)
+    push!(VISITS, i)
+    length(VISITS) >= 4 && error("too many visits")
+    return nothing
+end
+
+# A custom iterator with the unit-range protocol shape whose state wraps: it starts
+# at 0xfe and stops on equality with 0x00, so it visits fe, ff, 00.
+struct WrapIter end
+Base.iterate(::WrapIter) = (0xfe, 0xfe)
+Base.iterate(::WrapIter, s::UInt8) = s == 0x00 ? nothing : (s + 0x01, s + 0x01)
+
 # A `while` whose header does more than compare: the call lands in the WhileOp's
 # `before` region, which a ForOp has no place for.
 const HEADER_CALLS = Ref(0)
@@ -254,13 +270,19 @@ side_header(n) = (i = 1; s = 0; while (header_bump!(); i <= n); s += i; i += 1; 
     end
 end
 
-@testset "inclusive bound (<=) gets exclusive adjustment" begin
+@testset "inclusive bound (<=) needs a bound below typemax" begin
+    # `while i <= n` stops at `n` only because the update `n + 1` fails the test,
+    # which wraps when `n == typemax`. A dynamic `n` supplies no proof, so the loop
+    # keeps its own semantics as a WhileOp and no `n + 1` is synthesized either.
+    # (Missing proof: `n < typemax(Int)`.)
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             i = 0
             acc = 0
-            @check "add_int(_2, 1)::Int64"
-            @check "for %arg{{[0-9]+}} = 0:1:%{{.*}}"
+            @check_not "add_int(_2, 1)"
+            @check "while"
+            @check "sle_int"
+            @check_not "for"
             while i <= n
                 acc += i
                 i += 1
@@ -271,11 +293,341 @@ end
     f_incl = (n::Int) -> (i=0; acc=0; while i<=n; acc+=i; i+=1; end; acc)
     @test @roundtrip f_incl(5)
     @test @roundtrip f_incl(0)
+    # A constant bound below typemax is that proof: the loop becomes an inclusive
+    # ForOp, printed as the Julia range `0:1:100`.
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n::Int
+            i = 0
+            acc = 0
+            @check "for %arg{{[0-9]+}} = 0:1:100"
+            while i <= 100
+                acc += i * n
+                i += 1
+            end
+            return acc
+        end
+    end
+    f_const = (n::Int) -> (i=0; acc=0; while i<=100; acc+=i*n; i+=1; end; acc)
+    @test @roundtrip f_const(3)
+    # `<` is the exclusive ForOp's own test (printed `0:1:<n`): with a unit step the
+    # update `i + 1 <= n` always fits.
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n::Int
+            i = 0
+            acc = 0
+            @check "for %arg{{[0-9]+}} = 0:1:<_2"
+            while i < n
+                acc += i
+                i += 1
+            end
+            return acc
+        end
+    end
+end
+
+@testset "bounds at the edge of the integer type" begin
+    # Neither promoter computes `bound ± step`: an exclusive `last + step` wrapped
+    # for a range ending at `typemax` (or in any narrow type) and lost the loop.
+    # The inclusive ForOp visits `last` itself, tested before the IV is advanced.
+    count_range(a, b) = (s = 0; for i in a:b; s += 1; end; s)
+    sum_range(a, b) = (s = zero(a); for i in a:b; s += i; end; s)
+    for (a, b) in ((typemax(Int) - 1, typemax(Int)), (typemax(Int), typemax(Int)),
+                   (0x00, 0xff), (0x70, 0x90), (Int8(120), Int8(127)),
+                   (typemin(Int8), typemax(Int8)), (typemax(Int), typemax(Int) - 1))
+        sci, _ = code_structured(count_range, Tuple{typeof(a), typeof(b)}) |> only
+        @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+        @test @roundtrip count_range(a, b)
+        @test @roundtrip sum_range(a, b)
+    end
+    # `last` of a stepped range is on the grid but may still be `typemax`. With
+    # dynamic endpoints the alignment of `last` to the step is computed by the
+    # inlined `steprange_last`, which the prover does not follow, so the loop stays
+    # general and still iterates exactly. (Missing proof: `(last - a) % 2 == 0`.)
+    count_step(a, b) = (s = 0; for i in a:Int8(2):b; s += 1; end; s)
+    sci, _ = code_structured(count_step, Tuple{Int8, Int8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test @roundtrip count_step(Int8(1), Int8(127))
+    @test @roundtrip count_step(Int8(1), Int8(100))
+    @test @roundtrip count_step(Int8(1), Int8(0))
+    # An escaping IV still reads back the last visited value.
+    last_iv(a, b) = (local i; for j in a:b; i = j; end; i)
+    @test @roundtrip last_iv(typemax(Int) - 2, typemax(Int))
+    @test @roundtrip last_iv(0x00, 0xff)
+
+    # Counting `while` loops compare by the IV's signedness (`ult_int`/`ule_int` were
+    # lowered as signed compares before, so UInt8 loops crossing 0x80 exited early).
+    # `<` with a unit step promotes: its update stays at or below the bound. `<=`
+    # over a dynamic bound stays a WhileOp, wraparound included. (Missing proof:
+    # `n < typemax(UInt8)`.)
+    count_lt(a, n) = (i = a; s = 0; while i < n; s += 1; i += one(i); end; s)
+    count_le(a, n) = (i = a; s = 0; while i <= n; s += 1; i += one(i); end; s)
+    sci, _ = code_structured(count_lt, Tuple{UInt8, UInt8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    sci, _ = code_structured(count_le, Tuple{UInt8, UInt8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    for f in (count_lt, count_le)
+        @test @roundtrip f(0x70, 0x90)
+        @test @roundtrip f(0x90, 0x70)
+        @test @roundtrip f(0x00, 0xfe)
+    end
+    @test @roundtrip count_lt(typemax(Int) - 2, typemax(Int))
+    @test @roundtrip count_le(typemax(Int) - 2, typemax(Int) - 1)
+    @test @roundtrip count_le(Int8(120), Int8(126))
+
+    # `<=` with a non-unit step and a dynamic bound may never land on the bound, so
+    # it stays a WhileOp. (Missing proof: `n` on the grid of `0:2` and `n + 2` fits.)
+    count_le2(n) = (i = 0; s = 0; while i <= n; s += 1; i += 2; end; s)
+    sci, _ = code_structured(count_le2, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    @test @roundtrip count_le2(5)
+    @test @roundtrip count_le2(4)
+    @test @roundtrip count_le2(-1)
+end
+
+@testset "promotion requires a counted-loop proof" begin
+    # The counted-range contract (see the `ForOp` docstring) excludes wraparound, so
+    # a source loop becomes a ForOp only when its entry order, endpoint reachability
+    # and final update are proved. A recognizable shape alone is not a proof.
+
+    # `while i <= n` over UInt8 entered with n = typemax: the increment wraps and
+    # the native loop visits fe, ff, 00, 01, ... until the body throws. An inclusive
+    # ForOp would stop on equality with n and return after ff. Without a constant
+    # bound proving `n < typemax`, the loop stays a WhileOp, wraparound included.
+    le_wrap(i::UInt8, n::UInt8) = (while i <= n; visit!(i); i += 0x01; end; i)
+    empty!(VISITS)
+    @test_throws ErrorException le_wrap(0xfe, 0xff)
+    native = copy(VISITS)
+    @test native == [0xfe, 0xff, 0x00, 0x01]
+    sci, _ = code_structured(le_wrap, Tuple{UInt8, UInt8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci, 0xfe, 0xff)
+    @test VISITS == native
+
+    # The iteration protocol of a custom iterator has the unit-range shape (equality
+    # exit before the increment) but no guard establishing `first <= last`: the
+    # state starts above its stop value and wraps. Promotion would add a
+    # `lower <= upper` entry guard and skip the whole loop; it must stay a LoopOp.
+    wrap_visits() = (for i in WrapIter(); visit!(i); end; nothing)
+    empty!(VISITS)
+    wrap_visits()
+    native2 = copy(VISITS)
+    @test native2 == [0xfe, 0xff, 0x00]
+    sci2, _ = code_structured(wrap_visits, Tuple{}) |> only
+    @test count_stmts(sci2.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci2.entry, x -> x isa LoopOp) == 1
+    empty!(VISITS)
+    execute(sci2)
+    @test VISITS == native2
+end
+
+# Julia's inlined unit-range `iterate`, as a hand-built CFG: the shape both 1.11
+# and 1.12 lower `for i in first:upper` to, with the entry guard and the in-loop
+# exit protocol (a branch yielding `(next, done)`, its projections, `not_int`, the
+# exit branch), the loop taken on the flag's false path in either branch polarity.
+# `bound` selects the endpoint the loop's equality exit compares against (argument
+# 3, the guard's, or an unrelated 4th argument); `cmp` is the guard's order test.
+# The loop counts its iterations.
+function unit_range_guard_ir(; bound::Int=3, cmp::Symbol=:slt_int, inverted::Bool=false)
+    guard = [(stmts=[(Expr(:call, GlobalRef(Base, cmp), Argument(3), Argument(2)), Bool),
+                     (GotoIfNot(SSAValue(1), 3), Any)], succs=[2, 3]),    # %1 = upper < first
+             (stmts=[(GotoNode(4), Any)], succs=[4]),                      # done: flag true
+             (stmts=[(GotoNode(4), Any)], succs=[4])]                      # not done: flag false, iv = first
+    flag = (PhiNode(Int32[2, 3], Any[true, false]), Bool)                  # %5
+    iv0 = (PhiNode(Int32[3], Any[Argument(2)]), Int)                      # %6 (undef when done)
+    # The loop, SSA %9-%23 in both layouts, header block `h`: header phis for iv
+    # and the count; `iv === bound`; the done/next arms merge into `(next, done)`
+    # phis; `not_int(done)` decides between the latch and the exit edge.
+    next_phi = Vector{Any}(undef, 2); next_phi[2] = SSAValue(16)
+    loop(h, merge) = [
+        (stmts=[(PhiNode(Int32[4, h + 5], Any[SSAValue(6), SSAValue(18)]), Int),   # %9 iv
+                (PhiNode(Int32[4, h + 5], Any[0, SSAValue(13)]), Int),             # %10 count
+                (GotoNode(h + 1), Any)], succs=[h + 1]),
+        (stmts=[(Expr(:call, GlobalRef(Core, :(===)), SSAValue(9), Argument(bound)), Bool),   # %12
+                (Expr(:call, GlobalRef(Base, :add_int), SSAValue(10), 1), Int),               # %13
+                (GotoIfNot(SSAValue(12), h + 3), Any)], succs=[h + 2, h + 3]),
+        (stmts=[(GotoNode(h + 4), Any)], succs=[h + 4]),                                       # done arm
+        (stmts=[(Expr(:call, GlobalRef(Base, :add_int), SSAValue(9), 1), Int),                # %16 next
+                (GotoNode(h + 4), Any)], succs=[h + 4]),
+        (stmts=[(PhiNode(Int32[h + 2, h + 3], next_phi), Int),                                 # %18
+                (PhiNode(Int32[h + 2, h + 3], Any[true, false]), Bool),                        # %19
+                (Expr(:call, GlobalRef(Base, :not_int), SSAValue(19)), Bool),                  # %20
+                (GotoIfNot(SSAValue(20), h + 6), Any)], succs=[h + 5, h + 6]),
+        (stmts=[(GotoNode(h), Any)], succs=[h]),                                               # latch
+        (stmts=[(GotoNode(merge), Any)], succs=[merge]),                                       # exit edge
+    ]
+    exit_path(merge) = (stmts=[(GotoNode(merge), Any)], succs=[merge])
+    if inverted
+        # `if flag`: true falls through to the exit path (BB5), false → the loop (BB6)
+        blocks = vcat(guard,
+            [(stmts=[flag, iv0, (GotoIfNot(SSAValue(5), 6), Any)], succs=[5, 6]),
+             exit_path(13)],
+            loop(6, 13),
+            [(stmts=[(PhiNode(Int32[5, 12], Any[0, SSAValue(13)]), Int),
+                     (ReturnNode(SSAValue(24)), Any)], succs=Int[])])
+    else
+        # `if not_int(flag)` (Julia's shape): true falls through to the loop (BB5),
+        # false → the exit path (BB12)
+        blocks = vcat(guard,
+            [(stmts=[flag, iv0, (Expr(:call, GlobalRef(Base, :not_int), SSAValue(5)), Bool),
+                     (GotoIfNot(SSAValue(7), 12), Any)], succs=[5, 12])],
+            loop(5, 13),
+            [exit_path(13),
+             (stmts=[(PhiNode(Int32[11, 12], Any[SSAValue(13), 0]), Int),
+                     (ReturnNode(SSAValue(25)), Any)], succs=Int[])])
+    end
+    return build_ir(blocks, Any[Any, Int, Int, Int])
+end
+
+@testset "counted-loop proofs: acceptance and rejection" begin
+    # --- the unit-range entry guard, hand-built for both polarities ---
+    count_ref(first, upper) = length(first:upper)
+    for inverted in (false, true)
+        ir = unit_range_guard_ir(; inverted)
+        CC.verify_ir(ir)
+        sci = StructuredIRCode(ir)
+        @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+        for (a, b) in ((1, 5), (5, 1), (3, 3), (typemax(Int) - 1, typemax(Int)))
+            @test execute(sci, a, b, b) == count_ref(a, b)
+        end
+    end
+    # The equality exit compares against a value the guard never ordered: no proof.
+    sci = StructuredIRCode(unit_range_guard_ir(; bound=4))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa LoopOp) == 1
+    @test execute(sci, 1, 5, 5) == 5
+    # The guard's order test has the wrong signedness for the IV type: no proof.
+    sci = StructuredIRCode(unit_range_guard_ir(; cmp=:ult_int))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test execute(sci, 1, 5, 5) == 5
+
+    # --- a header-tested loop whose predicate does not match the IV type ---
+    # `while ult_int(i, n)` over Int: Julia never emits it, but the ForOp's own
+    # signed compare would reinterpret it, so it stays a WhileOp.
+    function lt_ir(cmp::Symbol)
+        build_ir([
+            (stmts=[(GotoNode(2), Any)], succs=[2]),
+            (stmts=[(PhiNode(Int32[1, 3], Any[0, SSAValue(5)]), Int),
+                    (Expr(:call, GlobalRef(Base, cmp), SSAValue(2), Argument(2)), Bool),
+                    (GotoIfNot(SSAValue(3), 4), Any)], succs=[3, 4]),
+            (stmts=[(Expr(:call, GlobalRef(Base, :add_int), SSAValue(2), 1), Int),
+                    (GotoNode(2), Any)], succs=[2]),
+            (stmts=[(ReturnNode(SSAValue(2)), Any)], succs=Int[]),
+        ], Any[Any, Int])
+    end
+    sci = StructuredIRCode(lt_ir(:slt_int))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    sci = StructuredIRCode(lt_ir(:ult_int))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    for n in (0, 5)
+        @test execute(sci, n) == n
+    end
+
+    # --- steps: zero, negative and unknown-sign steps are not counted loops ---
+    zero_step(i::UInt8, n::UInt8) = (while i < n; visit!(i); i += 0x00; end; i)
+    empty!(VISITS)
+    @test_throws ErrorException zero_step(0x01, 0x05)
+    native = copy(VISITS)
+    @test native == [0x01, 0x01, 0x01, 0x01]
+    sci, _ = code_structured(zero_step, Tuple{UInt8, UInt8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci, 0x01, 0x05)
+    @test VISITS == native
+    neg_step(n) = (i = 10; s = 0; while i < n; s += i; i += -1; end; s)   # never terminates for n > 10
+    sci, _ = code_structured(neg_step, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test @roundtrip neg_step(5)
+
+    # --- exclusive loops whose final update can wrap ---
+    # `i < n` with step 2 over Int8, entered at 126 with n = 127: natively the
+    # update wraps to -128 and the loop goes on until the body throws. A dynamic
+    # bound has no representability proof (missing: `n + 1 <= typemax(Int8)`).
+    lt2(i::Int8, n::Int8) = (while i < n; visit!(i); i += Int8(2); end; i)
+    empty!(VISITS)
+    @test_throws ErrorException lt2(Int8(126), Int8(127))
+    native = copy(VISITS)
+    @test native == Int8[126, -128, -126, -124]
+    sci, _ = code_structured(lt2, Tuple{Int8, Int8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci, Int8(126), Int8(127))
+    @test VISITS == native
+    # A constant bound decides it: 127 + 2 - 1 does not fit, 126 + 2 - 1 does.
+    lt2_bad(i::Int8) = (while i < Int8(127); visit!(i); i += Int8(2); end; i)
+    lt2_ok(i::Int8) = (while i < Int8(126); visit!(i); i += Int8(2); end; i)
+    sci, _ = code_structured(lt2_bad, Tuple{Int8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci, Int8(126))
+    @test VISITS == native
+    sci, _ = code_structured(lt2_ok, Tuple{Int8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test !only(filter(x -> x isa ForOp, collect(statements(sci.entry.body)))).inclusive
+    for a in (Int8(120), Int8(125), Int8(126), Int8(127))
+        empty!(VISITS); expected = lt2_ok(a); native = copy(VISITS)
+        empty!(VISITS)
+        @test execute(sci, a) == expected
+        @test VISITS == native
+    end
+
+    # --- inclusive loops with a larger step: alignment and the final update ---
+    le3_aligned(x) = (i = Int8(1); s = 0; while i <= Int8(10); s += i * x; i += Int8(3); end; s)
+    le3_offgrid(x) = (i = Int8(1); s = 0; while i <= Int8(11); s += i * x; i += Int8(3); end; s)
+    le3_wrap(x::Int8) = (i = Int8(1); while i <= Int8(127); visit!(i); i += Int8(3); end; i)
+    sci, _ = code_structured(le3_aligned, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test only(filter(x -> x isa ForOp, collect(statements(sci.entry.body)))).inclusive
+    @test @roundtrip le3_aligned(2)
+    sci, _ = code_structured(le3_offgrid, Tuple{Int}) |> only   # 11 is off the grid of 1:3
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test @roundtrip le3_offgrid(2)
+    # 127 is on the grid, but the exiting update 127 + 3 wraps: natively the loop
+    # runs on (1, 4, 7, 10, ... until the body throws), so it stays a WhileOp.
+    empty!(VISITS)
+    @test_throws ErrorException le3_wrap(Int8(0))
+    native = copy(VISITS)
+    sci, _ = code_structured(le3_wrap, Tuple{Int8}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    empty!(VISITS)
+    @test_throws ErrorException execute(sci, Int8(0))
+    @test VISITS == native
+
+    # --- required positive cases: dynamic unit ranges with their entry proof ---
+    count_range(a, b) = (s = 0; for i in a:b; s += 1; end; s)
+    sum_opaque(a, b) = (s = 0; for i in opaque_range(a, b); s += i; end; s)
+    sum_arg(r::UnitRange{Int}) = (s = 0; for i in r; s += i; end; s)
+    nested_dep(n) = (s = 0; for i in 1:n; for j in 1:i; s += i * j; end; end; s)
+    in_if(b::Bool, n) = (s = 0; if b; for i in 1:n; s += i; end; end; s)
+    for (f, tt, nfor) in ((count_range, Tuple{Int, Int}, 1), (count_range, Tuple{UInt8, UInt8}, 1),
+                          (sum_opaque, Tuple{Int, Int}, 1), (sum_arg, Tuple{UnitRange{Int}}, 1),
+                          (nested_dep, Tuple{Int}, 2), (in_if, Tuple{Bool, Int}, 1))
+        sci, _ = code_structured(f, tt) |> only
+        @test count_stmts(sci.entry, x -> x isa ForOp) == nfor
+        @test count_stmts(sci.entry, x -> x isa WhileOp || x isa LoopOp) == 0
+        for blk in IRStructurizer.eachblock(sci.entry), (_, e) in blk.body
+            e.stmt isa ForOp && @test e.stmt.inclusive
+        end
+    end
+    @test @roundtrip count_range(0x10, 0x20)
+    @test @roundtrip sum_opaque(2, 5)
+    @test @roundtrip sum_opaque(5, 2)
+    @test @roundtrip sum_arg(3:7)
+    @test @roundtrip sum_arg(7:3)
+    @test @roundtrip nested_dep(4)
+    @test @roundtrip in_if(true, 4)
+    @test @roundtrip in_if(false, 4)
 end
 
 @testset "inclusive bound with Core.Const upper type" begin
-    # Regression test: when the upper bound SSA value has Core.Const inferred type,
-    # the inclusive→exclusive adjustment must still work (one() needs a concrete type).
+    # An inferred constant is a valid proof input: the `Core.Const(Int32(10))` type
+    # of the bound SSA value proves `upper < typemax(Int32)`, so the `<=` loop still
+    # promotes to an inclusive ForOp although its bound is not a literal.
     function const_upper(n::Int32)
         i = Int32(0)
         acc = Int32(0)
@@ -470,14 +822,14 @@ end
 end
 
 @testset "opaque range: body-defined bound is hoisted ahead of the ForOp" begin
-    # Hoist the repeated stop read before the ForOp's exclusive-bound adjustment.
+    # Hoist the repeated stop read ahead of the ForOp, which uses it as its
+    # inclusive bound.
     @test @filecheck begin
         code_structured(Tuple{Int}) do n::Int
             s = 0
             @check "getfield({{%[0-9]+}}, :stop)"
             @check "[[STOP:%[0-9]+]] = Base.getfield({{%[0-9]+}}, :stop)"
-            @check "add_int([[STOP]], 1)"
-            @check "= for"
+            @check "= for {{.*}}:1:[[STOP]]"
             @check_not "getfield"
             for i in opaque_oneto(n)
                 s += i * i
@@ -510,26 +862,32 @@ end
     @test count_stmts(sci.entry, x -> x isa ForOp) == 0
     @test @roundtrip sum_inline_step(-5, -2)
     @test @roundtrip sum_inline_step(10, 3)
+    # A constant step with a dynamic bound: the inlined `steprange_last` computes
+    # `last` on the grid, but the prover does not follow it, so the range stays a
+    # general loop. (Missing proof: `(last - 1) % 2 == 0`.)
     sum_step2(n) = (s = 0; for i in 1:2:n; s += i; end; s)
     sci, _ = code_structured(sum_step2, Tuple{Int}) |> only
-    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
     @test @roundtrip sum_step2(10)
     @test @roundtrip sum_step2(0)
 
     # The WhileOp path drops the whole `before` region, so a header-computed bound
-    # (`r.stop` on an opaque `r`) must be hoisted there too, for `<=` and `<` alike.
+    # (`r.stop` on an opaque `r`) must be hoisted there too. `<` promotes; `<=`
+    # stays a WhileOp, header and all. (Missing proof: `r.stop < typemax(Int)`.)
     while_le(n) = (r = opaque_oneto(n); i = 1; s = 0; while i <= r.stop; s += i; i += 1; end; s)
     while_lt(n) = (r = opaque_oneto(n); i = 1; s = 0; while i < r.stop; s += i; i += 1; end; s)
-    for f in (while_le, while_lt)
-        sci, _ = code_structured(f, Tuple{Int}) |> only
-        @test count_stmts(sci.entry, x -> x isa ForOp) == 1
-    end
+    sci, _ = code_structured(while_lt, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    sci, _ = code_structured(while_le, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
     @test @roundtrip while_le(5)
     @test @roundtrip while_le(0)
     @test @roundtrip while_lt(5)
     @test @roundtrip while_lt(0)
 
-    # A step from the body is speculated even when the loop takes zero trips.
+    # A step read from an opaque object is a runtime value of unknown sign, so the
+    # loop stays a WhileOp; nothing is speculated. (Missing proof: `r.step > 0`.)
     function while_step(n, st)
         r = opaque_steprange(1, st, n)
         i = 1
@@ -541,7 +899,8 @@ end
         return s
     end
     sci, _ = only(code_structured(while_step, Tuple{Int, Int}))
-    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
     @test @roundtrip while_step(10, 3)
     @test @roundtrip while_step(1, 3)
     @test @roundtrip while_step(0, 3)
@@ -1020,12 +1379,14 @@ end
 end
 
 @testset "if-then phi inside loop" begin
+    # (`<` rather than `<=`: the latter has no proof for a dynamic `n` and would
+    # stay a WhileOp.)
     @test @filecheck begin
         code_structured(Tuple{Int, Bool}) do n::Int, flag::Bool
             acc = 0
             j = 1
-            @check "for"
-            while j <= n
+            @check "= for"
+            while j < n
                 x = 0
                 @check "if"
                 if flag && j >= 2
@@ -1904,7 +2265,9 @@ end
         @test execute(sci, n) == forlast(n)   # empty → 0; else → n (was n+1 when buggy)
     end
 
-    # Step ≠ 1 (`1:2:n`): the last in-body odd ≤ n. Empty → init 0.
+    # Step ≠ 1 (`1:2:n`): the last in-body odd ≤ n. Empty → init 0. The dynamic
+    # stepped range stays a general loop (missing proof: `last` on the grid of 1:2),
+    # which reads the escaping shadow back the same way.
     forlast2(n) = (last = 0; for i in 1:2:n; last = i; end; last)
     sci2, _ = code_structured(Tuple{Int}) do n
         last = 0
@@ -1913,7 +2276,7 @@ end
         end
         return last
     end |> only
-    @test count_stmts(sci2.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci2.entry, x -> x isa ForOp) == 0
     for n in (-3, 0, 1, 2, 4, 5, 6, 50, 200)
         @test execute(sci2, n) == forlast2(n)
     end

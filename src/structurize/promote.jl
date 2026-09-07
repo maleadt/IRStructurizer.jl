@@ -13,6 +13,19 @@
  Top-Level Promotion Pass
 =============================================================================#
 
+"""
+Enclosing context of the loop being promoted: the enclosing blocks, outermost
+first, for SSA lookups, and the enclosing `(IfOp, arm)` pairs, innermost last, for
+the entry-guard trace. A range loop can sit inside further conditionals or an outer
+loop body within the guarded arm, so the guard is not always the nearest pair;
+dominance holds through that nesting.
+"""
+struct PromoteScope
+    blocks::Vector{Block}
+    guards::Vector{Tuple{IfOp, Symbol}}
+end
+PromoteScope() = PromoteScope(Block[], Tuple{IfOp, Symbol}[])
+
 """Count `BreakOp` terminators reachable inside this loop body, descending into
 `IfOp` arms but not into nested loops (whose breaks are their own). A counted or
 condition loop has exactly one, its iteration-exit break. A second one is a
@@ -31,9 +44,12 @@ end
 
 """
 Post-pass: walk the structured IR and promote LoopOps to WhileOp/ForOp
-where the pattern matches.
+where the pattern matches. `scope` carries the enclosing blocks and `(IfOp, arm)`
+pairs down the walk (see `PromoteScope`); the legality proofs read them.
 """
-function promote_loops!(block::Block, ctx::StructurizeCtx)
+function promote_loops!(block::Block, ctx::StructurizeCtx,
+                        scope::PromoteScope=PromoteScope())
+    push!(scope.blocks, block)
     new_body = SSAMap()
     # Track ForOp promotions: loop_ssa_idx => (removed_positions, ForOp, carry_redirect)
     for_promotions = Dict{Int, Tuple{Vector{Int}, ForOp, Dict{Int,Int}}}()
@@ -43,13 +59,13 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
         if stmt isa LoopOp && count_breaks(stmt.body) > 1
             # Secondary dynamic exit (e.g. an early break/return alongside the
             # iteration-exit break): only the general LoopOp can represent it.
-            promote_loops!(stmt.body, ctx)
+            promote_loops!(stmt.body, ctx, scope)
             push!(new_body, (idx, stmt, entry.type, entry.flag))
         elseif stmt isa LoopOp
             # Promote inner loops first.
-            promote_loops!(stmt.body, ctx)
+            promote_loops!(stmt.body, ctx, scope)
             # Try direct LoopOp to ForOp (iteration protocol patterns).
-            result, removed, redirect = try_promote_for_from_loop(stmt, idx, block, new_body, ctx)
+            result, removed, redirect = try_promote_for_from_loop(stmt, idx, block, new_body, ctx, scope)
             if result isa ForOp
                 for_promotions[idx] = (removed, result, redirect)
                 carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed]
@@ -58,7 +74,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                 # Fall back to LoopOp to WhileOp to ForOp.
                 promoted = try_promote_while(stmt, ctx)
                 if promoted !== nothing
-                    result2, removed2 = try_promote_for(promoted, idx, block, new_body, ctx)
+                    result2, removed2 = try_promote_for(promoted, idx, block, new_body, ctx, scope)
                     if result2 isa ForOp
                         if isempty(removed2)
                             # The escaping IV is kept as an ordinary carry, so arity
@@ -81,7 +97,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             end
         elseif stmt isa Expr && stmt.head === :call && stmt.args[1] === Core.getfield &&
                stmt.args[2] isa SSAValue && haskey(for_promotions, stmt.args[2].id)
-            # Fix getfield for ForOp: removed positions to upper bound or redirect,
+            # Fix getfield for ForOp: removed positions to the bound or a redirect,
             # others to adjusted index.
             loop_ssa = stmt.args[2].id
             field_idx = stmt.args[3]::Int
@@ -106,9 +122,19 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                 new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                 push!(new_body, (idx, new_gf, entry.type, entry.flag))
             end
+        elseif stmt isa IfOp
+            # Record the arm each nested loop sits in: the entry-guard trace looks
+            # for a loop's dominating guard among these.
+            push!(scope.guards, (stmt, :then))
+            promote_loops!(stmt.then_region, ctx, scope)
+            pop!(scope.guards)
+            push!(scope.guards, (stmt, :else))
+            promote_loops!(stmt.else_region, ctx, scope)
+            pop!(scope.guards)
+            push!(new_body, (idx, stmt, entry.type, entry.flag))
         elseif stmt isa ControlFlowOp
             for b in blocks(stmt)
-                promote_loops!(b, ctx)
+                promote_loops!(b, ctx, scope)
             end
             push!(new_body, (idx, stmt, entry.type, entry.flag))
         else
@@ -116,6 +142,319 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
         end
     end
     block.body = new_body
+    pop!(scope.blocks)
+end
+
+#=============================================================================
+ Counted-Loop Legality
+=============================================================================#
+#
+# A ForOp is built only once the source loop is proved to satisfy the counted-range
+# contract (see the `ForOp` docstring): one supported integer type for the IV, bounds
+# and step; a predicate whose signedness matches that type; a positive constant
+# step; and, per route, ordered entry, endpoint reachability, or a representable
+# final update. The prover is bounded to constants (literals and `Core.Const` SSA
+# types, checked in overflow-safe `BigInt` arithmetic) and to the one dominating
+# entry-guard trace of Julia's unit-range `iterate`. Unknown facts fail the proof
+# and the loop keeps its general form; no fact framework, and no function name or
+# range type is taken as a contract.
+
+"""The scope of a loop's own regions: its enclosing scope plus `regions`."""
+inner_scope(scope::PromoteScope, regions::Block...) =
+    PromoteScope(vcat(scope.blocks, collect(regions)), scope.guards)
+
+"""The statement entry defining `v`, searching the scope innermost first."""
+function scope_entry(scope::PromoteScope, v::SSAValue)
+    for i in length(scope.blocks):-1:1
+        entry = get(scope.blocks[i].body, v.id, nothing)
+        entry === nothing || return entry
+    end
+    return nothing
+end
+
+"""The lattice type of `v` as seen from the scope (statement entries keep their
+inferred type, so a `Core.Const` is visible), or `nothing` when unknown."""
+function scope_argextype(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(v))
+    if v isa SSAValue
+        entry = scope_entry(scope, v)
+        return entry === nothing ? nothing : entry.type
+    elseif v isa BlockArgument || v isa Undef
+        return v.type
+    elseif v isa Argument
+        argtypes = (ctx.m::MCFG).argtypes
+        return 1 <= v.n <= length(argtypes) ? argtypes[v.n] : nothing
+    elseif v isa QuoteNode
+        return CC.Const(v.value)
+    elseif v isa GlobalRef || v isa SlotNumber || v isa Core.MethodInstance ||
+           v isa Core.CodeInstance
+        return nothing
+    else
+        return CC.Const(v)   # literal
+    end
+end
+
+"""The widened type of `v`, or `nothing`."""
+function scope_value_type(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(v))
+    t = scope_argextype(ctx, scope, v)
+    return t === nothing ? nothing : widenconst(t)
+end
+
+"""The constant value of `v` as `Some(x)`: a literal, a `QuoteNode`, or an SSA
+value whose inferred type is a `Core.Const`. `nothing` when not constant."""
+function scope_const(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(v))
+    t = scope_argextype(ctx, scope, v)
+    return t isa CC.Const ? Some(t.val) : nothing
+end
+
+"""Resolve a callee reference (`GlobalRef` or value) to its value, or `nothing`."""
+function callee_value(@nospecialize(f))
+    if f isa GlobalRef
+        isconst(f.mod, f.name) || return nothing
+        return getglobal(f.mod, f.name)
+    end
+    return f
+end
+
+"""`(object, field)` of a `getfield(object, field)` call with a constant field
+(`Int` position or `Symbol` name), else `nothing`."""
+function getfield_operands(@nospecialize(stmt))
+    stmt isa Expr && stmt.head === :call && length(stmt.args) == 3 || return nothing
+    callee_value(stmt.args[1]) === Core.getfield || return nothing
+    f = stmt.args[3]
+    f isa QuoteNode && (f = f.value)
+    f isa Union{Int, Symbol} || return nothing
+    return (stmt.args[2], f)
+end
+
+"""
+Whether `a` and `b` are the same value: the same SSA value, block argument,
+argument or constant, or two `getfield` projections of the same constant field
+of the same immutable object. The latter matters for opaque ranges: Julia's
+`iterate` reads `r.start`/`r.stop` afresh for the guard, the initial state and
+the exit test, and never CSEs the reads. Fields of mutable objects are not
+followed: a body may write them between two reads.
+"""
+function same_value(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(a), @nospecialize(b))
+    a === b && return true
+    if a isa SSAValue && b isa SSAValue
+        a.id == b.id && return true
+        ea = scope_entry(scope, a)
+        eb = scope_entry(scope, b)
+        (ea === nothing || eb === nothing) && return false
+        fa = getfield_operands(ea.stmt)
+        fb = getfield_operands(eb.stmt)
+        (fa === nothing || fb === nothing) && return false
+        fa[2] === fb[2] || return false
+        same_value(ctx, scope, fa[1], fb[1]) || return false
+        T = scope_value_type(ctx, scope, fa[1])
+        return T isa DataType && !ismutabletype(T)
+    elseif a isa BlockArgument && b isa BlockArgument
+        return a.id == b.id
+    elseif a isa Argument && b isa Argument
+        return a.n == b.n
+    end
+    return false
+end
+
+"""Follow a chain of `not_int` calls: `(base value, inverted)`."""
+function strip_not(scope::PromoteScope, @nospecialize(v))
+    inverted = false
+    while v isa SSAValue
+        entry = scope_entry(scope, v)
+        entry === nothing && break
+        stmt = entry.stmt
+        (stmt isa Expr && stmt.head === :call && length(stmt.args) == 2 &&
+         callee_value(stmt.args[1]) === Core.Intrinsics.not_int) || break
+        v = stmt.args[2]
+        inverted = !inverted
+    end
+    return v, inverted
+end
+
+"""The step as a positive constant of the IV type `T`, else `nothing`."""
+function positive_const_step(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(step), T::DataType)
+    c = scope_const(ctx, scope, step)
+    c === nothing && return nothing
+    st = something(c)
+    return st isa T && st > zero(T) ? st : nothing
+end
+
+"""The value of `v` if it is a constant of type `T`, else `nothing`."""
+function typed_const(ctx::StructurizeCtx, scope::PromoteScope, @nospecialize(v), T::DataType)
+    c = scope_const(ctx, scope, v)
+    c === nothing && return nothing
+    x = something(c)
+    return x isa T ? x : nothing
+end
+
+"""
+Prove that a unit-range loop is entered only when `lower <= upper`, from Julia's
+inlined `iterate(::AbstractUnitRange)` guard (1.11 and 1.12 lower it alike):
+
+    g = if slt_int(upper, first)       # ult_int for an unsigned IV
+          yield true, undef, ...
+        else
+          yield false, first, ...
+        end
+    if not_int(getfield(g, flag_position))
+        loop init(iv = getfield(g, initial_iv_position), ...)
+    end
+
+`lower` must be a projection of `g`; the loop must sit, possibly through further
+nesting, in an arm of an enclosing `IfOp` whose condition is the flag projection
+of the same `g`, taken when the flag is false (either polarity, followed through
+`not_int`); the two flags must be the distinct `Bool` constants; the flag-false
+arm must yield `first`, the very value the guard compared `upper` against, at the
+projected position; and that comparison must have been false on that arm. Value
+identity follows `same_value`, so `upper` may be a fresh read of the same
+immutable range field. Anything else fails: no other entry guard is trusted.
+"""
+function unit_range_entry_proof(ctx::StructurizeCtx, scope::PromoteScope,
+                                @nospecialize(lower), @nospecialize(upper), T::DataType)
+    lower isa SSAValue || return false
+    lentry = scope_entry(scope, lower)
+    lentry === nothing && return false
+    proj = getfield_operands(lentry.stmt)
+    proj === nothing && return false
+    g_val, iv_pos = proj
+    (g_val isa SSAValue && iv_pos isa Int) || return false
+    gentry = scope_entry(scope, g_val)
+    gentry === nothing && return false
+    g = gentry.stmt
+    g isa IfOp || return false
+    then_y = g.then_region.terminator
+    else_y = g.else_region.terminator
+    (then_y isa YieldOp && else_y isa YieldOp) || return false
+
+    for (gif, arm) in Iterators.reverse(scope.guards)
+        cond, inverted = strip_not(scope, gif.condition)
+        cond isa SSAValue || continue
+        centry = scope_entry(scope, cond)
+        centry === nothing && continue
+        fproj = getfield_operands(centry.stmt)
+        fproj === nothing && continue
+        (fproj[1] isa SSAValue && fproj[1].id == g_val.id && fproj[2] isa Int) || continue
+        flag_pos = fproj[2]
+        (flag_pos <= length(then_y.values) && flag_pos <= length(else_y.values)) || continue
+        then_flag = then_y.values[flag_pos]
+        else_flag = else_y.values[flag_pos]
+        (then_flag isa Bool && else_flag isa Bool && then_flag != else_flag) || continue
+        # The loop's arm is taken when `gif.condition` is true (:then) or false
+        # (:else); undo the inversions to get the flag on that path. Only the
+        # "not done" path (flag false) proves entry.
+        ((arm === :then) ⊻ inverted) && continue
+
+        entered_then = !then_flag
+        yields = entered_then ? then_y : else_y
+        iv_pos <= length(yields.values) || return false
+        first = yields.values[iv_pos]
+        # `first` may be defined inside the entered arm (a fresh `r.start` read).
+        arm_scope = inner_scope(scope, entered_then ? g.then_region : g.else_region)
+
+        # g's condition is the range-order test; it was false on the entered arm.
+        gcond, ginv = strip_not(scope, g.condition)
+        gcond isa SSAValue || return false
+        gc = scope_entry(scope, gcond)
+        gc === nothing && return false
+        cmp = gc.stmt
+        (cmp isa Expr && cmp.head === :call && length(cmp.args) == 3) || return false
+        want = forop_iv_signed(T) ? Core.Intrinsics.slt_int : Core.Intrinsics.ult_int
+        callee_value(cmp.args[1]) === want || return false
+        (entered_then ⊻ ginv) && return false   # `upper < first` held: no entry proof
+        u, f = cmp.args[2], cmp.args[3]
+        same_value(ctx, scope, u, upper) || return false
+        same_value(ctx, arm_scope, f, first) || return false
+        (scope_value_type(ctx, scope, u) === T && scope_value_type(ctx, scope, f) === T) ||
+            return false
+        return true
+    end
+    return false
+end
+
+"""
+Legality of the iterate-protocol route: a `LoopOp` whose exit is `iv === bound`
+before the increment `iv + step`, as an inclusive `ForOp(lower, bound, step)`.
+Requires the shared type/step facts, and either constant ordered endpoints with
+`bound` on the step grid, or (unit step) the dominating unit-range entry guard.
+Returns the IV type, or `nothing` when the contract is not established.
+"""
+function counted_loop_legal_iterate(ctx::StructurizeCtx, scope::PromoteScope,
+                                    iv_arg::BlockArgument, @nospecialize(lower),
+                                    @nospecialize(bound), @nospecialize(step))
+    T = forop_iv_type(iv_arg.type)
+    T === nothing && return nothing
+    scope_value_type(ctx, scope, lower) === T || return nothing
+    scope_value_type(ctx, scope, bound) === T || return nothing
+    st = positive_const_step(ctx, scope, step, T)
+    st === nothing && return nothing
+    lo = typed_const(ctx, scope, lower, T)
+    up = typed_const(ctx, scope, bound, T)
+    if lo !== nothing && up !== nothing
+        # Constant endpoints: the loop is entered unconditionally, so it visits
+        # `lower` and must reach `bound` without wrapping.
+        lo <= up || return nothing
+        (big(up) - big(lo)) % big(st) == 0 || return nothing
+        return T
+    end
+    # A larger step needs the alignment fact, which only constants supply here.
+    st == one(T) || return nothing
+    unit_range_entry_proof(ctx, scope, lower, bound, T) || return nothing
+    return T
+end
+
+"""
+Legality of the header-tested route: a `WhileOp` testing `iv < bound` (`is_le`
+false) or `iv <= bound` (`is_le` true) with the compare `func`, updating
+`iv + step`, as an exclusive or inclusive `ForOp`. Beyond the shared type/step
+facts and the predicate's signedness matching the IV type:
+
+- `<`: the first update reaching or crossing `bound` must be representable. Unit
+  step needs nothing more; a larger step needs a constant `bound` with
+  `bound + step - 1 <= typemax`, or constant endpoints whose exact final update
+  fits.
+- `<=`: the source update and the following failed test must amount to stopping
+  at `bound`. Unit step needs a constant `bound < typemax`; a larger step needs
+  constant endpoints proving alignment and a representable `bound + step`.
+
+Returns the IV type, or `nothing`; the `WhileOp` then keeps its own semantics,
+wraparound included.
+"""
+function counted_loop_legal_while(ctx::StructurizeCtx, scope::PromoteScope,
+                                  iv_arg::BlockArgument, @nospecialize(lower),
+                                  @nospecialize(bound), @nospecialize(step),
+                                  is_le::Bool, @nospecialize(func))
+    T = forop_iv_type(iv_arg.type)
+    T === nothing && return nothing
+    want = if forop_iv_signed(T)
+        is_le ? Core.Intrinsics.sle_int : Core.Intrinsics.slt_int
+    else
+        is_le ? Core.Intrinsics.ule_int : Core.Intrinsics.ult_int
+    end
+    callee_value(func) === want || return nothing
+    scope_value_type(ctx, scope, lower) === T || return nothing
+    scope_value_type(ctx, scope, bound) === T || return nothing
+    st = positive_const_step(ctx, scope, step, T)
+    st === nothing && return nothing
+    lo = typed_const(ctx, scope, lower, T)
+    up = typed_const(ctx, scope, bound, T)
+    tmax = big(typemax(T))
+    if !is_le
+        st == one(T) && return T          # `iv < bound` makes `iv + 1 <= bound`
+        up === nothing && return nothing
+        big(up) + big(st) - 1 <= tmax && return T
+        lo === nothing && return nothing
+        lo >= up && return T              # statically empty: no update runs
+        last = big(lo) + div(big(up) - 1 - big(lo), big(st)) * big(st)
+        return last + big(st) <= tmax ? T : nothing
+    end
+    if st == one(T)
+        up === nothing && return nothing
+        return big(up) < tmax ? T : nothing   # `bound + 1` fits and fails the test
+    end
+    (lo === nothing || up === nothing) && return nothing
+    lo > up && return T                       # statically empty
+    (big(up) - big(lo)) % big(st) == 0 || return nothing   # lands on the bound
+    return big(up) + big(st) <= tmax ? T : nothing        # final update fits, exits
 end
 
 #=============================================================================
@@ -325,8 +664,8 @@ function simplify_loop_exit(body::Block)
 end
 
 """Check whether a loop result field has a live use. An escaping IV or shadow
-must remain a carry: the exclusive upper bound need not equal its final value
-(e.g. an empty while loop, or the last in-body IV of a for loop)."""
+must remain a carry: the bound need not equal its final value (e.g. an empty
+while loop, or the post-increment IV of a `<=` loop)."""
 function loop_result_pos_escapes(loop_idx::Int, pos::Int, parent_block::Block)
     for (pidx, pentry) in parent_block.body
         s = pentry.stmt
@@ -404,7 +743,8 @@ counting pattern. Works on LoopOps that have been simplified by simplify_loop_ex
 Returns (ForOp, removed_positions) or (loop, Int[]) if promotion fails.
 """
 function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
-                                    new_body::SSAMap, ctx::StructurizeCtx)
+                                    new_body::SSAMap, ctx::StructurizeCtx,
+                                    scope::PromoteScope)
     # Simplify the exit structure (returns a new Block, original is untouched).
     body = simplify_loop_exit(loop.body)
     body === nothing && return (loop, Int[], Dict{Int,Int}())
@@ -473,9 +813,13 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
     step === nothing && return (loop, Int[], Dict{Int,Int}())
 
-    # The `<` range test cannot represent descending iteration. Require a known
-    # positive step; the sign of a runtime step (`a:st:b`) cannot be assumed.
-    step isa Integer && step > 0 || return (loop, Int[], Dict{Int,Int}())
+    # The counted-range contract must be proved before anything is committed (see
+    # `counted_loop_legal_iterate`): an equality exit with the protocol shape is
+    # not itself a proof that the range is entered in order or reaches its end.
+    lower = loop.init_values[iv_pos]
+    counted_loop_legal_iterate(ctx, inner_scope(scope, body, cont_region),
+                               iv_candidate, lower, bound, step) === nothing &&
+        return (loop, Int[], Dict{Int,Int}())
 
     # Step and bound must be loop-invariant: not a block argument of the loop, and
     # not defined in the body (the bound is computed in the header part of `body`,
@@ -554,19 +898,17 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     removed = setdiff(removed, kept)
 
     # Build ForOp.
-    lower = loop.init_values[iv_pos]
-    # Loop-defined bound/step definitions move ahead of the loop, before the `upper`
-    # adjustment that reads them.
+    # Loop-defined bound/step definitions move ahead of the loop that reads them.
     for (hidx, hentry) in hoisted
         push!(new_body, (hidx, hentry.stmt, hentry.type, hentry.flag))
     end
-    # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step.
-    adj_ssa = alloc_ssa!(ctx)
-    anchor_line!(ctx, adj_ssa, cond_val.id)
-    upper_type = iv_candidate.type
-    add_expr = Expr(:call, GlobalRef(Base, :add_int), bound, step)
-    push!(new_body, (adj_ssa, add_expr, upper_type))
-    upper = SSAValue(adj_ssa)
+    # The `===` exit visits `bound` itself and stops there, which is exactly the
+    # inclusive ForOp, with `bound` taken verbatim as the upper limit. An exclusive
+    # `bound + step` would wrap for a range ending at `typemax` of its type (or any
+    # narrow integer type) and lose the whole loop. The legality proof established
+    # that every entry satisfies `lower <= bound` (so the ForOp's own entry guard
+    # changes nothing) and that `bound` lies on the step grid.
+    upper = bound
 
     iv_arg = BlockArgument(alloc_arg!(ctx), iv_candidate.type)
     for_body = Block()
@@ -600,11 +942,11 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 
     # ContinueOp values. A kept escaping position carries `iv_arg` itself, not its
     # lifted continue. The iterate protocol advances the state before re-checking, so
-    # the lifted continue is the advanced value `iv+step`, which equals `upper` (the
-    # post-loop bound). Carrying `iv_arg` makes the kept carry's last value the last
-    # in-body IV (`upper - step`), matching the LoopOp's break, the pre-advance current
-    # value. The empty range is guarded by the outer `if`, so the init is read only
-    # when the loop ran.
+    # the lifted continue is the advanced value `iv+step`, one past the bound.
+    # Carrying `iv_arg` makes the kept carry's last value the last in-body IV, the
+    # bound itself, matching the LoopOp's break, the pre-advance current value. The
+    # empty range is guarded by the outer `if`, so the init is read only when the
+    # loop ran.
     cont_values = IRValue[]
     for (i, v) in enumerate(continue_op.values)
         i ∈ removed && continue
@@ -653,7 +995,8 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     remap_block_args!(for_body, arg_remap)
     step = remap_value(step, arg_remap)
 
-    return (ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits), removed, carry_redirect)
+    return (ForOp(lower, upper, step, iv_arg, for_body, non_iv_inits; inclusive=true),
+            removed, carry_redirect)
 end
 
 #=============================================================================
@@ -767,7 +1110,7 @@ positions the ForOp dropped (the caller adjusts post-loop `getfield`s accordingl
 - `(op, Int[])` with `op` still a WhileOp: not promoted.
 """
 function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
-                          ctx::StructurizeCtx)
+                          ctx::StructurizeCtx, scope::PromoteScope)
     op isa WhileOp || return (op, Int[])
 
     # Look for a condition that is slt_int/sle_int on a block arg vs a loop-invariant bound.
@@ -791,7 +1134,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # Check condition function. `===` is not a counting pattern (try_promote_for_from_loop
     # handles it).
     is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
-    is_sle = func isa GlobalRef && func.name === :sle_int
+    is_sle = func isa GlobalRef && func.name in (:sle_int, :ule_int)
     (is_slt || is_sle) || return (op, Int[])
 
     # IV must be a block argument.
@@ -803,8 +1146,9 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
 
     # A ForOp does not carry its IV as a result. If the IV is read after the loop,
     # keep it as an ordinary carry (`keep_iv`) so the post-loop read is a normal
-    # result, correct for both the empty (init) and non-empty (last continue = upper)
-    # cases. If the IV does not escape, drop it; it is redundant with the range.
+    # result, correct for both the empty (init) and non-empty (last continue = the
+    # post-increment IV) cases. If the IV does not escape, drop it; it is redundant
+    # with the range.
     keep_iv = loop_result_pos_escapes(idx, iv_pos, parent_block)
 
     # Find step: look in the after region for add_int(iv_arg, step).
@@ -834,14 +1178,18 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     end
     step === nothing && return (op, Int[])
 
-    # ForOp requires positive step (ascending loops only).
-    step isa Integer && step < 0 && return (op, Int[])
+    # The counted-range contract must be proved before anything is committed (see
+    # `counted_loop_legal_while`): the `<`/`<=` shape alone does not rule out a
+    # wrapping final update.
+    counted_loop_legal_while(ctx, inner_scope(scope, before, after), iv_candidate,
+                             op.init_values[iv_pos], bound, step, is_sle, func) === nothing &&
+        return (op, Int[])
 
     # Step and bound must be loop-invariant: not a block argument of either region,
     # and not defined in the loop unless that definition can be relocated ahead of it;
     # see `collect_hoists`. This matters for the bound in particular: the ForOp drops
     # the `before` region wholesale, so a bound computed there (`while i <= r.stop` on
-    # an opaque `r`) would otherwise dangle even without an `upper` adjustment.
+    # an opaque `r`) would otherwise dangle.
     hoisted = collect_hoists((bound, step), vcat(before.args, after.args), before, after)
     hoisted === nothing && return (op, Int[])
 
@@ -854,25 +1202,15 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         _refs_ssa_deep(after, SSAValue(sidx)) && return (op, Int[])
     end
 
-    # Build ForOp.
+    # Build ForOp. The bound is taken verbatim: `<` is the exclusive ForOp's test
+    # and `<=` the inclusive one's, so no `bound + 1` is computed (it would wrap
+    # for a bound at `typemax`; the proof above covers the source's own update).
     lower = op.init_values[iv_pos]
     upper = bound
-    is_inclusive = is_sle
 
-    # Loop-defined bound/step definitions move ahead of the loop, before the `upper`
-    # adjustment that may read them.
+    # Loop-defined bound/step definitions move ahead of the loop that reads them.
     for (hidx, hentry) in hoisted
         push!(new_body, (hidx, hentry.stmt, hentry.type, hentry.flag))
-    end
-
-    # Exclusive upper bound: add 1 if inclusive.
-    if is_inclusive
-        adj_ssa = alloc_ssa!(ctx)
-        anchor_line!(ctx, adj_ssa, cond_val.id)
-        upper_type = iv_candidate.type
-        add_expr = Expr(:call, GlobalRef(Base, :add_int), upper, one(upper_type))
-        push!(new_body, (adj_ssa, add_expr, upper_type))
-        upper = SSAValue(adj_ssa)
     end
 
     # Carry init values. When the IV escapes (`keep_iv`) it rides as an ordinary
@@ -936,8 +1274,9 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     end
 
     # ContinueOp carried values. At `iv_pos` (when kept) this is `carried_val`, the
-    # increment SSA = `iv + step`; its last value is `upper` (non-empty) so the kept
-    # carry's result matches `while`-counted post-increment semantics.
+    # increment SSA = `iv + step`; its last value is the post-increment IV (`upper`
+    # for `<`, `upper + 1` for `<=`), so the kept carry's result matches
+    # `while`-counted semantics.
     cont_values = IRValue[]
     if after.terminator isa YieldOp
         for (i, v) in enumerate(after.terminator.values)
@@ -951,7 +1290,8 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     remap_block_args!(for_body, arg_remap)
     step = remap_value(step, arg_remap)
 
-    return (ForOp(lower, upper, step, iv_arg, for_body, carry_inits), keep_iv ? Int[] : [iv_pos])
+    return (ForOp(lower, upper, step, iv_arg, for_body, carry_inits; inclusive=is_sle),
+            keep_iv ? Int[] : [iv_pos])
 end
 
 #=============================================================================

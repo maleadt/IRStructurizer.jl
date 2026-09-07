@@ -1426,10 +1426,11 @@ end
 end
 
 @testset "ForOp" begin
+    # `<` with a unit step promotes; `<=` over a dynamic `n` would stay a WhileOp.
     sci, _ = code_structured(Tuple{Int}) do n::Int
         s = 0
         i = 1
-        while i <= n
+        while i < n
             s += i
             i += 1
         end
