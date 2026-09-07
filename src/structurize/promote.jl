@@ -119,6 +119,77 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
 end
 
 #=============================================================================
+ Hoisting Loop-Defined Bounds and Steps
+=============================================================================#
+
+# Hoisting may execute a statement on a path that previously skipped it. Require
+# no side effects, exceptions or undefined behavior, and a consistent result.
+# Termination is checked separately for compatibility with Julia 1.11.
+const IR_FLAGS_HOISTABLE = CC.IR_FLAGS_REMOVABLE | CC.IR_FLAG_CONSISTENT | CC.IR_FLAG_NOUB
+
+"""Whether a statement is known to terminate, including when speculated."""
+function terminates(entry)
+    entry.flag & CC.IR_FLAG_TERMINATES != 0 && return true
+    # Julia 1.11 never sets the termination bit. Recognize only builtins with
+    # bounded execution; llvmcall and atomic_pointermodify can run user code.
+    VERSION >= v"1.12-" && return false
+    stmt = entry.stmt
+    stmt isa Expr && stmt.head === :call || return false
+    f = stmt.args[1]
+    if f isa GlobalRef
+        isconst(f.mod, f.name) || return false
+        f = getglobal(f.mod, f.name)
+    end
+    return f === Core.getfield || f === Core.tuple ||
+           (f isa Core.IntrinsicFunction && f !== Core.Intrinsics.llvmcall &&
+            f !== Core.Intrinsics.atomic_pointermodify)
+end
+
+"""Whether `entry` can move ahead of the loop. Operands must be defined outside
+its block arguments and regions; transitive hoisting is not attempted."""
+function hoistable_loop_def(entry, args::Vector{BlockArgument}, regions::Block...)
+    entry.flag & IR_FLAGS_HOISTABLE == IR_FLAGS_HOISTABLE || return false
+    terminates(entry) || return false
+    stmt = entry.stmt
+    stmt isa Expr || return false
+    for a in stmt.args
+        if a isa BlockArgument
+            any(arg -> arg.id == a.id, args) && return false
+        elseif a isa SSAValue
+            any(r -> haskey(r.body, a.id), regions) && return false
+        end
+    end
+    return true
+end
+
+"""Whether deleting a statement preserves effects and termination."""
+function droppable_loop_def(entry)
+    entry.flag & CC.IR_FLAGS_REMOVABLE == CC.IR_FLAGS_REMOVABLE || return false
+    return terminates(entry)
+end
+
+"""Collect loop-invariant bound/step definitions to move before a `ForOp`.
+Return `nothing` if either value depends on the loop. Preserve SSA ids so uses
+remaining inside the loop resolve to the relocated definitions."""
+function collect_hoists(vals, args::Vector{BlockArgument}, regions::Block...)
+    hoisted = SSAMap()
+    for v in vals
+        if v isa BlockArgument
+            any(a -> a.id == v.id, args) && return nothing
+        elseif v isa SSAValue && !haskey(hoisted, v.id)
+            for r in regions
+                entry = get(r.body, v.id, nothing)
+                entry === nothing && continue
+                hoistable_loop_def(entry, args, regions...) || return nothing
+                push!(hoisted, (v.id, entry.stmt, entry.type, entry.flag))
+                break
+            end
+        end
+    end
+    return hoisted
+end
+
+#=============================================================================
  LoopOp to ForOp (direct, for iteration protocol patterns)
 =============================================================================#
 
@@ -402,16 +473,16 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     end
     step === nothing && return (loop, Int[], Dict{Int,Int}())
 
-    # ForOp requires positive step (ascending loops only).
-    step isa Integer && step < 0 && return (loop, Int[], Dict{Int,Int}())
+    # The `<` range test cannot represent descending iteration. Require a known
+    # positive step; the sign of a runtime step (`a:st:b`) cannot be assumed.
+    step isa Integer && step > 0 || return (loop, Int[], Dict{Int,Int}())
 
-    # Step and bound must be loop-invariant.
-    if step isa SSAValue && haskey(body.body, step.id)
-        return (loop, Int[], Dict{Int,Int}())
-    end
-    if bound isa BlockArgument && any(a -> a.id == bound.id, body.args)
-        return (loop, Int[], Dict{Int,Int}())
-    end
+    # Step and bound must be loop-invariant: not a block argument of the loop, and
+    # not defined in the body (the bound is computed in the header part of `body`,
+    # the step in the continue branch) unless that definition can be relocated ahead
+    # of the loop; see `collect_hoists`.
+    hoisted = collect_hoists((bound, step), body.args, body, cont_region)
+    hoisted === nothing && return (loop, Int[], Dict{Int,Int}())
 
     # Shadow IV detection: other args whose continue value is the same SSA as
     # the IV's continue value (they track the same induction variable).
@@ -484,6 +555,11 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 
     # Build ForOp.
     lower = loop.init_values[iv_pos]
+    # Loop-defined bound/step definitions move ahead of the loop, before the `upper`
+    # adjustment that reads them.
+    for (hidx, hentry) in hoisted
+        push!(new_body, (hidx, hentry.stmt, hentry.type, hentry.flag))
+    end
     # For ===: body runs for iv = init...bound inclusive, exclusive upper = bound + step.
     adj_ssa = alloc_ssa!(ctx)
     anchor_line!(ctx, adj_ssa, cond_val.id)
@@ -559,13 +635,16 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
         end
     end
 
-    # Body: stmts before the exit IfOp plus continue branch stmts (minus dead increment).
+    # Body: stmts before the exit IfOp plus continue branch stmts (minus dead increment
+    # and the bound/step definitions hoisted above).
     for (sidx, sentry) in body.body
         sidx == last_idx && break
+        haskey(hoisted, sidx) && continue
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
     for (sidx, sentry) in cont_region.body
         step_ssa !== nothing && sidx == step_ssa && !incr_used && continue  # drop dead IV increment
+        haskey(hoisted, sidx) && continue
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 
@@ -629,6 +708,13 @@ function try_promote_while(loop::LoopOp, ctx::StructurizeCtx)
         if val isa SSAValue && !haskey(stay_region.body, val.id)
             return nothing
         end
+    end
+
+    # The sibling before/after regions cannot share header SSA definitions.
+    # Keep the LoopOp if the body reads one, including through a nested region.
+    for (sidx, _) in body.body
+        sidx == last_idx && break
+        _refs_ssa_deep(stay_region, SSAValue(sidx)) && return nothing
     end
 
     # Before region: header stmts (everything before the IfOp).
@@ -751,20 +837,33 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # ForOp requires positive step (ascending loops only).
     step isa Integer && step < 0 && return (op, Int[])
 
-    # Step must be loop-invariant (not defined inside the loop body).
-    if step isa SSAValue && (haskey(op.after.body, step.id) || haskey(op.before.body, step.id))
-        return (op, Int[])
-    end
+    # Step and bound must be loop-invariant: not a block argument of either region,
+    # and not defined in the loop unless that definition can be relocated ahead of it;
+    # see `collect_hoists`. This matters for the bound in particular: the ForOp drops
+    # the `before` region wholesale, so a bound computed there (`while i <= r.stop` on
+    # an opaque `r`) would otherwise dangle even without an `upper` adjustment.
+    hoisted = collect_hoists((bound, step), vcat(before.args, after.args), before, after)
+    hoisted === nothing && return (op, Int[])
 
-    # Bound must be loop-invariant (not a block arg of this loop).
-    if bound isa BlockArgument && any(a -> a.id == bound.id, before.args)
-        return (op, Int[])
+    # Promotion replaces the header with a range test. Any remaining header
+    # statement must be safe to delete, e.g. `while (f(); i <= n)` must retain f().
+    for (sidx, sentry) in before.body
+        sidx == cond_val.id && continue
+        haskey(hoisted, sidx) && continue
+        droppable_loop_def(sentry) || return (op, Int[])
+        _refs_ssa_deep(after, SSAValue(sidx)) && return (op, Int[])
     end
 
     # Build ForOp.
     lower = op.init_values[iv_pos]
     upper = bound
     is_inclusive = is_sle
+
+    # Loop-defined bound/step definitions move ahead of the loop, before the `upper`
+    # adjustment that may read them.
+    for (hidx, hentry) in hoisted
+        push!(new_body, (hidx, hentry.stmt, hentry.type, hentry.flag))
+    end
 
     # Exclusive upper bound: add 1 if inclusive.
     if is_inclusive
@@ -832,6 +931,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
         if carried_val isa SSAValue && sidx == carried_val.id && !incr_used
             continue
         end
+        haskey(hoisted, sidx) && continue  # relocated ahead of the loop
         push!(for_body.body, (sidx, sentry.stmt, sentry.type, sentry.flag))
     end
 

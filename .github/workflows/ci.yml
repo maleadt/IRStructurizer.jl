@@ -44,4 +44,9 @@ jobs:
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
+      - name: Run tests
+        shell: julia --color=yes --project {0}
+        run: |
+          using Pkg
+          # Instrument the package, not the test functions whose IR we inspect.
+          Pkg.test(; coverage="@" * joinpath(pwd(), "src"))

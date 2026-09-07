@@ -190,6 +190,26 @@ end  # CFG analysis
  ForOp is detected directly during CFG analysis for counting patterns.
 =============================================================================#
 
+# Opaque ranges keep field reads in the inlined iteration protocol.
+@noinline opaque_oneto(n) = Base.OneTo(n)
+@noinline opaque_range(a, b) = a:b
+@noinline opaque_steprange(a, s, b) = a:s:b
+
+struct SideRange; stop::Int; end
+const SIDE_STOP_CALLS = Ref(0)
+@noinline side_stop(r::SideRange) = (SIDE_STOP_CALLS[] += 1; r.stop)
+Base.iterate(r::SideRange) = r.stop < 1 ? nothing : (1, 1)
+Base.iterate(r::SideRange, i::Int) = i === side_stop(r) ? nothing : (i + 1, i + 1)
+
+mutable struct MutStop; stop::Int; end
+@noinline opaque_mutstop(n) = MutStop(n)
+
+# A `while` whose header does more than compare: the call lands in the WhileOp's
+# `before` region, which a ForOp has no place for.
+const HEADER_CALLS = Ref(0)
+@noinline header_bump!() = (HEADER_CALLS[] += 1; nothing)
+side_header(n) = (i = 1; s = 0; while (header_bump!(); i <= n); s += i; i += 1; end; s)
+
 @testset "loop classification" begin
 
 @testset "ForOp detection" begin
@@ -449,6 +469,186 @@ end
     @test count_loops(all_stmts) == 2
 end
 
+@testset "opaque range: body-defined bound is hoisted ahead of the ForOp" begin
+    # Hoist the repeated stop read before the ForOp's exclusive-bound adjustment.
+    @test @filecheck begin
+        code_structured(Tuple{Int}) do n::Int
+            s = 0
+            @check "getfield({{%[0-9]+}}, :stop)"
+            @check "[[STOP:%[0-9]+]] = Base.getfield({{%[0-9]+}}, :stop)"
+            @check "add_int([[STOP]], 1)"
+            @check "= for"
+            @check_not "getfield"
+            for i in opaque_oneto(n)
+                s += i * i
+            end
+            @check "continue"
+            return s
+        end
+    end
+
+    sum_oneto(n) = (s = 0; for i in opaque_oneto(n); s += i * i; end; s)
+    @test @roundtrip sum_oneto(5)
+    @test @roundtrip sum_oneto(1)
+    @test @roundtrip sum_oneto(0)
+
+    sum_range(a, b) = (s = 0; for i in opaque_range(a, b); s += i; end; s)
+    @test @roundtrip sum_range(2, 5)
+    @test @roundtrip sum_range(3, 3)
+    @test @roundtrip sum_range(5, 2)   # empty
+
+    # The iteration-protocol rewrite requires a known positive step.
+    sum_steprange(n, st) = (s = 0; for i in opaque_steprange(1, st, n); s += i; end; s)
+    sci, _ = code_structured(sum_steprange, Tuple{Int, Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test @roundtrip sum_steprange(10, 3)
+    @test @roundtrip sum_steprange(10, 7)
+    @test @roundtrip sum_steprange(0, 2)
+    @test @roundtrip sum_steprange(-5, -2)   # 1, -1, -3, -5
+    sum_inline_step(n, st) = (s = 0; for i in 1:st:n; s += i; end; s)
+    sci, _ = code_structured(sum_inline_step, Tuple{Int, Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test @roundtrip sum_inline_step(-5, -2)
+    @test @roundtrip sum_inline_step(10, 3)
+    sum_step2(n) = (s = 0; for i in 1:2:n; s += i; end; s)
+    sci, _ = code_structured(sum_step2, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test @roundtrip sum_step2(10)
+    @test @roundtrip sum_step2(0)
+
+    # The WhileOp path drops the whole `before` region, so a header-computed bound
+    # (`r.stop` on an opaque `r`) must be hoisted there too, for `<=` and `<` alike.
+    while_le(n) = (r = opaque_oneto(n); i = 1; s = 0; while i <= r.stop; s += i; i += 1; end; s)
+    while_lt(n) = (r = opaque_oneto(n); i = 1; s = 0; while i < r.stop; s += i; i += 1; end; s)
+    for f in (while_le, while_lt)
+        sci, _ = code_structured(f, Tuple{Int}) |> only
+        @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    end
+    @test @roundtrip while_le(5)
+    @test @roundtrip while_le(0)
+    @test @roundtrip while_lt(5)
+    @test @roundtrip while_lt(0)
+
+    # A step from the body is speculated even when the loop takes zero trips.
+    function while_step(n, st)
+        r = opaque_steprange(1, st, n)
+        i = 1
+        s = 0
+        while i < n
+            s += i
+            i += r.step
+        end
+        return s
+    end
+    sci, _ = only(code_structured(while_step, Tuple{Int, Int}))
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test @roundtrip while_step(10, 3)
+    @test @roundtrip while_step(1, 3)
+    @test @roundtrip while_step(0, 3)
+end
+
+@testset "body-defined bound that is not loop-invariant is not promoted" begin
+    # Each bound below is an SSA value defined inside the loop that cannot be hoisted:
+    # the loop must stay a WhileOp/LoopOp (and validate) rather than become a ForOp.
+    function stays_loop(f, T)
+        sci, _ = code_structured(f, T) |> only
+        return count_stmts(sci.entry, x -> x isa ForOp) == 0 &&
+               count_stmts(sci.entry, x -> x isa WhileOp || x isa LoopOp) == 1
+    end
+
+    # Bound depends on the induction variable.
+    bound_uses_iv(n) = (i = 1; s = 0; while i <= n - i; s += i; i += 1; end; s)
+    @test stays_loop(bound_uses_iv, Tuple{Int})
+    @test @roundtrip bound_uses_iv(10)
+    @test @roundtrip bound_uses_iv(0)
+
+    # Bound is a side-effecting non-inlined call (iteration-protocol path).
+    sum_side(n) = (s = 0; for i in SideRange(n); s += i; end; s)
+    @test stays_loop(sum_side, Tuple{Int})
+    @test @roundtrip sum_side(5)
+    @test @roundtrip sum_side(0)
+
+    # Bound is read from a mutable object the body writes: the `getfield` is
+    # effect-free and nothrow but not `:consistent`, so hoisting it would freeze the
+    # bound and change the trip count.
+    function shrinking(n)
+        r = opaque_mutstop(n)
+        i = 1; s = 0
+        while i <= r.stop
+            s += i; r.stop -= 1; i += 1
+        end
+        return s
+    end
+    @test stays_loop(shrinking, Tuple{Int})
+    @test @roundtrip shrinking(5)
+    @test @roundtrip shrinking(0)
+end
+
+@testset "while header with a side effect is not promoted" begin
+    # The WhileOp-to-ForOp promotion drops the `before` region, so a header statement
+    # that is neither the hoisted bound nor deletable must keep the loop a WhileOp.
+    # Previously the call was silently dropped from the promoted ForOp.
+    HEADER_CALLS[] = 0
+    expected = side_header(3)
+    native_calls = HEADER_CALLS[]
+    @test native_calls == 4
+    sci, _ = code_structured(side_header, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 1
+    HEADER_CALLS[] = 0
+    @test execute(sci, 3) == expected
+    @test HEADER_CALLS[] == native_calls
+end
+
+@testset "while header values used by the body retain their scope" begin
+    function header_value(n)
+        i = 1
+        s = 0
+        while (k = n - i; i < n)
+            s += k
+            i += 1
+        end
+        return s
+    end
+    sci, _ = only(code_structured(header_value, Tuple{Int}))
+    @test count_stmts(sci.entry, x -> x isa LoopOp) == 1
+    @test count_stmts(sci.entry, x -> x isa ForOp || x isa WhileOp) == 0
+    @test @roundtrip header_value(5)
+    @test @roundtrip header_value(0)
+end
+
+@testset "hoisting requires safe speculation" begin
+    # Only Julia 1.11 uses the builtin fallback when the termination bit is absent.
+    CC = IRStructurizer.CC
+    m = IRStructurizer.SSAMap()
+    push!(m, (1, Expr(:call, GlobalRef(Core, :getfield), Core.Argument(2), QuoteNode(:stop)), Int, CC.IR_FLAG_NULL))
+    push!(m, (2, Expr(:call, GlobalRef(Base, :add_int), Core.SSAValue(1), 1), Int, CC.IR_FLAG_NULL))
+    push!(m, (3, Expr(:invoke, nothing, GlobalRef(Base, :sum), Core.Argument(2)), Int, CC.IR_FLAG_NULL))
+    push!(m, (4, Expr(:invoke, nothing, GlobalRef(Base, :sum), Core.Argument(2)), Int, CC.IR_FLAG_TERMINATES))
+    @test IRStructurizer.terminates(get(m, 1, nothing)) == (VERSION < v"1.12-")
+    @test IRStructurizer.terminates(get(m, 2, nothing)) == (VERSION < v"1.12-")
+    @test !IRStructurizer.terminates(get(m, 3, nothing))
+    @test IRStructurizer.terminates(get(m, 4, nothing))
+    # A statement with every required bit is hoistable regardless of what it calls.
+    full = IRStructurizer.IR_FLAGS_HOISTABLE | CC.IR_FLAG_TERMINATES
+    push!(m, (5, Expr(:invoke, nothing, GlobalRef(Base, :sum), Core.Argument(2)), Int, full))
+    args, blk = IRStructurizer.BlockArgument[], IRStructurizer.Block()
+    @test IRStructurizer.hoistable_loop_def(get(m, 5, nothing), args, blk)
+    @test !IRStructurizer.hoistable_loop_def(get(m, 3, nothing), args, blk)
+    # Hoisting speculates the statement on inputs it was never reached with, so a
+    # statement that may be undefined behavior (`noub` unset) stays where it is even
+    # when it is removable, consistent and terminating.
+    push!(m, (6, Expr(:invoke, nothing, GlobalRef(Base, :sum), Core.Argument(2)), Int, full & ~CC.IR_FLAG_NOUB))
+    @test !IRStructurizer.hoistable_loop_def(get(m, 6, nothing), args, blk)
+    for f in (Core.Intrinsics.llvmcall, Core.Intrinsics.atomic_pointermodify)
+        # These intrinsics can run arbitrary code, even with all other effects
+        # promised by the caller. The fallback must not infer termination.
+        push!(m, (7, Expr(:call, f), Int, full & ~CC.IR_FLAG_TERMINATES))
+        @test !IRStructurizer.terminates(get(m, 7, nothing))
+        @test !IRStructurizer.hoistable_loop_def(get(m, 7, nothing), args, blk)
+    end
+end
+
 end  # ForOp detection
 
 @testset "WhileOp detection" begin
@@ -499,6 +699,12 @@ end  # WhileOp detection
     # Should have some loop op (not ForOp since step changes)
     loop_ops = filter(x -> x isa ForOp || x isa WhileOp || x isa LoopOp, collect(statements(sci.entry.body)))
     @test length(loop_ops) >= 1
+    # The step is a carried block argument, which a ForOp (whose step is evaluated
+    # outside the body) cannot express.
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 0
+    f_dyn = (n::Int) -> (i = 0; step = 1; while i < n; i += step; step += 1; end; i)
+    @test @roundtrip f_dyn(10)
+    @test @roundtrip f_dyn(0)
 end
 
 @testset "step defined inside loop body" begin
