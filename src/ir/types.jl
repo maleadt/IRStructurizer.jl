@@ -472,7 +472,9 @@ part of its contract. In mathematical terms (no arithmetic in the IV type):
 `init_values` are the initial loop-carried values; `body.args` are the carries
 (the IV is `iv_arg`, not a body arg); the body's `ContinueOp` supplies the next
 carried values, in the same order and count. The op's results are the final
-carried values, or the initial ones for an empty range. The IV is not a result:
+carried values, or the initial ones for an empty range. The result tuple may
+expose only a prefix of the carries; trailing invariant carries need no result
+slot. The IV is not a result:
 a producer that needs the escaping IV keeps it as an explicit carry (whose final
 value can differ from `upper`, e.g. the post-increment IV of a `while` loop, or
 the init of an empty loop). Extra exit values (loop-internal values used after

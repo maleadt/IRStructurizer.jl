@@ -288,16 +288,30 @@ feeds in reads off its outgoing edge.
 
 ### Loop promotion
 
-The lift emits only `LoopOp`. The `promote_loops!` post-pass rewrites the ones it
-recognizes: a loop driven by an integer induction variable with a constant step becomes a
-`ForOp`, and a loop that tests its condition before the body becomes a `WhileOp`. The rest
-stay `LoopOp`.
+The lift emits only `LoopOp`. The `promote_loops!` post-pass recognizes header-tested
+loops as `WhileOp`s and promotes integer recurrences to `ForOp`s when it can prove
+finite, increasing iteration without wraparound. Bounds and step share the IV's
+integer type, comparisons respect its signedness, and the step is a positive constant.
+Inclusive ranges must reach their endpoint; exclusive ranges must have a representable
+final increment. Promotion must also preserve the source loop's effects and exit values.
+
+The initial proofs cover constant bounds, dynamic unit ranges with a dominating entry
+guard, and unit-step `<` loops. Dynamic `<=` bounds and stepped ranges such as `1:2:n`
+keep their general form when the final-update or endpoint proof is unavailable. They
+remain supported, including any wrapping behavior in the source loop.
 
 ### Reverse direction
 
-The reverse direction (`unstructurize.jl`) lowers a `StructuredIRCode` back to `IRCode`
-through `IRCode(sci)`. It is there for the tests, which round-trip the structurizer against
-Julia's own IR. cuTile consumes the `StructuredIRCode` directly.
+`expand_for_loops!` rewrites every `ForOp` exactly into the general ops: an inclusive
+range becomes an entry `IfOp` around a `LoopOp` that stops on equality with the bound
+before incrementing, an exclusive one a header-tested `WhileOp`. It never computes
+`upper ± step`, so ranges ending at `typemax` are exact. Consumers without a native counted
+loop for a given `ForOp` can use it as their fallback.
+
+The reverse direction (`unstructurize.jl`) expands a copy this way and then lowers the
+`StructuredIRCode` back to `IRCode` through `IRCode(sci)`. It is there for the tests, which
+round-trip the structurizer against Julia's own IR. cuTile consumes the `StructuredIRCode`
+directly.
 
 
 ## Acknowledgements
