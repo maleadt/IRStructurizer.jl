@@ -63,6 +63,7 @@ end
     include("structurize.jl")
     include("multiplex.jl")
     include("ir.jl")
+    include("use_identity.jl")
     include("unstructurize.jl")
     include("debuginfo.jl")
     include("regression.jl")
