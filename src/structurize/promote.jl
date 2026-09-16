@@ -164,6 +164,9 @@ end
 
 """Whether deleting a statement preserves effects and termination."""
 function droppable_loop_def(entry)
+    # Coverage markers lack the flags required for removal, but deleting them
+    # only affects coverage reporting.
+    entry.stmt isa Expr && entry.stmt.head === :code_coverage_effect && return true
     entry.flag & CC.IR_FLAGS_REMOVABLE == CC.IR_FLAGS_REMOVABLE || return false
     return terminates(entry)
 end

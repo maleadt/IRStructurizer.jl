@@ -600,6 +600,35 @@ end
     @test HEADER_CALLS[] == native_calls
 end
 
+@testset "coverage markers in the header do not block promotion" begin
+    # Inject a coverage marker into the loop header so this regression runs
+    # regardless of the coverage settings. The marker should not block promotion.
+    function cov_loop(n::Int)
+        i = 0
+        acc = 0
+        while i <= n
+            acc += i
+            i += 1
+        end
+        return acc
+    end
+    ir, _ = only(code_ircode(cov_loop, (Int,)))
+    cmp = findfirst(1:length(ir.stmts)) do i
+        stmt = ir.stmts[i][:stmt]
+        stmt isa Expr && stmt.head === :call || return false
+        f = stmt.args[1]
+        f isa GlobalRef && (f = getglobal(f.mod, f.name))
+        return f === Base.sle_int
+    end
+    @test cmp !== nothing
+    CC.insert_node!(ir, SSAValue(cmp), CC.NewInstruction(Expr(:code_coverage_effect), Nothing))
+    ir = CC.compact!(ir)
+    @test any(s -> s isa Expr && s.head === :code_coverage_effect, ir.stmts.stmt)
+    sci = StructuredIRCode(ir)
+    @test count_stmts(sci.entry, x -> x isa ForOp) == 1
+    @test count_stmts(sci.entry, x -> x isa WhileOp) == 0
+end
+
 @testset "while header values used by the body retain their scope" begin
     function header_value(n)
         i = 1
