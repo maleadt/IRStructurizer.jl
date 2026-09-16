@@ -185,12 +185,14 @@ walk_uses!(f, ::Nothing) = nothing
 
 Pre-built index mapping values to their use sites. Created by `uses(block)`.
 Supports `idx[val]` to get use sites, `haskey(idx, val)` for liveness checks.
+Keys are compared with `===` after normalization (an `Instruction` maps to its
+`SSAValue`), so literal operands never have their `hash` or `==` called.
 
 Accepts any key type that appears in operand positions: `SSAValue`,
 `BlockArgument`, `Argument`, `Instruction`, etc.
 """
 struct UseIndex
-    index::Dict{Any, Vector{UseRef}}
+    index::IdDict{Any, Vector{UseRef}}
 end
 
 function Base.getindex(idx::UseIndex, @nospecialize(key))
@@ -220,7 +222,7 @@ Returns a dict-like object: `idx[val]` gives the `Vector{UseRef}` of all
 sites referencing `val`.
 """
 function uses(block::Block)
-    index = Dict{Any, Vector{UseRef}}()
+    index = IdDict{Any, Vector{UseRef}}()
     walk_uses!(block) do ref
         val = ref[]
         val === nothing && return
@@ -241,7 +243,7 @@ function uses(block::Block, @nospecialize(val))
     result = UseRef[]
     target = normalize_key(val)
     walk_uses!(block) do ref
-        normalize_key(ref[]) == target && push!(result, ref)
+        normalize_key(ref[]) === target && push!(result, ref)
     end
     return result
 end
@@ -255,7 +257,7 @@ Replace all uses of `old` with `new_val` in `block` (recursively).
 function replace_uses!(block::Block, @nospecialize(old), @nospecialize(new_val))
     target = normalize_key(old)
     walk_uses!(block) do ref
-        normalize_key(ref[]) == target && (ref[] = new_val)
+        normalize_key(ref[]) === target && (ref[] = new_val)
     end
 end
 
@@ -288,32 +290,32 @@ function _references(@nospecialize(stmt), @nospecialize(target))
     if stmt isa Expr
         # All arguments are operands, including `args[1]` (see `walk_uses!`).
         for arg in stmt.args
-            normalize_key(arg) == target && return true
+            normalize_key(arg) === target && return true
         end
     elseif stmt isa ControlFlowOp
         # Check control flow operands (init values, conditions, etc.)
         if stmt isa IfOp
-            normalize_key(stmt.condition) == target && return true
+            normalize_key(stmt.condition) === target && return true
         elseif stmt isa ForOp
-            normalize_key(stmt.lower) == target && return true
-            normalize_key(stmt.upper) == target && return true
-            normalize_key(stmt.step) == target && return true
+            normalize_key(stmt.lower) === target && return true
+            normalize_key(stmt.upper) === target && return true
+            normalize_key(stmt.step) === target && return true
             for v in stmt.init_values
-                normalize_key(v) == target && return true
+                normalize_key(v) === target && return true
             end
         elseif stmt isa Union{WhileOp, LoopOp}
             for v in stmt.init_values
-                normalize_key(v) == target && return true
+                normalize_key(v) === target && return true
             end
         end
     elseif stmt isa ReturnNode
         isdefined(stmt, :val) || return false
-        normalize_key(stmt.val) == target && return true
+        normalize_key(stmt.val) === target && return true
     elseif stmt isa PiNode
-        normalize_key(stmt.val) == target && return true
+        normalize_key(stmt.val) === target && return true
     elseif is_value_like_stmt(stmt)
         # Alias statement: the stmt itself is the referenced value.
-        normalize_key(stmt) == target && return true
+        normalize_key(stmt) === target && return true
     end
     return false
 end
