@@ -127,12 +127,13 @@ is_value_like_stmt(@nospecialize(s)) =
 # Fallback for unknown statement types (no-op)
 walk_uses!(f, ::Any) = nothing
 
-# Expr: walk operands. For `:invoke`, args are [CodeInstance/MI, callee, args...];
-# the callee (args[2]) is a real SSA use (e.g. a closure being applied) and must
-# be walked, so start at 2. The CodeInstance/MI at args[1] is not a value, so
-# skipping it is correct for both `:invoke` and `:call`.
+# Expr: every argument is an operand, like the compiler's `userefs`. This
+# includes `args[1]`: the callee of a `:call`, the type of a `:new`/`:splatnew`,
+# the pointer of a `:foreigncall`, the token of a `:gc_preserve_end`, and even
+# the target of an `:invoke`/`:invoke_modify`, which codegen evaluates and so
+# need not be a literal CodeInstance/MethodInstance.
 function walk_uses!(f, expr::Expr)
-    for i in 2:length(expr.args)
+    for i in 1:length(expr.args)
         f(IndexedUseRef(expr.args, i))
     end
 end
@@ -285,10 +286,9 @@ end
 """Check if a statement references `target` in any operand position."""
 function _references(@nospecialize(stmt), @nospecialize(target))
     if stmt isa Expr
-        # `:invoke` callee (args[2]) is a real use; the MI at args[1] is not a
-        # value, so start at 2 for both `:invoke` and `:call`.
-        for i in 2:length(stmt.args)
-            normalize_key(stmt.args[i]) == target && return true
+        # All arguments are operands, including `args[1]` (see `walk_uses!`).
+        for arg in stmt.args
+            normalize_key(arg) == target && return true
         end
     elseif stmt isa ControlFlowOp
         # Check control flow operands (init values, conditions, etc.)

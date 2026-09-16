@@ -658,17 +658,59 @@ end
     @test length(idx[SSAValue(1)]) == 1  # ReturnNode terminator
 end
 
+@testset "uses tracks expression first operands" begin
+    # `args[1]` is an operand for every head, as in the compiler's `userefs`:
+    # the callee of a :call, the type of a :new/:splatnew, the pointer of a
+    # :foreigncall, the token of a :gc_preserve_end, and the target of an
+    # :invoke/:invoke_modify (codegen evaluates it; it need not be a literal).
+    for head in (:call, :new, :splatnew, :foreigncall, :gc_preserve_end,
+                 :invoke, :invoke_modify)
+        @testset "$head" begin
+            block = Block()
+            push!(block.body, (1, Expr(head, SSAValue(10), SSAValue(20)), Any))
+            block.terminator = ReturnNode(SSAValue(1))
+
+            @test length(uses(block)[SSAValue(10)]) == 1
+            @test length(uses(block, SSAValue(10))) == 1
+            @test [inst.ssa_idx for inst in users(block, SSAValue(10))] == [1]
+            @test length(uses(block)[SSAValue(20)]) == 1
+
+            replace_uses!(block, SSAValue(10), SSAValue(30))
+            @test block.body.stmts[1].args[1] == SSAValue(30)
+            @test isempty(uses(block, SSAValue(10)))
+            @test length(uses(block, SSAValue(30))) == 1
+        end
+    end
+end
+
+@testset "replacing a computed callee changes execution" begin
+    # Keep the callees abstract so inference leaves an indirect :call.
+    sci, _ = code_structured(Tuple{Any, Any, Int}) do f, g, x
+        f(x)
+    end |> only
+    first_arg = Core.Argument(2)
+    @test length(uses(sci.entry, first_arg)) == 1
+    @test length(users(sci.entry, first_arg)) == 1
+
+    f = x -> x + 1
+    g = x -> 2 * x
+    @test execute(sci, f, g, 5) == 6
+    replace_uses!(sci.entry, first_arg, Core.Argument(3))
+    @test execute(sci, f, g, 5) == 10
+end
+
 @testset "uses tracks :invoke callee (args[2])" begin
     # `:invoke` args are [CodeInstance/MI, callee, args…]. The callee (args[2])
     # is a real SSA use — e.g. an outlined closure being applied; missing it lets
-    # DCE drop the statement defining the callee, dangling the invoke. The MI at
-    # args[1] is not a value (here a stand-in Symbol), so it's never a use.
+    # DCE drop the statement defining the callee, dangling the invoke.
     block = Block()
     push!(block.body, (1, Expr(:invoke, :stand_in_mi, SSAValue(0), SSAValue(2)), Int))
     block.terminator = ReturnNode(SSAValue(1))
     idx = uses(block)
     @test length(idx[SSAValue(0)]) == 1   # callee counted as a use
     @test length(idx[SSAValue(2)]) == 1   # the call argument
+    @test length(uses(block, SSAValue(0))) == 1
+    @test [inst.ssa_idx for inst in users(block, SSAValue(0))] == [1]
     # replace_uses! must rewrite the callee operand too.
     replace_uses!(block, SSAValue(0), SSAValue(99))
     @test isempty(uses(block)[SSAValue(0)])
