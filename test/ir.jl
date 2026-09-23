@@ -1845,6 +1845,10 @@ end
     if_op = IfOp(SSAValue(5), Block(), Block())
     @test operands(block, if_op) == Any[SSAValue(5)]
 
+    # ReturnNode reads its value, unless it is the unreachable form
+    @test operands(block, ReturnNode(SSAValue(3))) == Any[SSAValue(3)]
+    @test operands(block, ReturnNode()) == Any[]
+
     # Unknown type falls back to empty
     @test operands(block, 42) == Any[]
     @test operands(block, GlobalRef(Base, :+)) == Any[]
