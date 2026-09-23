@@ -141,6 +141,8 @@ function print_value(p::IRPrinter, v::GlobalRef)
 end
 
 function print_value(p::IRPrinter, v)
+    # A binding partition (Julia 1.14) prints as the global it reads, as in Base.
+    is_binding_partition(v) && return print_value(p, Base.partition_owner(v).globalref)
     print(p.io, repr(v))
 end
 
@@ -154,6 +156,7 @@ function format_type(t)
 end
 
 function is_intrinsic_call(func)
+    is_binding_partition(func) && return constant_callee(func) isa Core.IntrinsicFunction
     if func isa GlobalRef
         try
             f = getfield(func.mod, func.name)

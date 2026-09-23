@@ -33,6 +33,13 @@ end
 Post-pass: walk the structured IR and promote LoopOps to WhileOp/ForOp
 where the pattern matches.
 """
+# The world promotion resolves callees in: one the IR is valid in, so that a
+# constant rebound since inference still reads as inference saw it.
+function promotion_world(ctx::StructurizeCtx)
+    worlds = (ctx.m::MCFG).valid_worlds
+    return worlds isa WorldRange ? worlds.min_world : Base.get_world_counter()
+end
+
 function promote_loops!(block::Block, ctx::StructurizeCtx)
     new_body = SSAMap()
     # Track ForOp promotions: loop_ssa_idx => (removed_positions, ForOp, carry_redirect)
@@ -204,7 +211,7 @@ into a single IfOp:
 Returns a new Block with the simplified body, or nothing if the pattern doesn't match.
 The original body is not modified.
 """
-function simplify_loop_exit(body::Block)
+function simplify_loop_exit(body::Block, world::UInt)
     length(body.body) < 2 && return nothing
 
     # Find the last IfOp (outer exit dispatch)
@@ -229,7 +236,7 @@ function simplify_loop_exit(body::Block)
         if cond_entry !== nothing && cond_entry.stmt isa Expr &&
            cond_entry.stmt.head === :call && length(cond_entry.stmt.args) == 2
             func = cond_entry.stmt.args[1]
-            if func isa GlobalRef && func.name === :not_int
+            if constant_callee(func, world) === Core.Intrinsics.not_int
                 cond = cond_entry.stmt.args[2]
                 inverted = true
             end
@@ -408,8 +415,9 @@ Returns (ForOp, removed_positions) or (loop, Int[]) if promotion fails.
 """
 function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
                                     new_body::SSAMap, ctx::StructurizeCtx)
+    world = promotion_world(ctx)
     # Simplify the exit structure (returns a new Block, original is untouched).
-    body = simplify_loop_exit(loop.body)
+    body = simplify_loop_exit(loop.body, world)
     body === nothing && return (loop, Int[], Dict{Int,Int}())
 
     # After simplification the body should end with IfOp(cond, break, continue)
@@ -448,7 +456,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
 
     # Only handle === with break-on-true (the iteration protocol pattern).
     # slt_int/sle_int patterns are handled by the WhileOp-to-ForOp path.
-    is_eq = (func isa GlobalRef && func.name === :(===)) || func === :(===)
+    is_eq = constant_callee(func, world) === (===) || func === :(===)
     (is_eq && then_t isa BreakOp) || return (loop, Int[], Dict{Int,Int}())
 
     iv_candidate isa BlockArgument || return (loop, Int[], Dict{Int,Int}())
@@ -466,7 +474,7 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
             s = step_entry.stmt
             if s isa Expr && s.head === :call && length(s.args) >= 3
                 sfunc = s.args[1]
-                if sfunc isa GlobalRef && sfunc.name === :add_int &&
+                if constant_callee(sfunc, world) === Core.Intrinsics.add_int &&
                    s.args[2] isa BlockArgument && s.args[2].id == iv_candidate.id
                     step = s.args[3]
                     step_ssa = step_val.id
@@ -793,8 +801,11 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
 
     # Check condition function. `===` is not a counting pattern (try_promote_for_from_loop
     # handles it).
-    is_slt = func isa GlobalRef && func.name in (:slt_int, :ult_int)
-    is_sle = func isa GlobalRef && func.name === :sle_int
+    # Match the intrinsics themselves: a binding's name says nothing about its value.
+    world = promotion_world(ctx)
+    callee = constant_callee(func, world)
+    is_slt = callee === Core.Intrinsics.slt_int || callee === Core.Intrinsics.ult_int
+    is_sle = callee === Core.Intrinsics.sle_int
     (is_slt || is_sle) || return (op, Int[])
 
     # IV must be a block argument.
@@ -825,7 +836,7 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
             s = step_entry.stmt
             if s isa Expr && s.head === :call && length(s.args) >= 3
                 sfunc = s.args[1]
-                if sfunc isa GlobalRef && sfunc.name === :add_int
+                if constant_callee(sfunc, world) === Core.Intrinsics.add_int
                     # Match either after or before block arg (cross-scope reference)
                     if s.args[2] isa BlockArgument &&
                        (s.args[2].id == after_iv_arg.id || s.args[2].id == before_iv_arg.id)

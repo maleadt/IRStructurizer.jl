@@ -631,8 +631,11 @@ function Base.copy(sci::StructuredIRCode)
     # Sever entry→SCI backref before deepcopy to avoid pulling in
     # debuginfo_table (contains Module on 1.11, which can't be deepcopied)
     sci.entry.parent = nothing
-    entry_copy = deepcopy(sci.entry)
-    sci.entry.parent = sci
+    entry_copy = try
+        Base.deepcopy_internal(sci.entry, shared_ir_objects(sci.entry))::Block
+    finally
+        sci.entry.parent = sci
+    end
     new_sci = StructuredIRCode(
         copy(sci.argtypes), copy(sci.sptypes),
         entry_copy,
