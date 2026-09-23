@@ -15,6 +15,41 @@
  the body emitted once), not only through execution.
 =============================================================================#
 
+# Bindings named like the intrinsics loop promotion recognizes.
+module AliasedIntrinsics
+const slt_int = Core.Intrinsics.sle_int   # an inclusive bound under an exclusive name
+const plus = Core.Intrinsics.add_int
+function misnamed(n::Int)
+    i = s = 0
+    while slt_int(i, n)
+        s += 1
+        i += 1
+    end
+    return s
+end
+function renamed(n::Int)
+    i = s = 0
+    while Core.Intrinsics.slt_int(i, n)
+        s = plus(s, i)
+        i = plus(i, 1)
+    end
+    return s
+end
+end
+
+# A constant the tests rebind after inferring code that calls it.
+module ReboundIntrinsic
+const cmp = Core.Intrinsics.slt_int
+function counted(n::Int)
+    i = s = 0
+    while cmp(i, n)
+        s += 1
+        i += 1
+    end
+    return s
+end
+end
+
 @testset "regression suite" begin
 
 #=============================================================================
@@ -311,6 +346,23 @@ end
     @test @roundtrip ((n::Int) -> (i = 0; while i < n; i += 1; end; i))(5)
     @test @roundtrip ((n::Int) -> (acc = 0; for i in 1:2:n; acc += i; end; acc))(7)
     @test @roundtrip ((n::Int) -> (i = 0; while i <= n; i += 1; end; i))(4)
+end
+
+@testset "promotion recognizes intrinsics by identity, not name" begin
+    @test @roundtrip AliasedIntrinsics.misnamed(4)
+    sci, _ = code_structured(AliasedIntrinsics.renamed, Tuple{Int}) |> only
+    @test count_stmts(sci.entry, s -> s isa ForOp) == 1
+    for n in (0, 1, 5)
+        @test execute(sci, n) == AliasedIntrinsics.renamed(n)
+    end
+end
+
+@static if VERSION >= v"1.12-"
+@testset "promotion reads constants in the IR's world" begin
+    ir, _ = only(code_ircode(ReboundIntrinsic.counted, Tuple{Int}))
+    Core.eval(ReboundIntrinsic, :(const cmp = Core.Intrinsics.sle_int))
+    @test execute(StructuredIRCode(ir), 4) == 4
+end
 end
 
 @testset "while loop carrying a counter + accumulator promotes to a ForOp" begin

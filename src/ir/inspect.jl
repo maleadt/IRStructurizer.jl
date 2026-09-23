@@ -62,6 +62,22 @@ function resolve_callee(block::Block, @nospecialize(ref))
 end
 
 """
+    constant_callee(ref, world=Base.get_world_counter()) -> Any
+
+The function a call head names when that is known without scoping: a literal
+or quoted value, or a global whose type in `world` admits a single value (a
+constant, typically). `nothing` otherwise. Unlike [`resolve_callee`](@ref) it
+never reads a global variable.
+"""
+function constant_callee(@nospecialize(ref), world::UInt=Base.get_world_counter())
+    ref isa GlobalRef && return CC.singleton_type(global_lattice_element(ref, world))
+    ref isa QuoteNode && return ref.value
+    (ref isa SSAValue || ref isa Argument || ref isa BlockArgument || ref isa SlotNumber) &&
+        return nothing
+    return ref
+end
+
+"""
     iscall(stmt) -> Bool
 
 Check whether a statement is a `:call` or `:invoke` expression.
