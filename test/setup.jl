@@ -57,6 +57,25 @@ function count_stmts(blk::Block, pred)
     return n
 end
 
+# The name of the global a call head reads: a `GlobalRef`, or the binding
+# partition Julia 1.14 resolves one to.
+callee_name(ref::GlobalRef) = ref.name
+callee_name(@nospecialize(ref)) = IRStructurizer.is_binding_partition(ref) ?
+    Base.partition_owner(ref).globalref.name : nothing
+
 iscall_to(stmt, fname::Symbol) =
     stmt isa Expr && stmt.head === :call && !isempty(stmt.args) &&
-    (c = stmt.args[1]; c isa GlobalRef && c.name === fname)
+    callee_name(stmt.args[1]) === fname
+
+# A partition held as a constant: inference types `holds_partition`'s
+# statements `Const(COPY_PARTITION)`.
+const COPY_PARTITION = isdefined(Core, :getglobal_partition) ?
+    Base.lookup_binding_partition(Base.get_world_counter(), GlobalRef(Base, :Inf)) : nothing
+@noinline fetch_partition() = (print(devnull, ""); COPY_PARTITION)
+holds_partition(x) = (fetch_partition(), x)
+
+# Globals holding a function, for `resolve_callee` on binding partitions.
+partition_callee(x) = x + 1
+const partition_callee_const = partition_callee
+global partition_callee_typed::typeof(partition_callee) = partition_callee
+partition_callee_untyped = partition_callee

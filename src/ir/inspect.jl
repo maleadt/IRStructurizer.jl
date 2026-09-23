@@ -55,6 +55,7 @@ function resolve_callee(block::Block, @nospecialize(ref))
     end
     # GlobalRefs in optimized IR are guaranteed valid: inference rejects undefined bindings.
     ref isa GlobalRef && return getfield(ref.mod, ref.name)
+    is_binding_partition(ref) && return CC.singleton_type(partition_lattice_element(ref))
     ref isa QuoteNode && return ref.value
     # Literal callable embedded directly as args[1] (e.g. an IntrinsicFunction
     # value substituted by Julia's inliner): the ref *is* the function.
@@ -65,12 +66,13 @@ end
     constant_callee(ref, world=Base.get_world_counter()) -> Any
 
 The function a call head names when that is known without scoping: a literal
-or quoted value, or a global whose type in `world` admits a single value (a
-constant, typically). `nothing` otherwise. Unlike [`resolve_callee`](@ref) it
-never reads a global variable.
+or quoted value, a global whose type in `world` admits a single value (a
+constant, typically), or a binding partition whose type does. `nothing`
+otherwise. Unlike [`resolve_callee`](@ref) it never reads a global variable.
 """
 function constant_callee(@nospecialize(ref), world::UInt=Base.get_world_counter())
     ref isa GlobalRef && return CC.singleton_type(global_lattice_element(ref, world))
+    is_binding_partition(ref) && return CC.singleton_type(partition_lattice_element(ref))
     ref isa QuoteNode && return ref.value
     (ref isa SSAValue || ref isa Argument || ref isa BlockArgument || ref isa SlotNumber) &&
         return nothing
@@ -396,6 +398,7 @@ function argextype(src::Union{Block,StructuredIRCode}, @nospecialize(val))
     val isa Argument && return 1 <= val.n <= length(sci.argtypes) ? sci.argtypes[val.n] : nothing
     val isa SlotNumber && return 1 <= val.id <= length(sci.argtypes) ? sci.argtypes[val.id] : nothing
     val isa GlobalRef && return global_lattice_element(val, sci.valid_worlds.max_world)
+    is_binding_partition(val) && return partition_lattice_element(val)
     # Anything else is a literal; wrap as `Const` so widenconst / from_type
     # recover `typeof(val)` / `Some(val)` respectively.
     return CC.Const(val)
@@ -436,7 +439,16 @@ end
 # Internal: read a `GlobalRef`'s inferred lattice element at `world`.
 # Mirrors `Core.Compiler.abstract_eval_globalref_type`. Lattice elements
 # aren't part of the public surface; consumers go through `const_value`.
-@static if VERSION >= v"1.12-"
+@static if isdefined(CC, :partition_rt) && isdefined(CC, :walk_to_leaf_partition)
+    # Julia 1.14 changed the partition-walking internals; mirror
+    # `Compiler.globalref_rt` instead.
+    function global_lattice_element(g::GlobalRef, world::UInt)
+        binding = convert(Core.Binding, g)
+        partition = CC.lookup_binding_partition(world, binding)
+        _, leaf_partition = CC.walk_to_leaf_partition(binding, partition, world)
+        return CC.partition_rt(leaf_partition)
+    end
+elseif VERSION >= v"1.12-"
     function global_lattice_element(g::GlobalRef, world::UInt)
         binding = convert(Core.Binding, g)
         partition = CC.lookup_binding_partition(world, binding)
@@ -454,4 +466,57 @@ else
     # mutable host globals leak into kernel IR as compile-time values.
     global_lattice_element(g::GlobalRef, ::UInt) =
         CC.abstract_eval_globalref_type(g)
+end
+
+# Julia 1.14 replaces a resolved global access in optimized IR with the
+# `Core.BindingPartition` it acts on (JuliaLang/julia#62452). The partition was
+# resolved at the inference world, so its lattice element needs no lookup; this
+# mirrors `Compiler.argextype`.
+@static if isdefined(CC, :partition_rt)
+    is_binding_partition(@nospecialize(x)) = x isa Core.BindingPartition
+    partition_lattice_element(p::Core.BindingPartition) = CC.partition_rt(p)
+else
+    is_binding_partition(@nospecialize(x)) = false
+end
+
+# Compiler objects an IR copy refers to rather than copies: the code a statement
+# invokes, and the bindings and binding partitions (Julia 1.14) of its globals.
+@static if isdefined(Core, :BindingPartition)
+    const SharedIRObject = Union{Core.CodeInstance, Core.Binding, Core.BindingPartition}
+else
+    const SharedIRObject = Union{Core.CodeInstance, Core.Binding}
+end
+
+# The `SharedIRObject`s `deepcopy(x)` would reach, each mapped to itself, to
+# seed its table so they are shared like `GlobalRef`s. Copying them would be
+# wrong, and through their edges `deepcopy` reaches modules, which it refuses.
+# The walk follows what `deepcopy` follows, not only operands: statement types
+# can hold a partition as a constant, for example.
+function shared_ir_objects(@nospecialize(x))
+    shared = IdDict{Any,Any}()
+    seen = IdDict{Any,Nothing}()
+    function visit(@nospecialize(y))
+        if y isa SharedIRObject
+            shared[y] = y
+        elseif isbits(y) || y isa Union{Symbol, String, Module, Type, GlobalRef,
+                                          Core.MethodInstance, Method, Task}
+            # shared by `deepcopy`, or (a module) refused by it regardless
+        elseif !haskey(seen, y)
+            seen[y] = nothing
+            if y isa Union{Core.GenericMemory, Core.SimpleVector}
+                # An `Array` is reached through its fields, so its whole backing
+                # memory is visited, as `deepcopy` copies it. Bits hold no objects.
+                y isa Core.GenericMemory && isbitstype(eltype(y)) && return
+                for i in eachindex(y)
+                    isassigned(y, i) && visit(y[i])
+                end
+            else
+                for i in 1:nfields(y)
+                    isdefined(y, i) && visit(getfield(y, i))
+                end
+            end
+        end
+    end
+    visit(x)
+    return shared
 end

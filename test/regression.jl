@@ -185,6 +185,43 @@ end
     @test execute(sci, false) === 0.0
 end
 
+if isdefined(Core, :getglobal_partition)
+@testset "phi operand is a binding partition" begin
+    # Julia 1.14 replaces the `GlobalRef` above with the binding partition the
+    # optimizer resolved it to; its type is the binding's, not the partition's.
+    inf = Base.lookup_binding_partition(Base.get_world_counter(), GlobalRef(Base, :Inf))
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 3), Any)],                     succs=[3, 2]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(PhiNode(Int32[2, 3], Any[inf, 0.0]), Float64),
+                (ReturnNode(SSAValue(4)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool])
+    sci = StructuredIRCode(ir)
+    @test execute(sci, true) === Inf
+    @test execute(sci, false) === 0.0
+    @test execute(copy(sci), true) === Inf
+end
+
+@testset "copy shares invoked code and partitions held as constants" begin
+    sci, _ = only(code_structured(holds_partition, Tuple{Int}))
+    c = copy(sci)
+    @test sci.entry.parent === sci && c.entry.parent === c
+    @test execute(c, 1) === (COPY_PARTITION, 1)
+end
+
+@testset "copy shares partitions beyond an array's length" begin
+    # `deepcopy` copies an array's whole backing memory.
+    mem = Memory{Any}(undef, 2)
+    mem[1] = 1
+    mem[2] = COPY_PARTITION
+    block = Block()
+    push!(block.body, (1, QuoteNode(Base.wrap(Array, mem, 1)), Any))
+    sci = StructuredIRCode(Any[], Any[], block, 1)
+    @test copy(sci).entry.body.stmts[1].value[1] == 1
+end
+end
+
 #=============================================================================
  CFG families — executable roundtrip net
 =============================================================================#

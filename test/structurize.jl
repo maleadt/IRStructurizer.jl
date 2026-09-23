@@ -616,9 +616,7 @@ end
     cmp = findfirst(1:length(ir.stmts)) do i
         stmt = ir.stmts[i][:stmt]
         stmt isa Expr && stmt.head === :call || return false
-        f = stmt.args[1]
-        f isa GlobalRef && (f = getglobal(f.mod, f.name))
-        return f === Base.sle_int
+        return callee_name(stmt.args[1]) === :sle_int
     end
     @test cmp !== nothing
     CC.insert_node!(ir, SSAValue(cmp), CC.NewInstruction(Expr(:code_coverage_effect), Nothing))
@@ -1359,7 +1357,7 @@ end
             stmt = entry.stmt
             if stmt isa Expr && stmt.head === :call
                 callee = get(stmt.args, 1, nothing)
-                callee isa GlobalRef && callee.name === fname && (n += 1)
+                callee_name(callee) === fname && (n += 1)
             elseif stmt isa ControlFlowOp
                 for sub in IRStructurizer.blocks(stmt)
                     n += count_calls(sub, fname)

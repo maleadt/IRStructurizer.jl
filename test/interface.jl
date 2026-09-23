@@ -304,6 +304,23 @@ end
     @test length(results) == 2
 end
 
+if isdefined(Core, :getglobal_partition)
+@testset "resolve_callee on binding partitions" begin
+    # Known when the binding's type admits a single value, as for an SSA callee.
+    sci, _ = code_structured(identity, Tuple{Int}) |> only
+    partition(name) = Base.lookup_binding_partition(Base.get_world_counter(),
+                                                    GlobalRef(@__MODULE__, name))
+    @test IRStructurizer.resolve_callee(sci.entry, partition(:partition_callee_const)) === partition_callee
+    @test IRStructurizer.resolve_callee(sci.entry, partition(:partition_callee_typed)) === partition_callee
+    @test IRStructurizer.resolve_callee(sci.entry, partition(:partition_callee_untyped)) === nothing
+end
+end
+
+@testset "display: intrinsic callees" begin
+    sci, _ = code_structured(x -> x + 1, Tuple{Int}) |> only
+    @test occursin("intrinsic Base.add_int(", sprint(show, MIME"text/plain"(), sci))
+end
+
 @testset "display output format" begin
     # Verify display shows proper structure
     sci, _ = code_structured(Tuple{Bool}) do x::Bool
