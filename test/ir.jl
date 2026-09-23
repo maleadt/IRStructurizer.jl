@@ -605,6 +605,11 @@ end
 
 end  # traversal
 
+# A literal operand whose `hash` and `==` throw, like Static.jl's `StaticFloat64`.
+mutable struct OpaqueLiteral; value::Int; end
+Base.hash(::OpaqueLiteral, ::UInt) = error("operands must not be hashed")
+Base.:(==)(::OpaqueLiteral, ::OpaqueLiteral) = error("operands must not be compared with ==")
+
 @testset "use tracking" begin
 
 @testset "uses(block) and UseIndex" begin
@@ -869,6 +874,76 @@ end
     idx2 = uses(block)
     @test isempty(idx2[SSAValue(0)])
     @test length(idx2[SSAValue(99)]) == 2
+end
+
+@testset "literal operands are compared by identity" begin
+    @testset "unhashable operands" begin
+        a = OpaqueLiteral(1)
+        b = OpaqueLiteral(1)
+        c = OpaqueLiteral(2)
+        block = Block()
+        push!(block.body, (1, Expr(:call, identity, a), OpaqueLiteral))
+        push!(block.body, (2, Expr(:call, identity, b), OpaqueLiteral))
+        block.terminator = ReturnNode(a)
+
+        idx = uses(block)
+        @test length(idx[a]) == 2
+        @test length(idx[b]) == 1
+        @test length(uses(block, a)) == 2
+        @test length(users(block, a)) == 1
+
+        replace_uses!(block, a, c)
+        @test isempty(uses(block, a))
+        @test length(uses(block, c)) == 2
+        @test block.body.stmts[2].args[2] === b
+        @test block.terminator.val === c
+    end
+
+    @testset "equal mutable constants stay distinct" begin
+        a = [1, 2]
+        b = [1, 2]
+        block = Block()
+        push!(block.body, (1, Expr(:call, identity, a), Vector{Int}))
+        push!(block.body, (2, Expr(:call, identity, b), Vector{Int}))
+
+        idx = uses(block)
+        @test length(idx[a]) == 1
+        @test length(idx[b]) == 1
+        @test length(users(block, a)) == 1
+
+        replace_uses!(block, a, [3, 4])
+        @test block.body.stmts[2].args[2] === b
+
+        # Mutating a constant after indexing must not strand its entry.
+        b[1] = 7
+        @test length(idx[b]) == 1
+    end
+
+    @testset "numerically equal literals of different types" begin
+        block = Block()
+        push!(block.body, (1, Expr(:call, identity, 1), Int))
+        push!(block.body, (2, Expr(:call, identity, 1.0), Float64))
+        push!(block.body, (3, Expr(:call, identity, -0.0), Float64))
+
+        idx = uses(block)
+        @test length(idx[1]) == 1
+        @test length(idx[1.0]) == 1
+        @test length(idx[0.0]) == 0
+        @test length(uses(block, 1)) == 1
+
+        replace_uses!(block, 1, 2)
+        @test block.body.stmts[1].args[2] === 2
+        @test block.body.stmts[2].args[2] === 1.0
+    end
+
+    @testset "Instruction keys still normalize to SSAValue" begin
+        block = Block()
+        push!(block.body, (1, Expr(:call, identity, 1), Int))
+        push!(block.body, (2, Expr(:call, identity, SSAValue(1)), Int))
+        idx = uses(block)
+        @test idx[first(instructions(block))] === idx[SSAValue(1)]
+        @test length(idx[SSAValue(1)]) == 1
+    end
 end
 
 end  # use tracking
