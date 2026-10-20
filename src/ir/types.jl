@@ -1,6 +1,6 @@
 # structured IR definitions
 
-export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type,
+export StructuredIRCode, Undef, Instruction, instructions, arguments, value_type, ssavalue,
        insert_before!, insert_after!, terminator, terminator!, operands,
        source_location
 
@@ -347,8 +347,8 @@ end
 """Get the Julia type of the instruction result."""
 value_type(i::Instruction) = i[:type]
 
-"""Convert to SSAValue for use in operand positions."""
-Core.SSAValue(i::Instruction) = SSAValue(i.ssa_idx)
+"""The `SSAValue` that refers to `i` in operand positions."""
+ssavalue(i::Instruction) = SSAValue(i.ssa_idx)
 
 Base.:(==)(a::Instruction, b::Instruction) = a.ssa_idx == b.ssa_idx
 Base.hash(i::Instruction, h::UInt) = hash(i.ssa_idx, h)

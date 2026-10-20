@@ -18,7 +18,7 @@
     inst = first(insts)
     @test value_type(inst) isa Type
     @test value_type(inst) === inst[:type]
-    @test SSAValue(inst) isa SSAValue
+    @test ssavalue(inst) isa SSAValue
     @test inst[:flag] isa UInt32
 end
 
@@ -241,7 +241,7 @@ end
 
     # SSAValue defined in entry block
     entry_inst = first(instructions(sci.entry))
-    @test SSAValue(entry_inst) ∈ sci.entry
+    @test ssavalue(entry_inst) ∈ sci.entry
 
     # Find a loop and check its body
     loop_op = nothing
@@ -258,8 +258,8 @@ end
     if !isempty(collect(instructions(body)))
         body_inst = first(instructions(body))
         # Body instruction is in its own block, not in entry
-        @test SSAValue(body_inst) ∈ body
-        @test !(SSAValue(body_inst) ∈ sci.entry)
+        @test ssavalue(body_inst) ∈ body
+        @test !(ssavalue(body_inst) ∈ sci.entry)
     end
 
     # BlockArguments
@@ -348,7 +348,7 @@ end
 
     insts = collect(instructions(sci.entry))
     ref = first(insts)
-    ref_ssaval = SSAValue(ref)
+    ref_ssaval = ssavalue(ref)
 
     # insert_before! with SSAValue reference
     before = insert_before!(sci.entry, ref_ssaval, Expr(:call, :before_ssa), Int32)
@@ -366,7 +366,7 @@ end
     @test bp < rp < ap
 
     # Chaining: insert_after! the just-inserted instruction
-    chained = insert_after!(sci.entry, SSAValue(after), Expr(:call, :chained), Bool)
+    chained = insert_after!(sci.entry, ssavalue(after), Expr(:call, :chained), Bool)
     all_insts2 = collect(instructions(sci.entry))
     cp = findfirst(i -> i == chained, all_insts2)
     ap2 = findfirst(i -> i == after, all_insts2)
@@ -1323,7 +1323,7 @@ end  # loop carries
         singleton = Core.Compiler.singleton_type(T)
         singleton === nothing && continue
         # This SSA value has a singleton type — resolve_callee should find it
-        @test resolve_callee(block, SSAValue(inst)) === singleton
+        @test resolve_callee(block, ssavalue(inst)) === singleton
         break
     end
 
@@ -1381,7 +1381,7 @@ end  # expression inspection
     end |> only
 
     inst = first(instructions(sci.entry))
-    typ = value_type(sci.entry, SSAValue(inst))
+    typ = value_type(sci.entry, ssavalue(inst))
     @test typ !== nothing
     @test typ == value_type(inst)
 end
