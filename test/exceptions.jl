@@ -7,7 +7,7 @@
 =============================================================================#
 
 using IRStructurizer: ingest, handler_stacks, is_leave, MEnter, try_info, try_exit_refs,
-                      edge_of
+                      edge_of, is_pop_exception
 using Base.ScopedValues
 
 const EH_LOG = Any[]
@@ -623,6 +623,27 @@ eh_mcfg(f) = ingest(first(only(code_ircode(f, Tuple{Int}))); exceptions=:structu
     r = only(values(try_info(m)))
     loops = IRStructurizer.natural_loops_m(m)
     @test !any(h -> h in r.handler, keys(loops))
+end
+
+"""For each `pop_exception` in `m`: the handler depth of the catch it pops (its
+try's entry depth), and the depth of the block it runs in."""
+function eh_pop_depths(m)
+    stacks = handler_stacks(m)
+    enter_depth = Dict(b.term.id => length(stacks[bid]) for (bid, b) in enumerate(m.blocks)
+                       if b.term isa MEnter && stacks[bid] !== nothing)
+    return [(enter_depth[s.stmt.args[1].id], length(stacks[bid]))
+            for (bid, b) in enumerate(m.blocks) if stacks[bid] !== nothing
+            for s in b.body if is_pop_exception(s.stmt)]
+end
+
+@testset "a pop after a leave of an enclosing try moves before it" begin
+    # A catch that returns out of an enclosing try: Julia leaves the outer try,
+    # then pops the inner catch's exception, one handler shallower than the catch.
+    # Moved before the leave, the pop runs in its catch.
+    @testset "$(nameof(f))" for f in (eh_nested_return, eh_return_from_inner_catch,
+                                      eh_return_from_nested_catch_in_loop, eh_three_levels)
+        @test all(((d, at),) -> at >= d, eh_pop_depths(eh_mcfg(f)))
+    end
 end
 
 end  # exceptions

@@ -27,8 +27,9 @@ that predecessor edge's operands. Stable ids == original SSA positions. Blocks
 unreachable from the entry are dropped (see `prune_unreachable!`).
 
 An `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
-`:structured`. Then it becomes an `MEnter` terminator, and each `Expr(:leave, ...)`
-is split into blocks of its own that pop one handler each (`split_leaves!`). See
+`:structured`. Then it becomes an `MEnter` terminator, each `Expr(:leave, ...)` is
+split into blocks of its own that pop one handler each (`split_leaves!`), and the
+`pop_exception`s are moved to where their catch's handler runs. See
 `structurize/exceptions.jl`.
 """
 function ingest(ir::IRCode; exceptions::Symbol=:error)
@@ -113,7 +114,10 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
              length(ir.stmts.stmt) + 1,
              copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds, has_eh)
     prune_unreachable!(m)
-    has_eh && split_leaves!(m)
+    if has_eh
+        hoist_pops_over_leaves!(m)
+        split_leaves!(m)
+    end
     return m
 end
 

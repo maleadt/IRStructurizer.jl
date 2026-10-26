@@ -307,3 +307,85 @@ function popped_state(at_enter::Dict{Int, Int}, st::MStmt)
         "unsupported try/catch: the pop_exception at %$(st.id) does not follow its enter"))
     return s
 end
+
+#=============================================================================
+ Placing pop_exception
+
+ Each `pop_exception` should run at the handler depth and in the exception state
+ of the catch it pops: inside that catch's handler region, where its own enter
+ dominates it. Julia orders pops and leaves either way around; these rewrites
+ move the pops into place.
+=============================================================================#
+
+"""Move the `pop_exception`s that open a block reached only through `:leave`s to
+before those leaves, when the leaves took the handler stack below the depth of
+the catch whose exception they pop. Julia leaves an enclosing try and then pops
+when a catch exits past it (`try; try ... catch; return x; end ... end`:
+`leave %outer`, then `pop_exception %inner`). The pop then sits outside the outer
+try, where the lift puts it after the outer `TryOp`, and possibly after a loop
+around that `TryOp`, where no enter that could name it dominates it. Before the
+leave, the pop is back in the inner catch, where its own enter dominates it. A
+leave pops the handler stack and a pop restores the exception stack, so the two
+commute. Run before `split_leaves!`."""
+function hoist_pops_over_leaves!(m::MCFG)
+    changed = true
+    while changed
+        changed = false
+        stacks = handler_stacks(m)
+        enter_depth = Dict{Int, Int}()
+        for (bid, b) in enumerate(m.blocks)
+            b.term isa MEnter && stacks[bid] !== nothing &&
+                (enter_depth[b.term.id] = length(stacks[bid]::Vector{Int}))
+        end
+        incoming = [Int[] for _ in m.blocks]   # the source block of each edge
+        catch_dests = Set{Int}()
+        for (bid, b) in enumerate(m.blocks)
+            t = b.term
+            if t isa MGoto
+                push!(incoming[t.edge.target], bid)
+            elseif t isa MCondBr
+                push!(incoming[t.t.target], bid); push!(incoming[t.f.target], bid)
+            elseif t isa MEnter
+                push!(incoming[t.body.target], bid)
+                t.catch_dest != 0 && push!(catch_dests, t.catch_dest)
+            end
+        end
+        for (pid, p) in enumerate(m.blocks)
+            srcs = incoming[pid]
+            (isempty(srcs) || pid == m.entry || pid in catch_dests) && continue
+            stacks[pid] === nothing && continue
+            depth = length(stacks[pid]::Vector{Int})
+            # The leading pops of a catch deeper than this block (`nothing`
+            # placeholders may sit between them).
+            n = 0
+            while n < length(p.body) &&
+                  (is_pop_exception(p.body[n+1].stmt) || p.body[n+1].stmt === nothing)
+                n += 1
+            end
+            n == 0 && continue
+            pops = MStmt[s for s in view(p.body, 1:n) if is_pop_exception(s.stmt) &&
+                         get(enter_depth, s.stmt.args[1].id, depth) > depth]
+            isempty(pops) && continue
+            all(srcs) do src
+                b = m.blocks[src]
+                b.term isa MGoto && !isempty(b.body) && is_leave(b.body[end].stmt)
+            end || continue
+            for (j, src) in enumerate(srcs)
+                b = m.blocks[src]
+                moved = j == 1 ? pops : map(pops) do s
+                    id = alloc_id!(m)
+                    m.types[id] = s.type
+                    m.codelocs[id] = s.codeloc
+                    MStmt(id, s.stmt, s.type, s.codeloc, s.flag)
+                end
+                for s in moved
+                    insert!(b.body, length(b.body), s)    # before the leave
+                end
+            end
+            moved_ids = Set{Int}(s.id for s in pops)
+            filter!(s -> !(s.id in moved_ids), p.body)
+            changed = true
+        end
+    end
+    return m
+end
