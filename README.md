@@ -312,7 +312,9 @@ block arguments, and `TryOp.upsilons` lists the `UpsilonNode`s that feed each on
 stay as statements on Julia's exception stack.
 
 Regions come from a handler-stack dataflow, and `normalize_cf!` gives each try a
-single continuation before the other passes run.
+single continuation before the other passes run. See
+[`docs/exceptions.md`](docs/exceptions.md) for the design and the mapping to Wasm
+`try_table`.
 
 ### Reverse direction
 
