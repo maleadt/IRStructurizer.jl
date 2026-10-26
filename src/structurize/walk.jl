@@ -380,7 +380,14 @@ the merge, e.g. a diverged arm whose yield is dead) becomes a typed `Undef`. If 
 arm already redefines a merge arg at its (remapped) id, e.g. a nested IfOp on the
 same merge emitted the `getfield` there, that in-block definition is preferred over
 the raw edge operand."""
-function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo)
+yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo) =
+    (blk.terminator = YieldOp(merge_values(blk, ctx, exit_block, minfo)))
+
+"""The values `exit_block` contributes to `minfo`'s merge, as `yield_to_merge!`
+describes: one per live merge argument, `Undef` where the edge carries none.
+Empty when there is no merge information."""
+merge_values(::Block, ::StructurizeCtx, ::Int, ::Nothing) = IRValue[]
+function merge_values(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo)
     ops = edge_operands(ctx.m::MCFG, exit_block, minfo.merge)
     vals = IRValue[]
     for j in eachindex(minfo.ids)
@@ -393,7 +400,7 @@ function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo
                         narrow_edge_value!(blk, ctx, v, minfo.types[j], minfo.ids[j]))
         end
     end
-    blk.terminator = YieldOp(vals)
+    return vals
 end
 
 """The edge operand `v`, remapped, for a block argument of type `T` (an IfOp result,
