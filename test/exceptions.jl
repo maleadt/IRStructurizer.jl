@@ -480,6 +480,53 @@ function eh_exits_from_catch_in_nested_loops(x)
     end
     x
 end
+# A catch returns out of a try nested in another catch, itself in a try body: the
+# return leaves two trys and pops two catches' exceptions at once.
+function eh_return_across_catches_and_trys(x)
+    try
+        try
+            eh_log(10)
+            x > 5 && eh_throw(ErrorException("a"))
+        catch
+            try
+                try
+                    eh_throw(ErrorException("b"))
+                catch
+                    eh_log(0)
+                    return x
+                end
+            catch
+                rethrow()
+            end
+        end
+    catch
+    end
+    -x
+end
+# A catch that either runs a try of its own or not, both paths joining at a block
+# that pops the outer catch. The inner path reaches the join holding two
+# exceptions, the other path one. `inner_first` puts the inner path on the
+# branch's first edge, so the state analysis reaches the join through it first.
+function eh_split_join_ir(inner_first::Bool)
+    thr = (Expr(:call, Core.throw, ErrorException("a")), Union{})
+    unreachable = (ReturnNode(), Union{})
+    # %1 = enter (outer); %6 = enter (inner); the join pops %1.
+    D, I, J = inner_first ? (8, 4, 7) : (4, 5, 8)
+    blocks = Vector{Any}(undef, 9)
+    blocks[1] = (stmts=[(Core.EnterNode(3), Any)], succs=[3, 2])
+    blocks[2] = (stmts=[thr, unreachable], succs=Int[])
+    blocks[3] = (stmts=[(GotoIfNot(Core.Argument(2), inner_first ? D : I), Any)],
+                 succs=inner_first ? [I, D] : [D, I])
+    blocks[D] = (stmts=[(GotoNode(J), Any)], succs=[J])
+    blocks[I] = (stmts=[(Core.EnterNode(I + 2), Any)], succs=[I + 2, I + 1])
+    blocks[I+1] = (stmts=[thr, unreachable], succs=Int[])
+    blocks[I+2] = (stmts=[(GotoNode(J), Any)], succs=[J])
+    blocks[J] = (stmts=[(Expr(:pop_exception, SSAValue(1)), Nothing), (GotoNode(9), Any)],
+                 succs=[9])
+    blocks[9] = (stmts=[(ReturnNode(Core.Argument(2)), Any)], succs=Int[])
+    return build_ir(blocks, Any[Tuple{}, Bool])
+end
+
 function eh_try_after_returning_try(x)
     try
         eh_log(10)
@@ -490,6 +537,60 @@ function eh_try_after_returning_try(x)
         x += 1
         eh_log(5)
     catch
+    end
+    x
+end
+
+# A `break` from a try in a catch nested in another catch pops both exceptions,
+# then leaves the try. Split into one pop per catch, both pops move past the leave.
+function eh_break_from_try_in_nested_catches(x)
+    for i in 1:3
+        try
+            x > 0 && eh_throw(ErrorException("a"))
+        catch
+            try
+                x > 1 && eh_throw(ErrorException("b"))
+            catch
+                try
+                    x > 2 && break
+                    eh_log(1)
+                catch
+                end
+            end
+        end
+        eh_log(i)
+    end
+    x
+end
+
+# The same with a try around the middle catch: a `break` from the innermost catch
+# pops three catches' exceptions and leaves two trys (`pop A; leave Y; leave X`).
+# The middle pop has to pass one leave, the outer pop both.
+function eh_break_from_catch_in_trys_in_catches(x)
+    for i in 1:3
+        try
+            x > 0 && eh_throw(ErrorException("a"))
+        catch
+            try
+                try
+                    x > 1 && eh_throw(ErrorException("b"))
+                catch
+                    try
+                        try
+                            x > 2 && eh_throw(ErrorException("c"))
+                        catch
+                            x > 3 && break
+                            eh_log(3)
+                        end
+                        eh_log(4)
+                    catch
+                    end
+                end
+                eh_log(5)
+            catch
+            end
+        end
+        eh_log(i)
     end
     x
 end
@@ -518,6 +619,9 @@ const EH_CASES = [
     (eh_return_from_finally, (1, 7, 12, 20)),
     (eh_return_or_break_from_try_in_catch, (-5, 0, 9)),
     (eh_exits_from_catch_in_nested_loops, (-5, 0, 3, 6, 8)),
+    (eh_return_across_catches_and_trys, (1, 7)),
+    (eh_break_from_try_in_nested_catches, (0, 1, 2, 5)),
+    (eh_break_from_catch_in_trys_in_catches, (0, 1, 2, 3, 5)),
 ]
 
 @testset "exceptions" begin
@@ -652,6 +756,84 @@ end
     # handler depth of its catch.
     @testset "$(nameof(f))" for (f, _) in EH_CASES
         @test all(((d, at),) -> at == d, eh_pop_depths(eh_mcfg(f)))
+    end
+end
+
+"""Every exception stack each block of `m` can be entered with, as the enters whose
+exceptions are on it, outermost first. A catch edge pushes its enter onto the stack
+the enter ran with, and `pop_exception %x` cuts the stack back to below `x` (or
+leaves it alone if `x` is not on it). Unlike `exception_states`, this keeps every
+stack that reaches a join. A stack that holds a catch twice is dropped: Julia 1.11
+leaks the exception of a `finally` that exits after a throw, and in a loop such
+stacks would grow without end."""
+function eh_incoming_stacks(m)
+    stacks = [Set{Vector{Int}}() for _ in m.blocks]
+    push!(stacks[m.entry], Int[])
+    work = [m.entry]
+    while !isempty(work)
+        b = pop!(work)
+        blk = m.blocks[b]
+        for s0 in collect(stacks[b])
+            s = copy(s0)
+            for st in blk.body
+                is_pop_exception(st.stmt) || continue
+                k = findfirst(==(st.stmt.args[1].id), s)
+                k === nothing || resize!(s, k - 1)
+            end
+            t = blk.term
+            for tgt in IRStructurizer._term_targets(t)
+                s′ = t isa MEnter && tgt == t.catch_dest ? vcat(s, t.id) : s
+                (allunique(s′) && !(s′ in stacks[tgt])) || continue
+                push!(stacks[tgt], s′)
+                push!(work, tgt)
+            end
+        end
+    end
+    return stacks
+end
+
+@testset "a pop that leaves several catches is split, one per catch" begin
+    # A `break` from a catch nested in another catch pops straight to the outer
+    # state. Split, every pop on a path to a continuation pops one exception:
+    # on every stack that reaches it, its catch's exception is the innermost one
+    # (or it is not there, and the pop does nothing). A `return` may still pop
+    # several catches at once: it has no continuation. So may a block that paths
+    # reach with different exceptions pending (a `finally` on Julia 1.11). Each pop
+    # also comes after its enter.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        domtree = CC.construct_domtree(IRStructurizer.build_cfg(m))
+        enter_block = Dict(b.term.id => bid for (bid, b) in enumerate(m.blocks)
+                           if b.term isa MEnter)
+        for (bid, b) in enumerate(m.blocks), st in b.body
+            is_pop_exception(st.stmt) || continue
+            x = st.stmt.args[1].id
+            @test bid != enter_block[x] && CC.dominates(domtree, enter_block[x], bid)
+        end
+        for (bid, ins) in enumerate(eh_incoming_stacks(m))
+            b = m.blocks[bid]
+            (b.term isa IRStructurizer.MReturn || length(ins) > 1) && continue
+            for s0 in ins
+                s = copy(s0)
+                for st in b.body
+                    is_pop_exception(st.stmt) || continue
+                    x = st.stmt.args[1].id
+                    k = findfirst(==(x), s)
+                    @test k === nothing || k == length(s)
+                    k === nothing || resize!(s, k - 1)
+                end
+            end
+        end
+    end
+end
+
+@testset "a join reached in two exception states is in the catch both are in" begin
+    # Whichever path the analysis takes first, the join is in the outer catch, and its
+    # pop of that catch is not split.
+    @testset "inner_first=$inner_first" for inner_first in (false, true)
+        m = ingest(eh_split_join_ir(inner_first); exceptions=:structured)
+        @test [st.stmt.args[1].id for b in m.blocks for st in b.body
+               if is_pop_exception(st.stmt)] == [1]
     end
 end
 

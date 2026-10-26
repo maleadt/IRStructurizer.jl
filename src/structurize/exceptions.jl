@@ -403,7 +403,9 @@ that cannot complete normally).
 
 Runs after `split_leaves!`. The pop moves only along the chain of leave blocks
 that follows it and nothing else reaches, into a new block after the last leave
-it has to pass."""
+it has to pass. Blocks holding nothing but pops may sit between it and the leaves
+(`split_pops_across_catches!` puts the pop of each outer catch in one). Their pops
+move too, in order, and keep a block each, so the split stays."""
 function sink_pops_below_leaves!(m::MCFG)
     stacks = handler_stacks(m)
     enter_depth = Dict{Int, Int}()
@@ -426,34 +428,120 @@ function sink_pops_below_leaves!(m::MCFG)
         while k >= 1 && (is_pop_exception(b.body[k].stmt) || b.body[k].stmt === nothing)
             k -= 1
         end
-        pops = [(s, depth - get(enter_depth, s.stmt.args[1].id, depth))
-                for s in view(b.body, k+1:length(b.body)) if is_pop_exception(s.stmt)]
-        filter!(((_, n),) -> n > 0, pops)
-        isempty(pops) && continue
-        issorted(pops; by=last) || continue
-        chain = Int[]
+        k == length(b.body) && continue
+        # Each pop with the number of leaves it has to pass and the block it is in.
+        npops(stmts, from) = [(s, depth - get(enter_depth, s.stmt.args[1].id, depth), from)
+                              for s in stmts if is_pop_exception(s.stmt)]
+        pops = npops(view(b.body, k+1:length(b.body)), bid)
+        # The blocks of pops alone that follow, into which `split_pops_across_catches!`
+        # put the pops of the outer catches, continue the run.
         cur = b.term.edge.target
-        while length(chain) < last(pops[end])
+        while true
+            l = m.blocks[cur]
+            (npreds[cur] == 1 && l.term isa MGoto && any(s -> is_pop_exception(s.stmt), l.body) &&
+             all(s -> is_pop_exception(s.stmt) || s.stmt === nothing, l.body)) || break
+            append!(pops, npops(l.body, cur))
+            cur = l.term.edge.target
+        end
+        filter!(p -> p[2] > 0, pops)
+        isempty(pops) && continue
+        issorted(pops; by=p -> p[2]) || continue
+        chain = Int[]
+        while length(chain) < pops[end][2]
             l = m.blocks[cur]
             (npreds[cur] == 1 && length(l.body) == 1 && is_leave(l.body[1].stmt) &&
              l.term isa MGoto) || break
             push!(chain, cur)
             cur = l.term.edge.target
         end
-        length(chain) >= last(pops[end]) || continue
-        placed = Dict{Int, Int}()            # leaves passed => block holding the pops
-        for (s, n) in pops
-            nb = get!(placed, n) do
-                l = m.blocks[chain[n]]
+        length(chain) >= pops[end][2] || continue
+        # The pops of one block go to one new block, and the split pops keep a
+        # block each, in order, so each exit still holds the state it held.
+        last_placed = Dict{Int, Int}()       # leaves passed => last block placed there
+        placed = Dict{Tuple{Int, Int}, Int}()
+        for (s, n, from) in pops
+            nb = get!(placed, (n, from)) do
+                l = m.blocks[get(last_placed, n, chain[n])]
                 id = add_block!(m, MBlock(Int[], MStmt[], l.term, l.term_codeloc, l.term_id))
                 l.term = MGoto(MEdge(id))
                 l.term_id = 0
-                id
+                last_placed[n] = id
             end
             push!(m.blocks[nb].body, s)
         end
         moved = Set{Int}(s.id for (s, _) in pops)
-        filter!(s -> !(s.id in moved), b.body)
+        for x in unique(p[3] for p in pops)
+            filter!(s -> !(s.id in moved), m.blocks[x].body)
+        end
+    end
+    return m
+end
+
+"""Split a `pop_exception` that leaves several catches at once into one pop per
+catch, each on the way out of its catch. Julia pops straight to the state an
+exit needs: a `break` from a catch nested in another catch pops the outer
+catch's exception, which drops the inner one too. The inner try's exits then
+disagree on the exception state: that `break` leaves the inner handler with
+nothing pending, while an exit from the inner body (a `return`, whose pop comes
+after it) still holds the outer exception. Their join, the inner try's
+continuation, would fall out of the outer catch's handler region, and the code
+after it with it. With `pop_exception %inner` in the inner catch and
+`pop_exception %outer` in a new block after it, every exit of the inner handler
+holds the outer exception, as the exits of its body do.
+
+Applies to the pops that end a block whose terminator is a goto; the extra pops
+go to a chain of new blocks on that edge. Runs after `split_leaves!` and before
+`sink_pops_below_leaves!`, which then moves each of the pops after the leaves
+that follow it, to the handler depth of its own catch."""
+function split_pops_across_catches!(m::MCFG)
+    state, at_enter = exception_states(m)
+    # Whether exception state `s` lies inside the catch of the enter `x`.
+    nested_in(s, x) = s != x && in_catch(s, x, at_enter)
+    for bid in 1:length(m.blocks)          # range fixed: new blocks hold single pops
+        b = m.blocks[bid]
+        (state[bid] < 0 || !(b.term isa MGoto)) && continue
+        k = length(b.body)
+        while k >= 1 && (is_pop_exception(b.body[k].stmt) || b.body[k].stmt === nothing)
+            k -= 1
+        end
+        k == length(b.body) && continue
+        # The state before the trailing pops.
+        s = state[bid]
+        for st in view(b.body, 1:k)
+            is_pop_exception(st.stmt) && (s = popped_state(at_enter, st))
+        end
+        # One pop per catch left, innermost first.
+        pops = Tuple{Int, MStmt}[]          # (catch, original pop it comes from)
+        for st in view(b.body, k+1:length(b.body))
+            is_pop_exception(st.stmt) || continue
+            x = st.stmt.args[1].id
+            while nested_in(s, x)
+                push!(pops, (s, st))
+                s = at_enter[s]
+            end
+            push!(pops, (x, st))
+            s = popped_state(at_enter, st)
+        end
+        count(is_pop_exception(st.stmt) for st in view(b.body, k+1:length(b.body))) ==
+            length(pops) && continue        # nothing to split
+        stmts = map(enumerate(pops)) do (j, (x, st))
+            id = j == 1 ? st.id : alloc_id!(m)
+            if j > 1
+                m.types[id] = st.type
+                m.codelocs[id] = st.codeloc
+            end
+            MStmt(id, Expr(:pop_exception, SSAValue(x)), st.type, st.codeloc, st.flag)
+        end
+        resize!(b.body, k)
+        push!(b.body, stmts[1])
+        prev = bid
+        for st in view(stmts, 2:length(stmts))
+            p = m.blocks[prev]
+            nb = add_block!(m, MBlock(Int[], MStmt[st], p.term, p.term_codeloc, p.term_id))
+            p.term = MGoto(MEdge(nb))
+            p.term_id = 0
+            prev = nb
+        end
     end
     return m
 end
