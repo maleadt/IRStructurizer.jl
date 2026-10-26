@@ -458,6 +458,7 @@ function loop_escaping_values(ctx::StructurizeCtx, loop_blocks::Set{Int},
         # Body + terminator operands escape only from a non-loop block.
         if bid ∉ loop_blocks
             for s in b.body
+                s.stmt isa Core.PhiCNode && continue   # names upsilons, not values
                 remap_ssa(s.stmt, v -> (consider(v); v))
             end
             t = b.term
@@ -465,12 +466,15 @@ function loop_escaping_values(ctx::StructurizeCtx, loop_blocks::Set{Int},
                 consider(t.cond)
             elseif t isa MReturn
                 t.has_val && consider(t.val)
+            elseif t isa MEnter
+                has_scope(t) && consider(t.scope)
             end
         end
         # An edge operand escapes when the edge leaves the loop (target ∉ loop):
         # a loop-internal value carried into the non-loop successor's block args.
         t = b.term
-        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) : ()
+        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) :
+                t isa MEnter ? (t.body,) : ()
         for e in edges
             e.target ∈ loop_blocks && continue
             for v in e.args

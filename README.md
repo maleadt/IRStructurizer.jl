@@ -27,18 +27,22 @@ julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only
 
 ## API
 
-### `code_structured(f, argtypes; validate=true)`
+### `code_structured(f, argtypes; validate=true, exceptions=:error)`
 
 Get structured IR for function `f` with argument types `argtypes`.
 
 - `validate`: Throw `UnstructuredControlFlowError` if unstructured control flow remains
+- `exceptions`: how to treat try/catch, as for `StructuredIRCode`
 
-### `StructuredIRCode(ir::IRCode; structurize=true, validate=true)`
+### `StructuredIRCode(ir::IRCode; structurize=true, validate=true, exceptions=:error)`
 
 Construct structured IR from Julia's `IRCode` (obtained via `Base.code_ircode`).
 
 - `structurize`: Convert unstructured control flow (GotoNode/GotoIfNot) into structured operations
 - `validate`: Throw `UnstructuredControlFlowError` if unstructured control flow remains
+- `exceptions`: `:error` (default) throws `UnstructuredControlFlowError` on try/catch;
+  `:structured` lifts it to `TryOp` (see [Exceptions](#exceptions)). With
+  `structurize=false` it is not looked at: the flat IR keeps its `EnterNode`s
 
 ### Inspection
 
@@ -57,11 +61,11 @@ end
 
 #### `terminator(block::Block)` / `terminator!(block, term)`
 
-Get or set the block's terminator (`ReturnNode`, `YieldOp`, `ContinueOp`, `BreakOp`, `ConditionOp`, or `nothing`).
+Get or set the block's terminator (`ReturnNode`, `YieldOp`, `ContinueOp`, `BreakOp`, `ConditionOp`, `LeaveOp`, or `nothing`).
 
 #### `operands(term)` → `Vector{IRValue}`
 
-Get the carried-value operands of a terminator. Provides uniform access regardless of terminator type (`.values` for `YieldOp`/`ContinueOp`/`BreakOp`, `.args` for `ConditionOp`).
+Get the carried-value operands of a terminator. Provides uniform access regardless of terminator type (`.values` for `YieldOp`/`ContinueOp`/`BreakOp`/`LeaveOp`, `.args` for `ConditionOp`).
 
 #### `operands(op::ControlFlowOp)` → `Vector{IRValue}`
 
@@ -71,6 +75,7 @@ Get the values flowing into a control flow operation from the parent scope:
 - `ForOp` → `[lower, upper, step, init_values...]`
 - `WhileOp` → `copy(init_values)`
 - `LoopOp` → `copy(init_values)`
+- `TryOp` → `[scope]` (or empty)
 
 #### `operands(block, inst)` → `Vector{Any}`
 
@@ -292,6 +297,22 @@ The lift emits only `LoopOp`. The `promote_loops!` post-pass rewrites the ones i
 recognizes: a loop driven by an integer induction variable with a constant step becomes a
 `ForOp`, and a loop that tests its condition before the body becomes a `WhileOp`. The rest
 stay `LoopOp`.
+
+### Exceptions
+
+By default an `EnterNode` (try/catch, try/finally, `@with`) throws
+`UnstructuredControlFlowError`. With `exceptions=:structured`, an `EnterNode` and its
+catch block become a `TryOp` at the enter's SSA index. Its
+`body` region is the protected code, and its `handler` region is the catch block,
+which runs with the handler popped. The catch block's `PhiCNode`s become handler
+block arguments, and `TryOp.upsilons` lists the `UpsilonNode`s that feed each one.
+`:leave` disappears: leaving the body pops the handler. The body ends in a
+`YieldOp`, and a nested region that exits it uses `LeaveOp`, which is like
+`BreakOp` but for the innermost try body. `:the_exception` and `:pop_exception %t`
+stay as statements on Julia's exception stack.
+
+Regions come from a handler-stack dataflow, and `normalize_cf!` gives each try a
+single continuation before the other passes run.
 
 ### Reverse direction
 

@@ -21,12 +21,23 @@ mutable struct StructurizeCtx
     def_block::Dict{Int, Int}   # ssa id => defining MBlock id (block args + body stmts)
     ssa_remap::Dict{Int, Int}   # original => fresh (for inner defs)
     line_map::Dict{Int, Int}    # ssa_idx => anchor PC/linetable index
+    try_regions::Dict{Int, TryRegion}  # MEnter id => its try region (exceptions.jl)
+    depth::Union{Nothing, Vector{Int}}  # handler-stack depth at each block's entry
+                                        # (-1: unreachable); `nothing` without trys
 end
 
 function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
     loops = natural_loops_m(m, cfg, domtree)
+    if has_enter(m)
+        stacks = handler_stacks(m)
+        try_regions = try_info(m, stacks, domtree)
+        depth = handler_depths(stacks)
+    else
+        try_regions = Dict{Int, TryRegion}()
+        depth = nothing
+    end
     # `ctx.types` feeds structural positions (op result / block-arg / Undef types),
     # which must be concrete `Type`s. Widen so a lattice element (e.g. `Core.Const`
     # on a single-literal-edge arg) can't land there. Block-arg and synthesized
@@ -46,7 +57,7 @@ function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
         end
     end
     StructurizeCtx(m, cfg, domtree, loops, m.next_id, 1, types, def_block,
-                   Dict{Int,Int}(), line_map)
+                   Dict{Int,Int}(), line_map, try_regions, depth)
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)

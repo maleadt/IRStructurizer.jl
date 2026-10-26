@@ -43,6 +43,19 @@ end
 LoopCtx(header::Int, loop_blocks::Set{Int}) =
     LoopCtx(header, loop_blocks, IRValue[], Int[], Any[], IRValue[])
 
+"""
+    TryCtx
+
+Context for structurizing a `TryOp` body (and the regions nested in it, up to the
+next loop or try body). An edge to a block outside `body` leaves the try: it
+becomes a `LeaveOp` carrying the operands of the edge into the continuation
+`merge` (or nothing, when the continuation passes no values).
+"""
+struct TryCtx
+    body::Set{Int}
+    merge::Union{Nothing, MergeInfo}
+end
+
 """The operands edge `src` to `dst` carries (parallel to `dst`'s block arguments),
 or `nothing` if `src` has no edge to `dst`. A degenerate `GotoIfNot` whose two edges
 target the same block is split away by [`split_duplicate_edges!`](@ref) before the
@@ -54,6 +67,9 @@ function edge_operands(m, src::Int, dst::Int)
     elseif t isa MCondBr
         t.t.target == dst && return t.t.args
         t.f.target == dst && return t.f.args
+    elseif t isa MEnter
+        t.body.target == dst && return t.body.args
+        t.catch_dest == dst && return Any[]     # the exceptional edge passes nothing
     end
     return nothing
 end
@@ -73,18 +89,22 @@ Recursively structurize a set of blocks into a single Block.
 
 - `merge_phis`: if provided, the block's terminator will be YieldOp with merge values.
 - `loop_ctx`: if provided, back-edges/exits become ContinueOp/BreakOp.
+- `try_ctx`: if provided, edges out of the try body become LeaveOp.
 """
 function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set{Int};
                               merge_phis::Union{Nothing, MergeInfo}=nothing,
-                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing,
+                              try_ctx::Union{Nothing, TryCtx}=nothing)
     block = Block()
     m = ctx.m::MCFG
     current = entry
     last_block = entry
 
-    # Advance the walker toward `target`, resolving loop boundaries (back-edge to
-    # ContinueOp, exit to BreakOp); returns nothing if `target` leaves the region.
-    advance = target -> resolve_dest(target, region_blocks, loop_ctx, block, ctx)
+    # Advance the walker from `src` toward `target`, resolving loop boundaries
+    # (back-edge to ContinueOp, exit to BreakOp) and try exits (LeaveOp); returns
+    # nothing if `target` leaves the region.
+    advance = (src, target) -> resolve_dest(target, region_blocks, loop_ctx, block, ctx,
+                                            src, try_ctx)
 
     while current !== nothing && current ∈ region_blocks
         last_block = current
@@ -106,7 +126,7 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
                         loop_exit ∈ ctx.cfg.blocks[b].succs && (last_block = b)
                     end
                 end
-                current = advance(loop_exit)
+                current = advance(last_block, loop_exit)
                 continue
             end
         end
@@ -120,11 +140,16 @@ function structurize_region!(ctx::StructurizeCtx, entry::Int, region_blocks::Set
             block.terminator = make_return(ctx, term)
             return block
         elseif term isa MGoto
-            current = advance(term.edge.target)
-        else  # MCondBr
-            next = emit_branch!(block, ctx, current, term::MCondBr, region_blocks, merge_phis, loop_ctx)
+            current = advance(current, term.edge.target)
+        elseif term isa MEnter
+            next = emit_try!(block, ctx, current, term, region_blocks, merge_phis, try_ctx)
             next === nothing && return block
-            current = advance(next)
+            current = advance(current, next)
+        else  # MCondBr
+            next = emit_branch!(block, ctx, current, term::MCondBr, region_blocks, merge_phis,
+                                loop_ctx, try_ctx)
+            next === nothing && return block
+            current = advance(current, next)
         end
     end
 
@@ -149,13 +174,30 @@ Returns the dest to continue walking, or nothing if it's a loop exit/back-edge.
 """
 function resolve_dest(dest, region_blocks::Set{Int},
                        loop_ctx::Union{Nothing, LoopCtx}, block::Block,
-                       ctx::Union{Nothing, StructurizeCtx}=nothing)
+                       ctx::Union{Nothing, StructurizeCtx}=nothing, src::Int=0,
+                       try_ctx::Union{Nothing, TryCtx}=nothing)
     dest === nothing && return nothing
     if loop_ctx !== nothing && ctx !== nothing &&
        resolve_loop_exit!(block, ctx, dest, loop_ctx)
         return nothing
     end
+    if try_ctx !== nothing && ctx !== nothing &&
+       resolve_try_exit!(block, ctx, src, dest, try_ctx)
+        return nothing
+    end
     dest ∈ region_blocks ? dest : nothing
+end
+
+"""Resolve a try exit on the edge `src` to `dest`, setting `block`'s terminator to a
+`LeaveOp` carrying the edge's operands into the try's continuation. Returns `true`
+if `dest` is outside the try body (handled), `false` if the edge stays inside. A
+top-level `LeaveOp` of the body becomes the body's `YieldOp` (`emit_try!`)."""
+function resolve_try_exit!(block::Block, ctx::StructurizeCtx, src::Int, dest::Int,
+                           try_ctx::TryCtx)
+    dest ∈ try_ctx.body && return false
+    block.terminator === nothing &&
+        (block.terminator = LeaveOp(merge_values(block, ctx, src, try_ctx.merge)))
+    return true
 end
 
 """Resolve a loop boundary on the edge to `dest`, setting `block`'s terminator.
@@ -190,6 +232,9 @@ function emit_block_stmts!(block::Block, ctx::StructurizeCtx, b::Int)
     m = ctx.m::MCFG
     remap = ctx.ssa_remap
     for s in m.blocks[b].body
+        # A `:leave` is implied by leaving the `TryOp` body, and a catch block's
+        # `PhiCNode`s are the handler's block arguments (`emit_try!`).
+        (is_leave(s.stmt) || s.stmt isa Core.PhiCNode) && continue
         idx = get(remap, s.id, s.id)
         stmt = remap_stmt(s.stmt, remap)
         push!(block, idx, stmt, s.type, s.flag)
@@ -249,7 +294,8 @@ continue with, or nothing if both branches exit/diverge.
 function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
                       condbr::MCondBr, region_blocks::Set{Int},
                       outer_merge_phis::Union{Nothing, MergeInfo},
-                      loop_ctx::Union{Nothing, LoopCtx}=nothing)
+                      loop_ctx::Union{Nothing, LoopCtx}=nothing,
+                      try_ctx::Union{Nothing, TryCtx}=nothing)
     # MCondBr carries explicit true/false edges (no fallthrough/succ derivation).
     true_dest = condbr.t.target
     false_dest = condbr.f.target
@@ -262,7 +308,8 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # single-entry: `merge` is the unique entry, or `nothing` iff both arms diverge
     # (zero continuation edges).
     then_blocks, else_blocks, merge = find_branch_regions(
-        ctx.cfg, ctx.domtree, current, true_dest, false_dest, region_blocks, loop_ctx)
+        ctx.cfg, ctx.domtree, current, true_dest, false_dest, region_blocks, loop_ctx;
+        depth=ctx.depth)
 
     # If merge exists and is in region, read its block args (the "phis") as a
     # MergeInfo. Skip args at loop headers: a header is never a branch merge,
@@ -286,16 +333,16 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
     # Build then/else blocks recursively (propagate loop_ctx for break/continue).
     then_blk = if !isempty(then_blocks)
         structurize_region!(ctx, true_dest, then_blocks;
-                             merge_phis=sub_merge_phis, loop_ctx=loop_ctx)
+                             merge_phis=sub_merge_phis, loop_ctx, try_ctx)
     else
-        make_empty_branch_block(ctx, true_dest, current, sub_merge_phis, loop_ctx)
+        make_empty_branch_block(ctx, true_dest, current, sub_merge_phis, loop_ctx, try_ctx)
     end
 
     else_blk = if !isempty(else_blocks)
         structurize_region!(ctx, false_dest, else_blocks;
-                             merge_phis=sub_merge_phis, loop_ctx=loop_ctx)
+                             merge_phis=sub_merge_phis, loop_ctx, try_ctx)
     else
-        make_empty_branch_block(ctx, false_dest, current, sub_merge_phis, loop_ctx)
+        make_empty_branch_block(ctx, false_dest, current, sub_merge_phis, loop_ctx, try_ctx)
     end
 
     # Anchor for debug info: the branch terminator's own location (the original
@@ -464,11 +511,150 @@ so when `dest` is the merge the block yields the operands that edge carries
 (`from`'s edge to the merge); a loop boundary becomes a break/continue instead."""
 function make_empty_branch_block(ctx::StructurizeCtx, dest::Int, from::Int,
                                   minfo::Union{Nothing, MergeInfo},
-                                  loop_ctx::Union{Nothing, LoopCtx})
+                                  loop_ctx::Union{Nothing, LoopCtx},
+                                  try_ctx::Union{Nothing, TryCtx}=nothing)
     b = Block()
     if loop_ctx !== nothing && resolve_loop_exit!(b, ctx, dest, loop_ctx)
         return b
     end
+    if try_ctx !== nothing && resolve_try_exit!(b, ctx, from, dest, try_ctx)
+        return b
+    end
     minfo !== nothing && yield_to_merge!(b, ctx, from, minfo)
     return b
+end
+
+#=============================================================================
+ Try Lifting (TryOp)
+=============================================================================#
+
+"""
+    emit_try!(block, ctx, current, enter, region_blocks, outer_merge_phis, try_ctx) -> next
+
+Lift the try that `current`'s `MEnter` opens to a `TryOp` at the enter's SSA index.
+The body is the try's protected region (walked with a `TryCtx`, so exits from nested
+regions become `LeaveOp`s), the handler its catch region, whose `PhiCNode`s become
+block arguments. `normalize_one_try!` gave every edge out of the two regions one
+target, the continuation K. As for `emit_branch!`, K's live block arguments become
+the op's results when K is in the region (and the walk continues there), and the
+op yields the enclosing merge's values when K is outside it. Returns K, or
+`nothing` if the walk ends here.
+"""
+function emit_try!(block::Block, ctx::StructurizeCtx, current::Int, enter::MEnter,
+                   region_blocks::Set{Int}, outer_merge_phis::Union{Nothing, MergeInfo},
+                   try_ctx::Union{Nothing, TryCtx})
+    r = ctx.try_regions[enter.id]
+    construct = construct_blocks(r)
+    issubset(construct, region_blocks) ||
+        error("internal error: the try at %$(enter.id) is not inside its enclosing region")
+
+    merge = nothing
+    for b in sort!(collect(construct)), s in ctx.cfg.blocks[b].succs
+        s ∈ construct && continue
+        merge === nothing || merge == s ||
+            error("internal error: the try at %$(enter.id) has more than one continuation")
+        merge = s
+    end
+    in_region = merge !== nothing && merge ∈ region_blocks
+    merge_phis = in_region ? merge_info(ctx, merge) : nothing
+    sub_merge_phis = in_region ? merge_phis : outer_merge_phis
+
+    # Body: exits from nested regions become LeaveOps; the body's own exit is a yield.
+    body = structurize_region!(ctx, enter.body.target, r.body; merge_phis=sub_merge_phis,
+                               try_ctx=TryCtx(r.body, sub_merge_phis))
+    body.terminator isa LeaveOp && (body.terminator = YieldOp(body.terminator.values))
+    set_yield_if_needed!(body)
+
+    handler, upsilons = if enter.catch_dest == 0
+        nothing, Vector{Int}[]
+    else
+        emit_handler(ctx, enter.catch_dest, r.handler, sub_merge_phis, try_ctx)
+    end
+
+    op = has_scope(enter) ?
+         TryOp(body, handler, upsilons, remap_ssa_ref(enter.scope, ctx.ssa_remap)) :
+         TryOp(body, handler, upsilons)
+    idx = enter.id
+
+    if in_region
+        if merge_phis !== nothing
+            push!(block, idx, op, Tuple{merge_phis.types...})
+            for (i, (phi_idx, phi_type)) in enumerate(zip(merge_phis.ids, merge_phis.types))
+                res = get(ctx.ssa_remap, phi_idx, phi_idx)
+                push!(block, res, Expr(:call, Core.getfield, SSAValue(idx), i), phi_type)
+                res != phi_idx && anchor_line!(ctx, res, idx)
+            end
+        else
+            push!(block, idx, op, Tuple{})
+        end
+        return merge
+    end
+
+    # The continuation is outside this region (the enclosing merge), or there is
+    # none: yield the enclosing merge's values, as `emit_branch!` does. The try
+    # reaches the merge if its body or handler completes, or if a nested exit
+    # leaves the body.
+    if outer_merge_phis !== nothing
+        phi_types = outer_merge_phis.types
+        if body.terminator isa YieldOp || (handler !== nothing && handler.terminator isa YieldOp) ||
+           has_nested_leave(body)
+            push!(block, idx, op, Tuple{phi_types...})
+            vals = IRValue[]
+            for (i, phi_type) in enumerate(phi_types)
+                fresh = alloc_ssa!(ctx)
+                push!(block, fresh, Expr(:call, Core.getfield, SSAValue(idx), i), phi_type)
+                anchor_line!(ctx, fresh, idx)
+                push!(vals, SSAValue(fresh))
+            end
+            block.terminator = YieldOp(vals)
+        else
+            push!(block, idx, op, Nothing)
+            block.terminator = YieldOp(IRValue[Undef(t) for t in phi_types])
+        end
+    else
+        push!(block, idx, op, Nothing)
+    end
+    return nothing
+end
+
+# Whether a `LeaveOp` exits the try body `blk` from a nested region: an `IfOp` arm,
+# or the handler of an inner `TryOp`, which runs inside this body. Loops and inner
+# try bodies are boundaries.
+function has_nested_leave(blk::Block)
+    for (_, entry) in blk.body
+        op = entry.stmt
+        if op isa IfOp
+            any(b -> b.terminator isa LeaveOp || has_nested_leave(b),
+                (op.then_region, op.else_region)) && return true
+        elseif op isa TryOp && op.handler !== nothing
+            h = op.handler
+            (h.terminator isa LeaveOp || has_nested_leave(h)) && return true
+        end
+    end
+    return false
+end
+
+"""Build a `TryOp` handler from the catch region `handler_blocks` entered at
+`catch_dest`. Each `PhiCNode` of the catch block becomes a block argument, and its
+operands (the `UpsilonNode`s that feed it) are returned alongside, one list per
+argument. The handler runs with this try's handler popped, so its exits answer to
+the enclosing `try_ctx`."""
+function emit_handler(ctx::StructurizeCtx, catch_dest::Int, handler_blocks::Set{Int},
+                      merge_phis::Union{Nothing, MergeInfo}, try_ctx::Union{Nothing, TryCtx})
+    m = ctx.m::MCFG
+    handler = Block()
+    subs = Substitutions()
+    upsilons = Vector{Int}[]
+    for s in m.blocks[catch_dest].body
+        s.stmt isa Core.PhiCNode || continue
+        arg = BlockArgument(alloc_arg!(ctx), widenconst(s.type))
+        push!(handler.args, arg)
+        subs[s.id] = arg
+        push!(upsilons, Int[(v::SSAValue).id for v in s.stmt.values])
+    end
+    content = structurize_region!(ctx, catch_dest, handler_blocks; merge_phis, try_ctx)
+    merge_block_into!(handler, content)
+    set_yield_if_needed!(handler)
+    apply_substitutions!(handler, subs, ctx)
+    return handler, upsilons
 end
