@@ -19,14 +19,21 @@ else
 end
 
 """
-    ingest(ir::IRCode) -> MCFG
+    ingest(ir::IRCode; exceptions=:error) -> MCFG
 
 Convert dense `IRCode` into the explicit-edge mutable form. Leading phi nodes of
 each block become block arguments; the values they carry per predecessor become
 that predecessor edge's operands. Stable ids == original SSA positions. Blocks
 unreachable from the entry are dropped (see `prune_unreachable!`).
+
+An `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
+`:structured`. Then it becomes an `MEnter` terminator, and each `Expr(:leave, ...)`
+is split into blocks of its own that pop one handler each (`split_leaves!`). See
+`structurize/exceptions.jl`.
 """
-function ingest(ir::IRCode)
+function ingest(ir::IRCode; exceptions::Symbol=:error)
+    exceptions in (:error, :structured) ||
+        throw(ArgumentError("exceptions must be :error or :structured, got :$exceptions"))
     di = @static VERSION >= v"1.12-" ? ir.debuginfo : ir.linetable
     nb = length(ir.cfg.blocks)
     blocks = [MBlock() for _ in 1:nb]
@@ -39,6 +46,7 @@ function ingest(ir::IRCode)
 
     # Pass 1: split each block into args / body / terminator. Edges get empty
     # operand vectors here, filled in pass 2.
+    has_eh = false
     for i in 1:nb
         bb = ir.cfg.blocks[i]
         mb = blocks[i]
@@ -50,10 +58,26 @@ function ingest(ir::IRCode)
             last_loc = loc
             if stmt isa Core.EnterNode
                 # An `EnterNode` is a terminator whose implicit edge to the
-                # catch handler has no structured counterpart; ingesting it as
-                # a plain statement would silently drop the handler block.
-                throw(UnstructuredControlFlowError(
+                # catch handler has no structured counterpart unless the try is
+                # lifted to a `TryOp`; ingesting it as a plain statement would
+                # silently drop the handler block.
+                exceptions === :structured || throw(UnstructuredControlFlowError(
                     "exception handling is not supported (EnterNode at statement $si)"))
+                # A terminator: falls through into the protected region, with an
+                # implicit edge to the catch block (`_ingest_term`).
+                has_eh = true
+                term_stmt = stmt
+                mb.term_codeloc = loc
+                mb.term_id = si
+            elseif exceptions === :structured && is_leave(stmt)
+                # Keep only the pops of live handlers: an optimized-away enter
+                # leaves a `nothing` argument. `split_leaves!` gives each pop a
+                # block of its own.
+                enters = Any[a for a in stmt.args
+                             if a isa SSAValue && ir.stmts.stmt[a.id] isa Core.EnterNode]
+                isempty(enters) && continue
+                push!(mb.body, MStmt(si, Expr(:leave, enters...), ir.stmts.type[si], loc,
+                                     ir.stmts.flag[si]))
             elseif stmt isa PhiNode
                 push!(mb.args, si)
                 types[si] = ir.stmts.type[si]
@@ -76,7 +100,7 @@ function ingest(ir::IRCode)
         if term_stmt === nothing            # fallthrough block: goto-next, or
             mb.term_codeloc = last_loc      # unreachable dead-end if last (MReturn)
         end
-        mb.term = _ingest_term(term_stmt, i, bb, nb)
+        mb.term = _ingest_term(term_stmt, i, bb, nb, mb.term_id)
     end
 
     # Pass 2: fill each edge's operands from the target block's phi values.
@@ -87,19 +111,24 @@ function ingest(ir::IRCode)
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
     m = MCFG(blocks, 1, types, codelocs,
              length(ir.stmts.stmt) + 1,
-             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
-    return prune_unreachable!(m)
+             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds, has_eh)
+    prune_unreachable!(m)
+    has_eh && split_leaves!(m)
+    return m
 end
 
 _term_edges(t::MGoto) = (t.edge,)
 _term_edges(t::MCondBr) = (t.t, t.f)
 _term_edges(t::MReturn) = ()
+_term_edges(t::MEnter) = (t.body,)   # (its catch block is `catch_dest`, a block index)
 
 """Drop the blocks unreachable from the entry, which unoptimized IR can contain,
 and renumber the rest in order. Normalization and the lift would otherwise count
 the edges out of them as predecessors, and Compiler's `CFGReachability` leaves
 their `irreducible` bits uninitialized. A phi operand for a dead predecessor
-lives on that predecessor's edge, so it goes with the block."""
+lives on that predecessor's edge, so it goes with the block. A `PhiCNode` names
+its upsilons instead, so those in dead blocks are dropped from it, as Compiler's
+compaction does. A catch block is reachable through its enter."""
 function prune_unreachable!(m::MCFG)
     live = falses(length(m.blocks))
     worklist = [m.entry]
@@ -111,16 +140,34 @@ function prune_unreachable!(m::MCFG)
     end
     all(live) && return m
     newid = cumsum(live)
+    dead = Set{Int}(s.id for (b, blk) in enumerate(m.blocks) if !live[b]
+                    for s in blk.body if s.stmt isa Core.UpsilonNode)
+    isdead(@nospecialize(v)) = v isa SSAValue && v.id in dead
     keepat!(m.blocks, live)
-    for b in m.blocks, e in _term_edges(b.term)
-        e.target = newid[e.target]
+    for b in m.blocks
+        for (i, s) in enumerate(b.body)
+            s.stmt isa Core.PhiCNode && any(isdead, s.stmt.values) || continue
+            b.body[i] = MStmt(s.id, Core.PhiCNode(filter(!isdead, s.stmt.values)), s.type,
+                              s.codeloc, s.flag)
+        end
+        t = b.term
+        for e in _term_edges(t)
+            e.target = newid[e.target]
+        end
+        t isa MEnter && t.catch_dest != 0 && (t.catch_dest = newid[t.catch_dest])
     end
     m.entry = newid[m.entry]
     return m
 end
 
-function _ingest_term(term_stmt, i::Int, bb, nb::Int)
-    if term_stmt isa ReturnNode
+function _ingest_term(term_stmt, i::Int, bb, nb::Int, term_id::Int=0)
+    if term_stmt isa Core.EnterNode
+        # The protected region is the fallthrough block; `catch_dest` is a block
+        # index in `IRCode` (0: scope-only enter, no handler).
+        isdefined(term_stmt, :scope) &&
+            return MEnter(term_id, MEdge(i + 1), term_stmt.catch_dest, term_stmt.scope)
+        return MEnter(term_id, MEdge(i + 1), term_stmt.catch_dest)
+    elseif term_stmt isa ReturnNode
         return isdefined(term_stmt, :val) ? MReturn(term_stmt.val, true) : MReturn()
     elseif term_stmt isa GotoNode
         return MGoto(MEdge(term_stmt.label))
@@ -141,6 +188,10 @@ end
 function _fill_edge_operands!(term::MTerm, i::Int, blocks, phivals, types)
     if term isa MGoto
         _fill_edge!(term.edge, i, blocks, phivals, types)
+    elseif term isa MEnter
+        # The protected region's entry can be a loop header with block args. The
+        # exceptional edge carries none (handler inputs are PhiC/Upsilon).
+        _fill_edge!(term.body, i, blocks, phivals, types)
     elseif term isa MCondBr
         _fill_edge!(term.t, i, blocks, phivals, types)
         _fill_edge!(term.f, i, blocks, phivals, types)

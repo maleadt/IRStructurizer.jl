@@ -66,6 +66,7 @@ end
     include("unstructurize.jl")
     include("tryop.jl")
     include("julialowering_cases.jl")
+    include("exceptions.jl")
     include("debuginfo.jl")
     include("regression.jl")
 
