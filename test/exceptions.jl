@@ -837,4 +837,77 @@ end
     end
 end
 
+"""The edge operands and upsilon values that `ingest(ir; exceptions=:structured)` leaves
+naming a `Union{}`-typed phi or PhiC (of `ir`, or of the MCFG), or a value that no
+longer exists (a block argument, statement or enter of the MCFG)."""
+function eh_bottom_refs(ir)
+    m = ingest(ir; exceptions=:structured)
+    bottom = Set{Int}(i for (i, (s, t)) in enumerate(zip(ir.stmts.stmt, ir.stmts.type))
+                      if t === Union{} && s isa Union{PhiNode, Core.PhiCNode})
+    defined = Set{Int}()
+    for b in m.blocks
+        union!(bottom, (a for a in b.args if get(m.types, a, Any) === Union{}))
+        union!(bottom, (s.id for s in b.body if s.stmt isa Core.PhiCNode && s.type === Union{}))
+        union!(defined, b.args, (s.id for s in b.body))
+        b.term isa MEnter && push!(defined, b.term.id)
+    end
+    bad(v) = v isa SSAValue && (v.id in bottom || !(v.id in defined))
+    refs = Any[]
+    for b in m.blocks
+        t = b.term
+        edges = t isa IRStructurizer.MGoto ? (t.edge,) :
+                t isa IRStructurizer.MCondBr ? (t.t, t.f) : t isa MEnter ? (t.body,) : ()
+        foreach(e -> append!(refs, filter(bad, e.args)), edges)
+        for s in b.body
+            s.stmt isa Core.UpsilonNode && isdefined(s.stmt, :val) && bad(s.stmt.val) &&
+                push!(refs, s.stmt.val)
+        end
+    end
+    return refs
+end
+
+@testset "values undefined on the catch path become Undef" begin
+    # A variable never assigned before a throw reaches the catch through a
+    # `Union{}`-typed `PhiCNode`, and phis carry it on. Nothing reads such a value
+    # (Julia guards it with `throw_undef_if_not`), so no edge operand or upsilon
+    # names one after ingest, nor a block argument that ingest dropped.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        @test isempty(eh_bottom_refs(first(only(code_ircode(f, Tuple{Int})))))
+    end
+    # Catch 1's `Union{}` PhiC reaches the body of a second try on its enter's edge,
+    # into two phis: a `Union{}` one, which an upsilon takes on to catch 2, and an
+    # `Any` one. The `Union{}` phi goes, and the `Any` one gets `Undef`.
+    thr = (Expr(:call, Core.throw, ErrorException("a")), Union{})
+    ir = build_ir([
+        (stmts=[(Core.EnterNode(3), Any)], succs=[2, 3]),
+        (stmts=[(Core.UpsilonNode(), Union{}), thr, (ReturnNode(), Union{})], succs=Int[]),
+        (stmts=[(Core.PhiCNode(Any[SSAValue(2)]), Union{}), (Core.EnterNode(5), Any)],
+         succs=[4, 5]),
+        (stmts=[(PhiNode(Int32[3], Any[SSAValue(5)]), Union{}),
+                (PhiNode(Int32[3], Any[SSAValue(5)]), Any),
+                (Core.UpsilonNode(SSAValue(7)), Union{}), thr, (ReturnNode(), Union{})],
+         succs=Int[]),
+        (stmts=[(Core.PhiCNode(Any[SSAValue(9)]), Union{}),
+                (Expr(:pop_exception, SSAValue(6)), Nothing), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(Expr(:pop_exception, SSAValue(1)), Nothing),
+                (ReturnNode(Argument(2)), Any)], succs=Int[]),
+    ], Any[Tuple{}, Int])
+    ir.stmts.flag .= UInt32(0)
+    CC.verify_ir(ir)
+    @test isempty(eh_bottom_refs(ir))
+    m = ingest(ir; exceptions=:structured)
+    @test [a for b in m.blocks for a in b.args] == [8]
+    @test only(b.term.body.args for b in m.blocks if b.term isa MEnter && b.term.id == 6) ==
+          Any[IRStructurizer.Undef(Any)]
+    # Some of the cases do carry such values: Julia's IR for them has `Union{}`-typed
+    # phis, PhiCs or upsilons before the rewrite.
+    @testset "$(nameof(f)) carries Union{} values" for f in (eh_finally_return,
+                                                              eh_return_from_try_in_catch)
+        ir = first(only(code_ircode(f, (Int,))))
+        @test any(((s, t),) -> t === Union{} &&
+                  (s isa Core.PhiCNode || s isa PhiNode || s isa Core.UpsilonNode),
+                  zip(ir.stmts.stmt, ir.stmts.type))
+    end
+end
+
 end  # exceptions

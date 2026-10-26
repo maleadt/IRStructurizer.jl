@@ -545,3 +545,70 @@ function split_pops_across_catches!(m::MCFG)
     end
     return m
 end
+
+#=============================================================================
+ Values undefined on the catch path
+=============================================================================#
+
+"""Turn the `Union{}`-typed phis and `PhiCNode`s that try/catch leaves behind into
+explicit `Undef`. A variable that is never assigned on the path into a catch block
+gets a `Union{}` PhiC, and phis carry that around merges and loops. A `Union{}`
+value never exists at runtime: Julia only reads such a variable behind
+`throw_undef_if_not`. Each edge operand that carries one becomes `Undef`, and each
+upsilon of one becomes an undefined upsilon. The `Union{}` phis are then left
+without any value: those that no statement, branch, return or scope reads are
+dropped, so that the lift does not give a loop or `IfOp` a `Union{}` carry (a
+statement that reads one is unreachable, and keeps it)."""
+function undef_bottom_values!(m::MCFG)
+    bottom = Set{Int}()
+    for b in m.blocks
+        for a in b.args
+            get(m.types, a, Any) === Union{} && push!(bottom, a)
+        end
+        for s in b.body
+            s.stmt isa Core.PhiCNode && s.type === Union{} && push!(bottom, s.id)
+        end
+    end
+    isempty(bottom) && return
+    isbottom(@nospecialize(v)) = v isa SSAValue && v.id in bottom
+    for b in m.blocks
+        t = b.term
+        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) :
+                t isa MEnter ? (t.body,) : ()
+        for e in edges
+            targs = m.blocks[e.target].args
+            for k in eachindex(e.args)
+                isbottom(e.args[k]) && (e.args[k] = Undef(get(m.types, targs[k], Any)))
+            end
+        end
+        for (i, s) in enumerate(b.body)
+            if s.stmt isa Core.UpsilonNode && isdefined(s.stmt, :val) && isbottom(s.stmt.val)
+                b.body[i] = MStmt(s.id, Core.UpsilonNode(), s.type, s.codeloc, s.flag)
+            end
+        end
+    end
+    # The `Union{}` block arguments nothing reads: out of their blocks and edges.
+    read = Set{Int}()
+    note(@nospecialize(v)) = (v isa SSAValue && push!(read, v.id); v)
+    incoming = [MEdge[] for _ in m.blocks]
+    for b in m.blocks
+        for s in b.body
+            remap_ssa(s.stmt, note)
+        end
+        t = b.term
+        t isa MCondBr && note(t.cond)
+        t isa MReturn && t.has_val && note(t.val)
+        t isa MEnter && has_scope(t) && note(t.scope)
+        for e in _term_edges(t)
+            push!(incoming[e.target], e)
+        end
+    end
+    for (bid, b) in enumerate(m.blocks)
+        dead = findall(a -> a in bottom && !(a in read), b.args)
+        isempty(dead) && continue
+        deleteat!(b.args, dead)
+        for e in incoming[bid]
+            deleteat!(e.args, dead)
+        end
+    end
+end

@@ -119,6 +119,7 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
         split_leaves!(m)
         split_pops_across_catches!(m)
         sink_pops_below_leaves!(m)
+        undef_bottom_values!(m)
     end
     return m
 end
