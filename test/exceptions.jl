@@ -646,4 +646,13 @@ end
     end
 end
 
+@testset "a pop before leaving trys nested in its catch moves after them" begin
+    # A `continue` out of a try nested in a catch pops the catch's exception, then
+    # leaves the nested try. Moved after the leave, every pop runs at exactly the
+    # handler depth of its catch.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        @test all(((d, at),) -> at == d, eh_pop_depths(eh_mcfg(f)))
+    end
+end
+
 end  # exceptions

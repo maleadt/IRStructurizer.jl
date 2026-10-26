@@ -326,7 +326,8 @@ try, where the lift puts it after the outer `TryOp`, and possibly after a loop
 around that `TryOp`, where no enter that could name it dominates it. Before the
 leave, the pop is back in the inner catch, where its own enter dominates it. A
 leave pops the handler stack and a pop restores the exception stack, so the two
-commute. Run before `split_leaves!`."""
+commute. Run before `split_leaves!`; `sink_pops_below_leaves!` then moves a pop
+that went past more leaves than needed back down to its catch's depth."""
 function hoist_pops_over_leaves!(m::MCFG)
     changed = true
     while changed
@@ -386,6 +387,73 @@ function hoist_pops_over_leaves!(m::MCFG)
             filter!(s -> !(s.id in moved_ids), p.body)
             changed = true
         end
+    end
+    return m
+end
+
+"""Move a `pop_exception` that runs before leaving trys entered in its catch to
+after those leaves, back at the depth of the catch. Julia pops first when a catch
+exits through a try nested in it (`catch; try; ...; continue; catch; end`: the
+`continue` pops the outer exception, then leaves the inner try). The inner try's
+continuation then joins that exit, whose exception is already popped, with the
+inner handler's exit, which still holds it. No exception state fits the join, so
+the outer handler region would grow over the continuation, and over the
+continuation of the next mux, without end when the catch dominates them (a body
+that cannot complete normally).
+
+Runs after `split_leaves!`. The pop moves only along the chain of leave blocks
+that follows it and nothing else reaches, into a new block after the last leave
+it has to pass."""
+function sink_pops_below_leaves!(m::MCFG)
+    stacks = handler_stacks(m)
+    enter_depth = Dict{Int, Int}()
+    for (bid, b) in enumerate(m.blocks)
+        b.term isa MEnter && stacks[bid] !== nothing &&
+            (enter_depth[b.term.id] = length(stacks[bid]::Vector{Int}))
+    end
+    npreds = zeros(Int, length(m.blocks))
+    for b in m.blocks, tgt in _term_targets(b.term)
+        npreds[tgt] += 1
+    end
+    for bid in 1:length(m.blocks)          # range fixed: new blocks hold placed pops
+        b = m.blocks[bid]
+        (stacks[bid] === nothing || !(b.term isa MGoto)) && continue
+        depth = length(stacks[bid]::Vector{Int})
+        # The trailing pops (`nothing` placeholders may sit between them), each
+        # with the number of leaves it has to pass. Their order is kept, so the
+        # numbers may only grow along the run.
+        k = length(b.body)
+        while k >= 1 && (is_pop_exception(b.body[k].stmt) || b.body[k].stmt === nothing)
+            k -= 1
+        end
+        pops = [(s, depth - get(enter_depth, s.stmt.args[1].id, depth))
+                for s in view(b.body, k+1:length(b.body)) if is_pop_exception(s.stmt)]
+        filter!(((_, n),) -> n > 0, pops)
+        isempty(pops) && continue
+        issorted(pops; by=last) || continue
+        chain = Int[]
+        cur = b.term.edge.target
+        while length(chain) < last(pops[end])
+            l = m.blocks[cur]
+            (npreds[cur] == 1 && length(l.body) == 1 && is_leave(l.body[1].stmt) &&
+             l.term isa MGoto) || break
+            push!(chain, cur)
+            cur = l.term.edge.target
+        end
+        length(chain) >= last(pops[end]) || continue
+        placed = Dict{Int, Int}()            # leaves passed => block holding the pops
+        for (s, n) in pops
+            nb = get!(placed, n) do
+                l = m.blocks[chain[n]]
+                id = add_block!(m, MBlock(Int[], MStmt[], l.term, l.term_codeloc, l.term_id))
+                l.term = MGoto(MEdge(id))
+                l.term_id = 0
+                id
+            end
+            push!(m.blocks[nb].body, s)
+        end
+        moved = Set{Int}(s.id for (s, _) in pops)
+        filter!(s -> !(s.id in moved), b.body)
     end
     return m
 end
