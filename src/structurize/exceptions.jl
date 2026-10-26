@@ -19,7 +19,20 @@
                                one of B's outer handlers
 
  Every edge out of R starts at a `:leave` block, and every edge out of R ∪ C lands
- on a block with B's handler stack.
+ on a block with B's handler stack. `normalize_one_try!` routes those edges to a
+ single continuation K (an `EdgeMux` when there are several), and threads values
+ defined in R ∪ C and read past K through K's block arguments (the reduce form,
+ as for loops). The lift then builds a `TryOp` whose body is R, whose handler is
+ C, and whose results are K's arguments.
+
+ Because K holds B's handler stack, the muxes the other passes build join edges
+ that hold the same handlers; `verify_try_structure` checks afterwards that every
+ block still has one handler stack. An edge out of a try body from a nested region (an
+ `IfOp` arm whose continuation stays in the body) is not a continuation edge of
+ that branch: `branch_continuation` skips it by handler depth, and the lift turns
+ it into a `LeaveOp`. A loop that contains B also contains R ∪ C
+ (`extend_loops_over_trys!`), so a throwing dead end in R stays in the try instead
+ of becoming a loop exit that the latch would hoist past the handler.
 =============================================================================#
 
 is_leave(@nospecialize(s)) = s isa Expr && s.head === :leave
@@ -299,6 +312,16 @@ function exception_states(m::MCFG)
     return state, at_enter
 end
 
+# The exception state after the first `j` statements of block `src`.
+function exception_state_after(m::MCFG, state::Vector{Int}, at_enter::Dict{Int, Int},
+                               src::Int, j::Int=length(m.blocks[src].body))
+    s = state[src]
+    for st in view(m.blocks[src].body, 1:j)
+        is_pop_exception(st.stmt) && (s = popped_state(at_enter, st))
+    end
+    return s
+end
+
 # The state `pop_exception %X` restores. Its enter dominates it, so the enter's state
 # is known by the time the dataflow reaches the pop.
 function popped_state(at_enter::Dict{Int, Int}, st::MStmt)
@@ -403,7 +426,9 @@ that cannot complete normally).
 
 Runs after `split_leaves!`. The pop moves only along the chain of leave blocks
 that follows it and nothing else reaches, into a new block after the last leave
-it has to pass. Blocks holding nothing but pops may sit between it and the leaves
+it has to pass. A pop before a chain that other paths share stays where it is, one
+handler deeper than its catch, where the TryOp it names is still in scope. Blocks
+holding nothing but pops may sit between the pop and the leaves
 (`split_pops_across_catches!` puts the pop of each outer catch in one). Their pops
 move too, in order, and keep a block each, so the split stays."""
 function sink_pops_below_leaves!(m::MCFG)
@@ -486,7 +511,7 @@ nothing pending, while an exit from the inner body (a `return`, whose pop comes
 after it) still holds the outer exception. Their join, the inner try's
 continuation, would fall out of the outer catch's handler region, and the code
 after it with it. With `pop_exception %inner` in the inner catch and
-`pop_exception %outer` in a new block after it, every exit of the inner handler
+`pop_exception %outer` in a new block after it, that exit of the inner handler
 holds the outer exception, as the exits of its body do.
 
 Applies to the pops that end a block whose terminator is a goto; the extra pops
@@ -609,6 +634,187 @@ function undef_bottom_values!(m::MCFG)
         deleteat!(b.args, dead)
         for e in incoming[bid]
             deleteat!(e.args, dead)
+        end
+    end
+end
+
+#=============================================================================
+ Loops containing a try
+=============================================================================#
+
+"""Grow each natural loop that contains a try's `MEnter` block by that try's body
+and handler. A dead end in the body (a throw) cannot reach the back edge, so the
+plain natural loop leaves it out and the latch would route it out of the loop, past
+the handler. A handler that leaves the loop would make the exceptional edge itself
+a loop exit. With the whole try inside, the loop's exits leave from the `TryOp`'s
+continuation, where no handler of the try is active."""
+function extend_loops_over_trys!(loops::Dict{Int, Set{Int}}, m::MCFG,
+                                 domtree::DomTree=construct_domtree(build_cfg(m)))
+    isempty(loops) && return loops
+    regions = try_info(m, handler_stacks(m), domtree)
+    for body in values(loops)
+        grew = true
+        while grew
+            grew = false
+            for r in values(regions)
+                r.block in body || continue
+                n = length(body)
+                union!(body, r.body, r.handler)
+                length(body) > n && (grew = true)
+            end
+        end
+    end
+    return loops
+end
+
+#=============================================================================
+ Try normalization
+=============================================================================#
+
+"""
+    normalize_one_try!(m::MCFG, cfg=build_cfg(m), domtree=...) -> Bool
+
+Normalize one try, returning `true` if it changed the CFG:
+
+1. If the edges out of its body and handler reach more than one block, or reach a
+   loop header (a back edge, or the entry of a later loop), route them all through
+   one mux. The `TryOp` then has a single continuation K that is an ordinary block,
+   and the dispatch to the original targets runs after it, outside the try.
+2. Otherwise, if a value defined in the body or handler is read past K, thread it
+   through a new argument of K (`reduce_try!`).
+"""
+function normalize_one_try!(m::MCFG, cfg::CFG=build_cfg(m),
+                            domtree::DomTree=construct_domtree(cfg))
+    has_enter(m) || return false
+    stacks = handler_stacks(m)
+    regions = try_info(m, stacks, domtree)
+    headers = nothing
+    for id in sort!(collect(keys(regions)))
+        r = regions[id]
+        refs = try_exit_refs(m, r)
+        isempty(refs) && continue
+        targets = unique!(Int[edge_of(m, x).target for x in refs])
+        if length(targets) == 1
+            headers === nothing && (headers = keys(natural_loops_m(m, cfg, domtree)))
+            if !(only(targets) in headers)
+                reduce_try!(m, r, only(targets), cfg, domtree) && return true
+                continue
+            end
+        end
+        handler_rejoins(m, r, refs) && throw(UnstructuredControlFlowError(
+            "unsupported try/catch: the handler of %$id rejoins other code before it pops"))
+        single_entry_mux!(m, refs)
+        return true
+    end
+    return false
+end
+
+# Whether every exit of `r` leaves its handler still in its catch, to blocks that other
+# paths reach too. The catch block would dominate a mux for those exits, which would
+# then be in the handler, with the same exits as before.
+function handler_rejoins(m::MCFG, r::TryRegion, refs::Vector{EdgeRef})
+    all(ref -> ref.src in r.handler, refs) || return false
+    state, at_enter = exception_states(m)
+    s = mapreduce(ref -> exception_state_after(m, state, at_enter, ref.src),
+                  (a, b) -> common_state(a, b, at_enter), refs)
+    return in_catch(s, r.enter, at_enter)
+end
+
+"""
+    reduce_try!(m, r, K, cfg, domtree) -> Bool
+
+The reduce form for a try: give the continuation K one new block argument per value
+defined in the body or handler that a block dominated by K reads. Each incoming
+edge feeds the value where it dominates the edge's source, and `Undef` elsewhere,
+and the reads past K are rewritten to the new argument. Then nothing defined inside
+the `TryOp` is read outside it except through its results. Only applies when every
+predecessor of K is inside the try; otherwise no value from inside dominates K.
+Returns `true` if it added an argument.
+"""
+function reduce_try!(m::MCFG, r::TryRegion, K::Int, cfg::CFG, domtree::DomTree)
+    construct = construct_blocks(r)
+    all(p -> p in construct, cfg.blocks[K].preds) || return false
+
+    def_block = Dict{Int, Int}()
+    def_type = Dict{Int, Any}()
+    for bid in construct
+        b = m.blocks[bid]
+        for a in b.args; def_block[a] = bid; def_type[a] = get(m.types, a, Any); end
+        for s in b.body; def_block[s.id] = bid; def_type[s.id] = s.type; end
+    end
+
+    past = Int[bid for bid in 1:length(m.blocks)
+               if !(bid in construct) && dominates(domtree, K, bid)]
+    escaping = Int[]
+    for bid in past, id in _mblock_use_ids(m.blocks[bid])
+        haskey(def_block, id) && !(id in escaping) && push!(escaping, id)
+    end
+    isempty(escaping) && return false
+
+    pred_refs = EdgeRef[]
+    for src in sort!(unique(cfg.blocks[K].preds))
+        append!(pred_refs, edge_refs(m, src, K))
+    end
+    for v in escaping
+        T = widenconst(def_type[v])
+        karg = alloc_id!(m)
+        m.types[karg] = T
+        m.codelocs[karg] = get(m.codelocs, v, _NOLOC)
+        push!(m.blocks[K].args, karg)
+        dv = def_block[v]
+        for ref in pred_refs
+            push!(edge_of(m, ref).args,
+                  dominates(domtree, dv, ref.src) ? SSAValue(v) : Undef(T))
+        end
+        fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(karg) : w
+        for bid in past
+            _rewrite_mblock!(m.blocks[bid], fv)
+        end
+    end
+    return true
+end
+
+"""Check the invariants the lift relies on after `normalize_cf!`: balanced handler
+stacks, a catch block reached only by its exceptional edge, a single continuation
+per try that is not a loop header, and every `pop_exception` where the TryOp it
+names is in scope: after the try's enter, outside its body, and within the
+handlers active at the enter. A shape that breaks one of them is not supported, so
+this throws `UnstructuredControlFlowError` rather than lift wrong code."""
+function verify_try_structure(m::MCFG)
+    stacks = handler_stacks(m)
+    cfg = build_cfg(m)
+    domtree = construct_domtree(cfg)
+    regions = try_info(m, stacks, domtree)
+    headers = keys(natural_loops_m(m, cfg, domtree))
+    for id in sort!(collect(keys(regions)))
+        r = regions[id]
+        t = m.blocks[r.block].term::MEnter
+        if t.catch_dest != 0 && cfg.blocks[t.catch_dest].preds != [r.block]
+            throw(UnstructuredControlFlowError(
+                "unsupported try/catch: the catch block of %$id is also reached by ordinary control flow"))
+        end
+        targets = unique!(Int[edge_of(m, x).target for x in try_exit_refs(m, r)])
+        if length(targets) > 1 || (length(targets) == 1 && only(targets) in headers)
+            throw(UnstructuredControlFlowError(
+                "unsupported try/catch: the try at %$id has no single continuation"))
+        end
+    end
+    for (bid, b) in enumerate(m.blocks)
+        stacks[bid] === nothing && continue
+        for st in b.body
+            is_pop_exception(st.stmt) || continue
+            r = get(regions, st.stmt.args[1].id, nothing)
+            r === nothing && continue
+            # The pop names the TryOp, so it has to come after the enter (which ends
+            # its block, so a pop in that block runs before it), outside the try's
+            # own body, and inside the handlers active at the enter: in the
+            # handler, or past the op, perhaps in a try entered there.
+            s = stacks[bid]::Vector{Int}
+            if bid == r.block || r.enter in s || length(s) < r.depth ||
+               view(s, 1:r.depth) != stacks[r.block] || !dominates(domtree, r.block, bid)
+                throw(UnstructuredControlFlowError(
+                    "unsupported try/catch: the pop_exception at %$(st.id) does not run in the catch of %$(r.enter)"))
+            end
         end
     end
 end
