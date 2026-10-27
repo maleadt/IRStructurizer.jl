@@ -29,30 +29,31 @@ function reachable_exits(outer::Block)
         end
     end
 
-    # Nested terminators reachable through nested IfOps. Ignore yield/condition
-    # here because those are inner to the IfOp.
-    function collect_terminators!(inner::Block)
-        term = inner.terminator
-        if term isa ContinueOp || term isa BreakOp
-            push!(result, inner => term)
-        end
-        for (_, entry) in inner.body
-            if entry.stmt isa IfOp
-                for b in blocks(entry.stmt)
-                    collect_terminators!(b)
-                end
-            end
-        end
-    end
     for (_, entry) in outer.body
         if entry.stmt isa IfOp
             for b in blocks(entry.stmt)
-                collect_terminators!(b)
+                collect_terminators!(result, b)
             end
         end
     end
 
     return result
+end
+
+# Nested terminators reachable through nested IfOps. Ignore yield/condition
+# here because those are inner to the IfOp.
+function collect_terminators!(result, inner::Block)
+    term = inner.terminator
+    if term isa ContinueOp || term isa BreakOp
+        push!(result, inner => term)
+    end
+    for (_, entry) in inner.body
+        if entry.stmt isa IfOp
+            for b in blocks(entry.stmt)
+                collect_terminators!(result, b)
+            end
+        end
+    end
 end
 
 """
@@ -86,14 +87,10 @@ Find the Block containing the given instruction.
 Returns `nothing` if not found.
 """
 function findblock(sci::StructuredIRCode, inst::Instruction)
-    found = nothing
-    walk(sci) do i, block
-        if i.ssa_idx == inst.ssa_idx
-            found = block
-            return :interrupt
-        end
+    for block in eachblock(sci)
+        haskey(block, inst.ssa_idx) && return block
     end
-    return found
+    return nothing
 end
 
 
