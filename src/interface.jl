@@ -26,6 +26,8 @@ restructured into nested SCF-style operations (if/for/while).
   If omitted and `f` has exactly one method, the types are inferred from its signature.
 - `validate`: Whether to validate that all control flow was properly structured (default: true).
   When `true`, throws `UnstructuredControlFlowError` if any unstructured control flow remains.
+- `exceptions`: `:error` (default) throws `UnstructuredControlFlowError` on try/catch;
+  `:structured` lifts each try to a `TryOp` (see `StructuredIRCode`).
 
 Other keyword arguments are passed to `code_ircode`.
 
@@ -53,9 +55,10 @@ julia> sci, ret_type = code_structured(f, Tuple{Int}) |> only  # destructure
 ```
 """
 function code_structured(@nospecialize(f), @nospecialize(argtypes=default_tt(f));
-                         validate::Bool=true, debuginfo::Symbol=:source, kwargs...)
+                         validate::Bool=true, debuginfo::Symbol=:source,
+                         exceptions::Symbol=:error, kwargs...)
     map(code_ircode(f, argtypes; kwargs...)) do (ir, ret_type)
-        sci = StructuredIRCode(ir; validate)
+        sci = StructuredIRCode(ir; validate, exceptions)
         debuginfo === :none && empty!(sci.line_map)
         sci => ret_type
     end

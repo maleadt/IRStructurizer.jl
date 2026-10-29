@@ -15,5 +15,14 @@ using PrecompileTools
             end
             return i
         end
+
+        # try/catch
+        code_structured(Tuple{Int}; exceptions=:structured) do x::Int
+            try
+                x > 0 ? x : error("negative")
+            catch
+                -1
+            end
+        end
     end
 end
