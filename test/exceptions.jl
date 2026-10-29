@@ -672,6 +672,50 @@ function eh_try_after_returning_try(x)
     x
 end
 
+# A loop in a catch that has a finally: its `return` pops the catch's exception at
+# once, its `break` pops it after the loop. The branch between the two joins a path
+# that holds the exception and one that does not.
+function eh_break_or_return_from_loop_in_catch(x)
+    y = 0
+    try
+        x > 0 && eh_throw(ErrorException("a"))
+    catch
+        for i in 1:3
+            x < 2i && continue
+            x > 5 && break
+            return x + i
+        end
+    finally
+        y = x + 10
+    end
+    x * 10 + y
+end
+# A `continue` in a finally overrides the `break` in the catch it wraps, all in an
+# outer catch. On the finally's catch path the outer exception is popped at once;
+# on its normal path the rest of the finally runs first.
+function eh_continue_in_finally_in_catch(x)
+    for i in 1:3
+        try
+            x > i && eh_throw(ErrorException("a"))
+        catch
+            try
+                try
+                    x > 5 && eh_throw(ErrorException("b"))
+                catch
+                    break
+                finally
+                    eh_log(8)
+                end
+            finally
+                x > 7 && return x + i
+                continue
+            end
+        end
+        eh_log(i)
+    end
+    x
+end
+
 # A `break` from a try in a catch nested in another catch pops both exceptions,
 # then leaves the try. Split into one pop per catch, both pops move past the leave.
 function eh_break_from_try_in_nested_catches(x)
@@ -771,6 +815,8 @@ const EH_CASES = [
     (eh_return_or_break_from_try_in_catch, (-5, 0, 9)),
     (eh_exits_from_catch_in_nested_loops, (-5, 0, 3, 6, 8)),
     (eh_return_across_catches_and_trys, (1, 7)),
+    (eh_break_or_return_from_loop_in_catch, (-1, 1, 3, 7)),
+    (eh_continue_in_finally_in_catch, (0, 2, 6, 9)),
     (eh_break_from_try_in_nested_catches, (0, 1, 2, 5)),
     (eh_break_from_catch_in_trys_in_catches, (0, 1, 2, 3, 5)),
     (eh_maybe_return_from_finally_in_catch, (1, 11, 12, 15, 16)),
@@ -1366,6 +1412,37 @@ end
                 r.block in body && @test issubset(IRStructurizer.construct_blocks(r), body)
             end
         end
+    end
+    # A pop_exception in the handler region of the catch it pops stays there: the
+    # muxes built for branch continuations inside a catch hold one exception state.
+    function pops_in_handler(m)
+        regions = try_info(m)
+        return Set{Int}(st.id for (bid, b) in enumerate(m.blocks) for st in b.body
+                        if is_pop_exception(st.stmt) && haskey(regions, st.stmt.args[1].id) &&
+                           bid in regions[st.stmt.args[1].id].handler)
+    end
+    @testset "pops stay in their handler: $(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        before = pops_in_handler(m)
+        IRStructurizer.normalize_cf!(m)
+        @test before ⊆ pops_in_handler(m)
+    end
+    # The same with a `nothing` placeholder after each pop that ends a goto block, as
+    # ingest keeps them: the pops still move past the mux.
+    @testset "pops stay in their handler past placeholders: $(nameof(f))" for f in
+            (eh_break_or_return_from_loop_in_catch, eh_continue_in_finally_in_catch)
+        m = eh_mcfg(f)
+        for b in m.blocks
+            (b.term isa IRStructurizer.MGoto && !isempty(b.body) &&
+             is_pop_exception(b.body[end].stmt)) || continue
+            id = IRStructurizer.alloc_id!(m)
+            m.types[id] = Nothing
+            m.codelocs[id] = b.body[end].codeloc
+            push!(b.body, IRStructurizer.MStmt(id, nothing, Nothing, b.body[end].codeloc, UInt32(0)))
+        end
+        before = pops_in_handler(m)
+        IRStructurizer.normalize_cf!(m)
+        @test before ⊆ pops_in_handler(m)
     end
     # A catch block also reached by ordinary control flow (after a leave) is not
     # something Julia's lowering produces, and is rejected.

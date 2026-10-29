@@ -360,8 +360,19 @@ function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
                                      loops=natural_loops_m(m, cfg, domtree))
     found = find_continuation(m, cfg, domtree, loops)
     found === nothing && return false
-    single_entry_mux!(m, found[2])
+    continuation_mux!(m, found[2])
     return true
+end
+
+# Route a branch's continuation edges through one mux. With try/catch, the pops that
+# only some of the edges ran move after the mux where they can
+# (`take_pops_before_mux!`), so that it holds one exception state.
+function continuation_mux!(m::MCFG, refs::Vector{EdgeRef})
+    has_enter(m) || return single_entry_mux!(m, refs)
+    taken = take_pops_before_mux!(m, refs)
+    mux = single_entry_mux!(m, refs)
+    put_pops_after_mux!(m, mux, taken)
+    return mux
 end
 
 """Dominator-tree preorder of the reachable blocks, siblings by block id."""
@@ -481,7 +492,7 @@ function normalize_round!(m::MCFG, cursor::Int)
     end
     if found !== nothing
         E, refs = found
-        single_entry_mux!(m, refs)
+        continuation_mux!(m, refs)
         return E
     end
     normalize_one_preheader!(m, loops, cfg) && return 1

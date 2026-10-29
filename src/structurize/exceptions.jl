@@ -571,6 +571,94 @@ function split_pops_across_catches!(m::MCFG)
     return m
 end
 
+"""
+    take_pops_before_mux!(m, refs) -> Dict{Int, Vector{MStmt}}
+
+Keep a branch-continuation mux in one exception state where the pops allow it. A
+branch in a handler region can have one arm that pops the catch's exception and
+leaves the handler, and another that runs on in the catch and pops later: in a
+loop in a catch with a `finally`, a `return` pops before the finally code runs and
+a `break` pops after the loop. A mux for the branch's continuation would join a
+path that holds the exception with one that does not. `exception_states` gives the
+mux one state, so either the code after the mux or the exit falls out of the
+handler region, and a `pop_exception` with it.
+
+When the edges in `refs` reach the mux in different states, one of them inside all
+the others, the trailing pops that take an edge out of that inner state move off
+its source block (`nothing` placeholders among them stay), to run after the mux on
+the dispatch edge to the same target (`put_pops_after_mux!`). Only the mux's
+discriminator test runs in between. This applies to a target whose edges all leave
+`goto` blocks and drop the same pops; the mux is built either way, so another
+target's edges may still reach it in a different state. Returns the pops taken,
+by target.
+"""
+function take_pops_before_mux!(m::MCFG, refs::Vector{EdgeRef})
+    taken = Dict{Int, Vector{MStmt}}()
+    state, at_enter = exception_states(m)
+    state_after(src, j) = exception_state_after(m, state, at_enter, src, j)
+    posts = Int[state_after(r.src, length(m.blocks[r.src].body)) for r in refs]
+    (any(<(0), posts) || allequal(posts)) && return taken
+    k = findfirst(s -> all(t -> in_catch(s, t, at_enter), posts), posts)
+    k === nothing && return taken
+    inner = posts[k]
+    targets = Int[edge_of(m, r).target for r in refs]
+    for T in unique(targets)
+        idx = findall(==(T), targets)
+        all(i -> posts[i] == inner, idx) && continue
+        # Per edge, the trailing pops that take the state out of `inner` (`nothing`
+        # placeholders may sit between them, and stay where they are).
+        pops = Vector{MStmt}[]
+        for i in idx
+            r = refs[i]
+            r.slot === :goto || break
+            body = m.blocks[r.src].body
+            j = length(body)
+            while state_after(r.src, j) != inner && j >= 1 &&
+                  (is_pop_exception(body[j].stmt) || body[j].stmt === nothing)
+                j -= 1
+            end
+            state_after(r.src, j) == inner || break
+            p = filter(st -> is_pop_exception(st.stmt), body[j+1:end])
+            isempty(p) && break
+            push!(pops, p)
+        end
+        length(pops) == length(idx) || continue
+        allequal(Any[[st.stmt for st in p] for p in pops]) || continue
+        taken[T] = pops[1]
+        for (n, i) in enumerate(idx)
+            moved = Set{Int}(st.id for st in pops[n])
+            filter!(st -> !(st.id in moved), m.blocks[refs[i].src].body)
+        end
+    end
+    return taken
+end
+
+"""Put the pops `take_pops_before_mux!` took for each target on the mux's dispatch
+edge to that target, in a block of their own."""
+function put_pops_after_mux!(m::MCFG, mux::EdgeMux, taken::Dict{Int, Vector{MStmt}})
+    isempty(taken) && return m
+    cur = mux.mux_id
+    while true
+        t = m.blocks[cur].term
+        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) : ()
+        next = 0
+        for e in edges
+            if haskey(taken, e.target)
+                pops = taken[e.target]
+                nb = add_block!(m, MBlock(Int[], pops, MGoto(MEdge(e.target, e.args)),
+                                          pops[end].codeloc))
+                e.target = nb
+                e.args = Any[]
+            elseif !(e.target in mux.entries)
+                next = e.target            # the next block of the compare chain
+            end
+        end
+        next == 0 && break
+        cur = next
+    end
+    return m
+end
+
 #=============================================================================
  Values undefined on the catch path
 =============================================================================#
