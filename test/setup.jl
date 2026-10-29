@@ -79,3 +79,91 @@ partition_callee(x) = x + 1
 const partition_callee_const = partition_callee
 global partition_callee_typed::typeof(partition_callee) = partition_callee
 partition_callee_untyped = partition_callee
+
+#=============================================================================
+ Round-trip harness: run a function and its structurized, lowered copy on the
+ same inputs and compare what they do (julialowering_cases.jl, exceptions.jl,
+ julialowering_exceptions.jl). `log` is the vector the test functions record
+ their side effects in.
+=============================================================================#
+
+"""An exception, comparable across runs: its type and message."""
+rt_payload(@nospecialize(e)) = (typeof(e), sprint(showerror, e))
+
+"""The payloads of the exceptions on the stack, outermost first."""
+rt_stack() = Any[rt_payload(x.exception) for x in current_exceptions()]
+
+"""
+    rt_outcome(log, f, args...)
+
+What a call does: `(:ok, value)`, or `(:threw, payload, above)` with the exception
+it threw and the ones it left on the exception stack above the caller's, outermost
+first (the thrown one, after any it was handling when it threw); the entries it
+made in `log`; how many exceptions it left on the stack after a normal return (-1
+after a throw); and what changed in the part of the stack that was there before
+the call (`prior`: each replaced entry, by its position from the top, and how many
+were dropped; a `rethrow(e)` replaces the current exception, a pop too many drops
+one). All of it is relative to the stack before the call: Julia 1.11 leaves the
+exception on the stack when a `finally` returns after a throw, and leaked
+exceptions stay there across calls.
+"""
+function rt_outcome(log::Vector{Any}, f, args...)
+    empty!(log)
+    depth = -1
+    held = rt_stack()
+    before = length(held)
+    # What changed below `before`: replaced entries by their offset from the top
+    # of that part, and the number of entries dropped.
+    changes(stack) = (Any[(i - before, stack[i]) for i in 1:min(before, length(stack))
+                          if stack[i] != held[i]],
+                      before - min(before, length(stack)))
+    result, prior = try
+        v = f(args...)
+        stack = rt_stack()
+        depth = length(stack) - before
+        (:ok, v), changes(stack)
+    catch e
+        stack = rt_stack()
+        (:threw, rt_payload(e), stack[before+1:end]), changes(stack)
+    end
+    return (; result, log = copy(log), depth, prior)
+end
+
+"""`rt_outcome` for a call made while a catch is handling an exception: a pop that
+also drops the caller's exception shows in the depth, or in the stack a throw
+leaves."""
+function rt_outcome_in_catch(log::Vector{Any}, f, args...)
+    try
+        throw(ErrorException("the caller's exception"))
+    catch
+        return rt_outcome(log, f, args...)
+    end
+end
+
+"""Lower `sci` back to `IRCode`, check it with `verify_ir`, and compile it. This
+runs outside `rt_outcome`, so a lowering failure is a test error, never an outcome
+to compare."""
+function rt_lower(sci::StructuredIRCode)
+    ir = CC.IRCode(sci)
+    CC.verify_ir(ir)
+    ir = CC.copy(ir)
+    ir.argtypes[1] = Tuple{}
+    @static if VERSION >= v"1.12-"
+        ir.debuginfo.def = Symbol("unstructurized")
+    end
+    return Core.OpaqueClosure(ir)
+end
+
+"""Run `f` and the lowered closure `oc` on every input tuple, directly and from
+inside a catch (`rt_outcome`, `rt_outcome_in_catch`); returns the mismatches."""
+function rt_compare(log::Vector{Any}, f, oc, inputs)
+    problems = String[]
+    for args in inputs, run in (rt_outcome, rt_outcome_in_catch)
+        expected = run(log, f, args...)
+        got = run(log, oc, args...)
+        isequal(expected, got) && continue
+        where = run === rt_outcome ? "" : " (in a catch)"
+        push!(problems, "$(nameof(f))$(args)$(where): expected $(expected), got $(got)")
+    end
+    return problems
+end

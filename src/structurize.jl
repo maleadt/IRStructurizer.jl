@@ -68,6 +68,9 @@ closure). The SSA-substitution primitive shared by `remap_stmt` (the walk),
 slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), `UpsilonNode` (val),
 `PhiCNode` (the upsilons it names), `EnterNode` (scope), and a bare `SSAValue`.
 Clones rather than mutates, so shared IR is safe.
+
+A `PhiCNode`'s operands name `UpsilonNode` statements rather than values, so the
+use scans of normalization skip it (`_mblock_use_ids`).
 """
 function remap_ssa(@nospecialize(stmt), f)
     if stmt isa Expr
