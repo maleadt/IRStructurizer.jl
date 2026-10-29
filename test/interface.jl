@@ -59,6 +59,28 @@ end
     @test_throws UnstructuredControlFlowError StructuredIRCode(ir; validate=false)
 end
 
+@testset "exceptions=:structured lifts try/catch" begin
+    # An `EnterNode` is a terminator with an implicit edge to its catch block. With
+    # `exceptions=:structured` it becomes a `TryOp` with the handler as a region,
+    # never a plain statement that would lose the handler block (see
+    # test/exceptions.jl for the shapes).
+    trycatch(x) = try; sqrt(x); catch; -1.0; end
+    sci, _ = only(code_structured(trycatch, (Float64,); exceptions=:structured))
+    @test count(((_, e),) -> e.stmt isa IRStructurizer.TryOp, sci.entry.body) == 1
+    @test execute(sci, 4.0) == 2.0
+    @test execute(sci, -4.0) == -1.0
+
+    tryfinally(x) = try; sqrt(x); finally; global _finally_hit = true; end
+    sci, _ = only(code_structured(tryfinally, (Float64,); exceptions=:structured))
+    @test count(((_, e),) -> e.stmt isa IRStructurizer.TryOp, sci.entry.body) == 1
+    global _finally_hit = false
+    @test execute(sci, 9.0) == 3.0
+    @test _finally_hit
+    _finally_hit = false
+    @test_throws DomainError execute(sci, -1.0)
+    @test _finally_hit
+end
+
 @testset "validation: invalid terminators" begin
     # Manually construct malformed IR with missing YieldOp
     then_region = Block()
