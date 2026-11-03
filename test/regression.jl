@@ -371,6 +371,15 @@ end
         @test execute(sci, x) == narrow_decl(x)
     end
     @test_throws MethodError execute(sci, "a")
+    # Union-split code (#69): on the `Int` arm, `convert(Int, ⋯)` inlines to the
+    # identity and leaves no π, so `k`'s `Int` phi takes a `Union{Float64, Int}`
+    # value. What narrows that edge is a correlated `Bool` phi, not an `isa` branch.
+    union_split_decl(m::Float64, c::Bool) = (k::Int = c ? m : 1; k)
+    sci, _ = code_structured(union_split_decl, Tuple{Float64, Bool}) |> only   # validates
+    for (m, c) in ((2.0, true), (-3.0, true), (1.5, false))
+        @test execute(sci, m, c) === union_split_decl(m, c)
+    end
+    @test_throws InexactError execute(sci, 2.5, true)
     # The same refinement after an inlined `iterate` (a `Union{Nothing, Tuple}` value
     # feeding a `Tuple` phi), before the optimizer has removed it.
     function narrow_iter(n)
