@@ -9,6 +9,9 @@
 _term_targets(t::MGoto) = (t.edge.target,)
 _term_targets(t::MCondBr) = (t.t.target, t.f.target)
 _term_targets(t::MReturn) = ()
+# Both edges of an enter are CFG edges (dominance, loops, reachability see the
+# handler), but neither is ever redirected: `_edge_refs_of`/`edge_refs` expose none.
+_term_targets(t::MEnter) = t.catch_dest == 0 ? (t.body.target,) : (t.body.target, t.catch_dest)
 
 """A lightweight `CFG` over the mutable blocks (preds/succs only; statement
 ranges are placeholders) for dominance / SCC queries during normalization. Block
@@ -105,6 +108,7 @@ end
 _edge_refs_of(src::Int, t::MGoto)   = (EdgeRef(src, :goto),)
 _edge_refs_of(src::Int, t::MCondBr) = (EdgeRef(src, :t), EdgeRef(src, :f))
 _edge_refs_of(src::Int, t::MReturn) = ()
+_edge_refs_of(src::Int, t::MEnter)  = ()
 
 """Route a loop's back edges and exit edges through one latch (MLIR's
 `createSingleExitingLatch`). Back edges carry `shouldRepeat=1`, exit edges `=0`;
@@ -150,6 +154,8 @@ function _mblock_use_ids(b::MBlock)
     ids = Int[]
     collect_ssa(@nospecialize(v)) = (v isa SSAValue && push!(ids, v.id); v)
     for s in b.body
+        # A PhiC's operands name UpsilonNode statements (tokens), not values.
+        s.stmt isa Core.PhiCNode && continue
         remap_ssa(s.stmt, collect_ssa)
     end
     t = b.term
@@ -161,6 +167,9 @@ function _mblock_use_ids(b::MBlock)
         for v in t.f.args; v isa SSAValue && push!(ids, v.id); end
     elseif t isa MReturn
         t.has_val && t.val isa SSAValue && push!(ids, t.val.id)
+    elseif t isa MEnter
+        has_scope(t) && t.scope isa SSAValue && push!(ids, t.scope.id)
+        for v in t.body.args; v isa SSAValue && push!(ids, v.id); end
     end
     return ids
 end
@@ -169,6 +178,7 @@ end
 # terminator operands, and outgoing-edge operands. Mirrors `_mblock_use_ids`.
 function _rewrite_mblock!(b::MBlock, f)
     for (i, s) in enumerate(b.body)
+        s.stmt isa Core.PhiCNode && continue   # upsilon tokens, not values
         b.body[i] = MStmt(s.id, remap_ssa(s.stmt, f), s.type, s.codeloc, s.flag)
     end
     t = b.term
@@ -180,6 +190,9 @@ function _rewrite_mblock!(b::MBlock, f)
         b.term = MCondBr(f(t.cond), t.t, t.f)
     elseif t isa MReturn
         t.has_val && (b.term = MReturn(f(t.val), true))
+    elseif t isa MEnter
+        has_scope(t) && (t.scope = f(t.scope))
+        for k in eachindex(t.body.args); t.body.args[k] = f(t.body.args[k]); end
     end
 end
 
