@@ -83,7 +83,12 @@ end
 # single-exiting latch ---------------------------------------------------------
 
 """Natural loops on the MBlock CFG: header id to set of in-loop block ids. A back
-edge is `src->header` where `header` dominates `src`."""
+edge is `src->header` where `header` dominates `src`.
+
+A loop that contains an `MEnter` also contains that try's whole protected region
+and handler (`extend_loops_over_trys!`), so a throwing dead end in the region, or
+a handler that leaves the loop, stays inside the `TryOp` instead of becoming a
+loop exit that the latch would hoist out of the try."""
 function natural_loops_m(m::MCFG, cfg::CFG=build_cfg(m),
                          domtree::DomTree=construct_domtree(cfg))
     loops = Dict{Int, Set{Int}}()
@@ -102,6 +107,7 @@ function natural_loops_m(m::MCFG, cfg::CFG=build_cfg(m),
             end
         end
     end
+    has_enter(m) && extend_loops_over_trys!(loops, m, domtree)
     return loops
 end
 
@@ -354,8 +360,19 @@ function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
                                      loops=natural_loops_m(m, cfg, domtree))
     found = find_continuation(m, cfg, domtree, loops)
     found === nothing && return false
-    single_entry_mux!(m, found[2])
+    continuation_mux!(m, found[2])
     return true
+end
+
+# Route a branch's continuation edges through one mux. With try/catch, the pops that
+# only some of the edges ran move after the mux where they can
+# (`take_pops_before_mux!`), so that it holds one exception state.
+function continuation_mux!(m::MCFG, refs::Vector{EdgeRef})
+    has_enter(m) || return single_entry_mux!(m, refs)
+    taken = take_pops_before_mux!(m, refs)
+    mux = single_entry_mux!(m, refs)
+    put_pops_after_mux!(m, mux, taken)
+    return mux
 end
 
 """Dominator-tree preorder of the reachable blocks, siblings by block id."""
@@ -382,15 +399,28 @@ because the latch appends it. Finding a branch whose arm would absorb the mux is
 an error."""
 function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::Int=1)
     all_blocks = Set(1:length(m.blocks))
+    # Edges that leave a try body enclosing the branch become `LeaveOp`s in the
+    # lift, not continuation entries; `depth` lets `branch_continuation` skip them.
+    depth = has_enter(m) ? handler_depths(m) : nothing
+    # A branch in a catch has the handler region as its region, as in the lift: an
+    # edge out of the handler leaves the `TryOp`, which only the handler's own exit
+    # can do, so it is a continuation entry like any other. Handler regions nest, so
+    # the smallest one that holds the branch is the innermost.
+    handlers = has_enter(m) ?
+        sort!([r.handler for r in values(try_info(m, handler_stacks(m), domtree))
+               if !isempty(r.handler)]; by=length) : Set{Int}[]
     order = dom_preorder(domtree)
     for E in @view order[findfirst(==(start), order):end]
         t = m.blocks[E].term
         t isa MCondBr || continue
         true_dest, false_dest = t.t.target, t.f.target
         lctx = enclosing_loop_ctx(loops, E)
-        then_blocks, else_blocks = branch_arms(cfg, domtree, true_dest, false_dest, all_blocks)
+        k = findfirst(h -> E in h, handlers)
+        region = k === nothing ? all_blocks : handlers[k]
+        then_blocks, else_blocks = branch_arms(cfg, domtree, true_dest, false_dest, region)
         entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
-                                               then_blocks, else_blocks, all_blocks, lctx)
+                                               then_blocks, else_blocks, region, lctx;
+                                               depth)
         length(entries) > 1 || continue
 
         # The continuation edges: every edge from a branch-region block (notcont)
@@ -459,6 +489,9 @@ normalized."""
 function normalize_round!(m::MCFG, cursor::Int)
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
+    # Try regions go first: once each `TryOp` has a single continuation, the other
+    # passes only ever redirect edges between blocks that hold the same handlers.
+    normalize_one_try!(m, cfg, domtree) && return 1
     normalize_one_irreducible!(m, cfg, domtree) && return 1
     loops = natural_loops_m(m, cfg, domtree)
     normalize_one_loop_latch!(m, loops) && return 1
@@ -468,7 +501,7 @@ function normalize_round!(m::MCFG, cursor::Int)
     end
     if found !== nothing
         E, refs = found
-        single_entry_mux!(m, refs)
+        continuation_mux!(m, refs)
         return E
     end
     normalize_one_preheader!(m, loops, cfg) && return 1
@@ -487,20 +520,23 @@ function normalize_cf!(m::MCFG)
     while (cursor = normalize_round!(m, cursor)) !== nothing
         (rounds += 1) > limit && error("normalize_cf! failed to converge (likely a mux bug)")
     end
+    has_enter(m) && verify_try_structure(m)
     return rounds > 0
 end
 
 """
-    normalize_cf(ir::IRCode) -> MCFG
+    normalize_cf(ir::IRCode; exceptions=:error) -> MCFG
 
 Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
 loops, multi-predecessor continuations) to single-entry via edge multiplexers, so
 the lift only structurizes single-entry regions. One `ingest`, then one mutate
 fixpoint over the `MCFG`; the lift (`lift_mcfg`) reads the returned `MCFG`
-directly.
+directly. `exceptions` is `ingest`'s: `:error` throws
+`UnstructuredControlFlowError` on an `EnterNode`, and `:structured` ingests it as
+an `MEnter` and gives each try a single continuation.
 """
-function normalize_cf(ir::IRCode)
-    m = ingest(ir)
+function normalize_cf(ir::IRCode; exceptions::Symbol=:error)
+    m = ingest(ir; exceptions)
     normalize_cf!(m)
     return m
 end

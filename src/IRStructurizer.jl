@@ -29,7 +29,7 @@ include("structurize/mcfg.jl")
 include("structurize/substitutions.jl")
 
 # structurize: IRCode -> StructuredIRCode, as ingest -> normalize -> lift -> promote
-# (exceptions.jl: handler stacks for try/catch)
+# (exceptions.jl: handler stacks, try regions and their normalization)
 include("structurize/ingest.jl")
 include("structurize/multiplex.jl")
 include("structurize/exceptions.jl")

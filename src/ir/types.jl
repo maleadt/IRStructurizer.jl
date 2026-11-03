@@ -742,16 +742,19 @@ validates that no unstructured control flow remains.
   control flow remains after structurization
 - `promote`: If true (default), run the `LoopOp` to `WhileOp`/`ForOp` promotion post-pass.
   Pass `false` to keep the generic `LoopOp` form.
+- `exceptions`: How to treat try/catch (`EnterNode`). `:error` (default) throws
+  `UnstructuredControlFlowError`. `:structured` lifts each try to a `TryOp`, with
+  `LeaveOp` for exits from regions nested in its body.
 """
 function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
-                          promote::Bool=true)
+                          promote::Bool=true, exceptions::Symbol=:error)
     # Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
     # loops, multi-predecessor continuations) to single-entry with edge multiplexers,
     # then lift the resulting `MCFG` (block args + per-edge operands replace phi nodes).
     # `lift_mcfg` captures debug info from the `MBlock` codelocs and runs the
     # structurize walk.
     if structurize && !isempty(ir.stmts.stmt)
-        return lift_mcfg(normalize_cf(ir); validate, promote)
+        return lift_mcfg(normalize_cf(ir; exceptions); validate, promote)
     end
 
     # Flat view (structurize=false, or empty IR): the raw IRCode statements in a
