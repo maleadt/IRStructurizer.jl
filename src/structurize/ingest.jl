@@ -26,7 +26,7 @@ each block become block arguments; the values they carry per predecessor become
 that predecessor edge's operands. Stable ids == original SSA positions. Blocks
 unreachable from the entry are dropped (see `prune_unreachable!`).
 
-An `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
+A live `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
 `:structured`. Then it becomes an `MEnter` terminator, each `Expr(:leave, ...)` is
 split into blocks of its own that pop one handler each (`split_leaves!`), and the
 `pop_exception`s are moved to where their catch's handler runs. See
@@ -47,7 +47,6 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
 
     # Pass 1: split each block into args / body / terminator. Edges get empty
     # operand vectors here, filled in pass 2.
-    has_eh = false
     for i in 1:nb
         bb = ir.cfg.blocks[i]
         mb = blocks[i]
@@ -58,19 +57,13 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
             loc = _codeloc(ir, si)
             last_loc = loc
             if stmt isa Core.EnterNode
-                # An `EnterNode` is a terminator whose implicit edge to the
-                # catch handler has no structured counterpart unless the try is
-                # lifted to a `TryOp`; ingesting it as a plain statement would
-                # silently drop the handler block.
-                exceptions === :structured || throw(UnstructuredControlFlowError(
-                    "exception handling is not supported (EnterNode at statement $si)"))
                 # A terminator: falls through into the protected region, with an
-                # implicit edge to the catch block (`_ingest_term`).
-                has_eh = true
+                # implicit edge to the catch block (`_ingest_term`). Ingesting it
+                # as a plain statement would silently drop the handler block.
                 term_stmt = stmt
                 mb.term_codeloc = loc
                 mb.term_id = si
-            elseif exceptions === :structured && is_leave(stmt)
+            elseif is_leave(stmt)
                 # Keep only the pops of live handlers: an optimized-away enter
                 # leaves a `nothing` argument. `split_leaves!` gives each pop a
                 # block of its own.
@@ -112,9 +105,14 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
     m = MCFG(blocks, 1, types, codelocs,
              length(ir.stmts.stmt) + 1,
-             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds, has_eh)
+             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds, false)
+    # Only a live try is rejected or lifted: unoptimized IR can hold dead ones.
     prune_unreachable!(m)
-    if has_eh
+    k = findfirst(b -> b.term isa MEnter, m.blocks)
+    if k !== nothing
+        exceptions === :structured || throw(UnstructuredControlFlowError(
+            "exception handling is not supported (EnterNode at statement $(m.blocks[k].term.id))"))
+        m.has_eh = true
         hoist_pops_over_leaves!(m)
         split_leaves!(m)
         split_pops_across_catches!(m)

@@ -634,6 +634,20 @@ const EH_CASES = [
     @test m.has_eh && count(b -> b.term isa MEnter, m.blocks) == 1
     m = ingest(first(only(code_ircode(x -> x > 0 ? x : -x, (Int,)))); exceptions=:structured)
     @test !m.has_eh
+    # A dead try goes with its blocks, before it could be rejected.
+    ir = build_ir([
+        (stmts=[(ReturnNode(Argument(2)), Any)], succs=Int[]),
+        (stmts=[(Core.EnterNode(5), Any)], succs=[3, 5]),
+        (stmts=[(Expr(:leave, SSAValue(2)), Any)], succs=[4]),
+        (stmts=[(ReturnNode(Argument(2)), Any)], succs=Int[]),
+        (stmts=[(Expr(:pop_exception, SSAValue(2)), Nothing), (ReturnNode(Argument(2)), Any)],
+         succs=Int[]),
+    ], Any[Tuple{}, Int])
+    for exceptions in (:error, :structured)
+        m = ingest(ir; exceptions)
+        @test !m.has_eh && length(m.blocks) == 1
+    end
+    @test execute(StructuredIRCode(ir), 3) == 3
 end
 
 @testset "an upsilon in a dead block leaves its PhiC" begin
