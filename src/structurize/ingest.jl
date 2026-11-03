@@ -283,8 +283,10 @@ _new_trampoline(target::Int, args::Vector{Any}) =
 
 """Split any `GotoIfNot` whose two edges target the same block: route the false
 edge through a trampoline so the target has two distinct predecessor blocks (a
-Julia phi can't list one predecessor twice)."""
+Julia phi can't list one predecessor twice). Returns the trampolines, each with the
+block whose edge it splits."""
 function split_duplicate_edges!(m::MCFG)
+    trampolines = Pair{Int, Int}[]
     for id in 1:length(m.blocks)        # range fixed before trampolines are appended
         t = m.blocks[id].term
         t isa MCondBr || continue
@@ -292,7 +294,9 @@ function split_duplicate_edges!(m::MCFG)
             tr = add_block!(m, _new_trampoline(t.f.target, copy(t.f.args)))
             t.f.target = tr
             empty!(t.f.args)
+            push!(trampolines, id => tr)
         end
     end
+    return trampolines
 end
 

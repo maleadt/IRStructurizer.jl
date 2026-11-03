@@ -26,13 +26,20 @@ mutable struct StructurizeCtx
                                         # (-1: unreachable); `nothing` without trys
 end
 
-function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
+function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}();
+                        trampolines::Vector{Pair{Int, Int}}=Pair{Int, Int}[])
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
     loops = natural_loops_m(m, cfg, domtree)
     if has_enter(m)
         stacks = handler_stacks(m)
         try_regions = try_info(m, stacks, domtree)
+        # A trampoline belongs to the regions of the block whose edge it splits, even
+        # where it runs after that block's `pop_exception`.
+        for (src, tr) in trampolines, r in values(try_regions)
+            src in r.body && push!(r.body, tr)
+            src in r.handler && push!(r.handler, tr)
+        end
         depth = handler_depths(stacks)
     else
         try_regions = Dict{Int, TryRegion}()
@@ -144,8 +151,9 @@ in the `promote_loops!` post-pass. Pass `promote=false` to get the pre-promotion
 form, where every loop is a `LoopOp`.
 """
 function structurize(m, line_map::Dict{Int, Int}=Dict{Int, Int}();
-                     promote::Bool=true)
-    ctx = StructurizeCtx(m, line_map)
+                     promote::Bool=true,
+                     trampolines::Vector{Pair{Int, Int}}=Pair{Int, Int}[])
+    ctx = StructurizeCtx(m, line_map; trampolines)
     all_blocks = Set(1:length(ctx.m.blocks))
     entry = structurize_region!(ctx, ctx.m.entry, all_blocks)
     promote && promote_loops!(entry, ctx)
@@ -162,13 +170,13 @@ predecessor P contributes" as a single edge operand; a `cond ? a : b` shape need
 the two predecessors distinct). Debug info comes from the `MBlock` codelocs.
 """
 function lift_mcfg(m::MCFG; validate::Bool=true, promote::Bool=true)
-    split_duplicate_edges!(m)
+    trampolines = split_duplicate_edges!(m)
     debuginfo_table, line_map = capture_debuginfo(m)
     valid_worlds = m.valid_worlds isa WorldRange ? m.valid_worlds :
                    WorldRange(typemin(UInt), typemax(UInt))
     sci = StructuredIRCode(copy(m.argtypes), copy(m.sptypes), Block(), 0, 0,
                            debuginfo_table, line_map, valid_worlds)
-    entry, max_ssa, max_arg, updated_line_map = structurize(m, line_map; promote)
+    entry, max_ssa, max_arg, updated_line_map = structurize(m, line_map; promote, trampolines)
     sci.entry = entry
     sci.max_ssa_idx = max_ssa
     sci.max_arg_idx = max_arg
