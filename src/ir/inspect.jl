@@ -497,7 +497,9 @@ end
 function shared_ir_objects(@nospecialize(x))
     shared = IdDict{Any,Any}()
     seen = IdDict{Any,Nothing}()
-    function visit(@nospecialize(y))
+    worklist = Any[x]
+    while !isempty(worklist)
+        y = pop!(worklist)
         if y isa SharedIRObject
             shared[y] = y
         elseif isbits(y) || y isa Union{Symbol, String, Module, Type, GlobalRef,
@@ -508,17 +510,16 @@ function shared_ir_objects(@nospecialize(x))
             if y isa Union{Core.GenericMemory, Core.SimpleVector}
                 # An `Array` is reached through its fields, so its whole backing
                 # memory is visited, as `deepcopy` copies it. Bits hold no objects.
-                y isa Core.GenericMemory && isbitstype(eltype(y)) && return
+                y isa Core.GenericMemory && isbitstype(eltype(y)) && continue
                 for i in eachindex(y)
-                    isassigned(y, i) && visit(y[i])
+                    isassigned(y, i) && push!(worklist, y[i])
                 end
             else
                 for i in 1:nfields(y)
-                    isdefined(y, i) && visit(getfield(y, i))
+                    isdefined(y, i) && push!(worklist, getfield(y, i))
                 end
             end
         end
     end
-    visit(x)
     return shared
 end

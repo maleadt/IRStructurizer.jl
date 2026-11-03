@@ -40,6 +40,9 @@ function promotion_world(ctx::StructurizeCtx)
     return worlds isa WorldRange ? worlds.min_world : Base.get_world_counter()
 end
 
+# The carry types of a loop result type, without the positions in `removed`.
+kept_carry_types(T, removed) = Any[t for (i, t) in enumerate(T.parameters) if i ∉ removed]
+
 function promote_loops!(block::Block, ctx::StructurizeCtx)
     new_body = SSAMap()
     # Track ForOp promotions: loop_ssa_idx => (removed_positions, ForOp, carry_redirect)
@@ -59,7 +62,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
             result, removed, redirect = try_promote_for_from_loop(stmt, idx, block, new_body, ctx)
             if result isa ForOp
                 for_promotions[idx] = (removed, result, redirect)
-                carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed]
+                carry_types = kept_carry_types(entry.type, removed)
                 push!(new_body, (idx, result, Tuple{carry_types...}, entry.flag))
             else
                 # Fall back to LoopOp to WhileOp to ForOp.
@@ -76,7 +79,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                             push!(new_body, (idx, result2, entry.type, entry.flag))
                         else
                             for_promotions[idx] = (removed2, result2, Dict{Int,Int}())
-                            carry_types = Any[t for (i, t) in enumerate(entry.type.parameters) if i ∉ removed2]
+                            carry_types = kept_carry_types(entry.type, removed2)
                             push!(new_body, (idx, result2, Tuple{carry_types...}, entry.flag))
                         end
                     else
@@ -97,7 +100,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                 target_pos = get(redirect, field_idx, 0)
                 if target_pos > 0
                     # Duplicate carry: redirect to surviving carry's adjusted index.
-                    adjusted = target_pos - count(p -> p < target_pos, removed)
+                    adjusted = target_pos - count(<(target_pos), removed)
                     new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                     push!(new_body, (idx, new_gf, entry.type, entry.flag))
                 else
@@ -109,7 +112,7 @@ function promote_loops!(block::Block, ctx::StructurizeCtx)
                     push!(new_body, (idx, for_op.upper, entry.type, entry.flag))
                 end
             else
-                adjusted = field_idx - count(p -> p < field_idx, removed)
+                adjusted = field_idx - count(<(field_idx), removed)
                 new_gf = Expr(:call, Core.getfield, SSAValue(loop_ssa), adjusted)
                 push!(new_body, (idx, new_gf, entry.type, entry.flag))
             end
