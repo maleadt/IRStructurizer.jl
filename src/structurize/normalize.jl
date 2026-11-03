@@ -402,15 +402,24 @@ function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::In
     # Edges that leave a try body enclosing the branch become `LeaveOp`s in the
     # lift, not continuation entries; `depth` lets `branch_continuation` skip them.
     depth = has_enter(m) ? handler_depths(m) : nothing
+    # A branch in a catch has the handler region as its region, as in the lift: an
+    # edge out of the handler leaves the `TryOp`, which only the handler's own exit
+    # can do, so it is a continuation entry like any other. Handler regions nest, so
+    # the smallest one that holds the branch is the innermost.
+    handlers = has_enter(m) ?
+        sort!([r.handler for r in values(try_info(m, handler_stacks(m), domtree))
+               if !isempty(r.handler)]; by=length) : Set{Int}[]
     order = dom_preorder(domtree)
     for E in @view order[findfirst(==(start), order):end]
         t = m.blocks[E].term
         t isa MCondBr || continue
         true_dest, false_dest = t.t.target, t.f.target
         lctx = enclosing_loop_ctx(loops, E)
-        then_blocks, else_blocks = branch_arms(cfg, domtree, true_dest, false_dest, all_blocks)
+        k = findfirst(h -> E in h, handlers)
+        region = k === nothing ? all_blocks : handlers[k]
+        then_blocks, else_blocks = branch_arms(cfg, domtree, true_dest, false_dest, region)
         entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
-                                               then_blocks, else_blocks, all_blocks, lctx;
+                                               then_blocks, else_blocks, region, lctx;
                                                depth)
         length(entries) > 1 || continue
 

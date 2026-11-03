@@ -793,6 +793,36 @@ function eh_maybe_return_from_finally_in_catch(x)
     0
 end
 
+# A `continue` from a catch in a loop on one path, a throw on the other two: the
+# throw joins two arms of the handler's branches, one of which leaves the handler.
+function eh_continue_or_throw_from_catch(x)
+    for i in 1:3
+        try
+            eh_throw(ErrorException("a"))
+        catch
+            x > -10 && i == 1 && continue
+            throw(DomainError(i))
+        end
+    end
+    return 0
+end
+# A `@goto` out of a catch around a try/catch, past code the catch reaches otherwise.
+function eh_goto_from_catch_past_try(x)
+    try
+        eh_throw(ErrorException("a"))
+    catch
+        try
+            try eh_log(1) catch; eh_log(2) end
+        catch
+            x > 1 && @goto done
+        end
+        eh_log(3)
+        return 2
+    end
+    @label done
+    return 0
+end
+
 const EH_CASES = [
     (eh_basic, (1, 20)), (eh_exc, (1, 20)), (eh_finally, (1, 20)), (eh_nested, (1, 5, 20)),
     (eh_upsilon, (1, 15, 20)), (eh_rethrow, (1, 12, 20)), (eh_return_in_try, (1, 7, 20)),
@@ -823,6 +853,8 @@ const EH_CASES = [
     (eh_break_from_try_in_nested_catches, (0, 1, 2, 5)),
     (eh_break_from_catch_in_trys_in_catches, (0, 1, 2, 3, 5)),
     (eh_maybe_return_from_finally_in_catch, (1, 11, 12, 15, 16)),
+    (eh_continue_or_throw_from_catch, (-20, -3, 2)),
+    (eh_goto_from_catch_past_try, (0, 2)),
 ]
 
 @testset "exceptions" begin
