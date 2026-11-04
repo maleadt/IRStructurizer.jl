@@ -50,6 +50,17 @@ function counted(n::Int)
 end
 end
 
+# Union splitting a call whose every member throws gives one call per member,
+# each inferred `Union{}` but branching on to a `Union{}` phi that merges them.
+module NeverReturns
+@noinline throws_on(x::Int) = throw(ArgumentError("Int"))
+@noinline throws_on(x::Float64) = throw(ArgumentError("Float64"))
+function split_throw(c::Bool, x::Union{Int, Float64})
+    c || return 0
+    throws_on(x)
+end
+end
+
 @testset "regression suite" begin
 
 #=============================================================================
@@ -303,6 +314,40 @@ end
     ], Any[Any, Float64])
     sci = StructuredIRCode(ir)
     @test execute(sci, 0.75) === (0.75, 7)
+end
+
+@testset "calls that never return" begin
+    # The phi of the calls is dead code; it must not become an `IfOp` result.
+    sci, _ = code_structured(NeverReturns.split_throw, Tuple{Bool, Union{Int, Float64}}) |> only
+    @test execute(sci, false, 1) === 0
+    @test_throws ArgumentError("Int") execute(sci, true, 1)
+    @test_throws ArgumentError("Float64") execute(sci, true, 1.0)
+
+    # The same shape, pinned, and with the join reading the phi.
+    #  1: goto 4 if not c         2: goto 5 if not d
+    #  3: %3 = throw(e1); goto 6   4: return 0
+    #  5: %6 = throw(e2); goto 6   6: %8 = φ(3 => %3, 5 => %6)::Union{}; <join>
+    e1, e2 = ArgumentError("one"), ArgumentError("two")
+    for join in (ReturnNode(), ReturnNode(SSAValue(8)))
+        ir = build_ir([
+            (stmts=[(GotoIfNot(Argument(2), 4), Any)],                  succs=[2, 4]),
+            (stmts=[(GotoIfNot(Argument(3), 5), Any)],                  succs=[3, 5]),
+            (stmts=[(Expr(:call, GlobalRef(Core, :throw), e1), Union{}),
+                    (GotoNode(6), Any)],                                succs=[6]),
+            (stmts=[(ReturnNode(0), Any)],                              succs=Int[]),
+            (stmts=[(Expr(:call, GlobalRef(Core, :throw), e2), Union{}),
+                    (GotoNode(6), Any)],                                succs=[6]),
+            (stmts=[(PhiNode(Int32[3, 5], Any[SSAValue(3), SSAValue(6)]), Union{}),
+                    (join, Union{})],                                   succs=Int[]),
+        ], Any[Any, Bool, Bool])
+        CC.verify_ir(ir)
+        for exceptions in (:error, :structured)
+            sci = StructuredIRCode(ir; exceptions)
+            @test execute(sci, false, true) === 0
+            @test_throws e1 execute(sci, true, true)
+            @test_throws e2 execute(sci, true, false)
+        end
+    end
 end
 
 @testset "loop carry of a literal `nothing`" begin

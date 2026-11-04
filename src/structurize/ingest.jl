@@ -23,8 +23,9 @@ end
 
 Convert dense `IRCode` into the explicit-edge mutable form. Leading phi nodes of
 each block become block arguments; the values they carry per predecessor become
-that predecessor edge's operands. Stable ids == original SSA positions. Blocks
-unreachable from the entry are dropped (see `prune_unreachable!`).
+that predecessor edge's operands. Stable ids == original SSA positions. A block
+ends at a statement that never returns (typed `Union{}`), and blocks unreachable
+from the entry are dropped (see `prune_unreachable!`).
 
 A live `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
 `:structured`. Then it becomes an `MEnter` terminator, each `Expr(:leave, ...)` is
@@ -89,6 +90,18 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
                 mb.term_id = si
             else
                 push!(mb.body, MStmt(si, stmt, ir.stmts.type[si], loc, ir.stmts.flag[si]))
+                if ir.stmts.type[si] === Union{} && !never_returns_exempt(stmt)
+                    # The rest of the block is dead. Optimized IR usually has an
+                    # `unreachable` here, but union splitting a call whose every
+                    # member throws branches on to a `Union{}` phi of the calls,
+                    # which the lift would make a `Union{}` carry. End the block, as
+                    # Compiler's `convert_to_ircode` does, so that dead successors
+                    # are pruned with their phis. `prune_unreachable!` also drops
+                    # the upsilons cut off here from their PhiCs.
+                    term_stmt = ReturnNode()
+                    mb.term_codeloc = loc
+                    break
+                end
             end
         end
         if term_stmt === nothing            # fallthrough block: goto-next, or
@@ -122,6 +135,11 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
     return m
 end
 
+# Statements typed `Union{}` that do return: a `Union{}` PhiC or upsilon carries a
+# variable that is undefined on that path, and `nothing` is a deleted statement.
+never_returns_exempt(@nospecialize(stmt)) =
+    stmt isa Core.PhiCNode || stmt isa Core.UpsilonNode || stmt === nothing
+
 _term_edges(t::MGoto) = (t.edge,)
 _term_edges(t::MCondBr) = (t.t, t.f)
 _term_edges(t::MReturn) = ()
@@ -132,8 +150,9 @@ and renumber the rest in order. Normalization and the lift would otherwise count
 the edges out of them as predecessors, and Compiler's `CFGReachability` leaves
 their `irreducible` bits uninitialized. A phi operand for a dead predecessor
 lives on that predecessor's edge, so it goes with the block. A `PhiCNode` names
-its upsilons instead, so those in dead blocks are dropped from it, as Compiler's
-compaction does. A catch block is reachable through its enter."""
+its upsilons instead, so those no longer in the IR are dropped from it, as
+Compiler's compaction does: those in dead blocks, and those after a statement that
+never returns. A catch block is reachable through its enter."""
 function prune_unreachable!(m::MCFG)
     live = falses(length(m.blocks))
     worklist = [m.entry]
@@ -143,25 +162,27 @@ function prune_unreachable!(m::MCFG)
         live[b] = true
         append!(worklist, _term_targets(m.blocks[b].term))
     end
-    all(live) && return m
-    newid = cumsum(live)
-    dead = Set{Int}(s.id for (b, blk) in enumerate(m.blocks) if !live[b]
-                    for s in blk.body if s.stmt isa Core.UpsilonNode)
-    isdead(@nospecialize(v)) = v isa SSAValue && v.id in dead
-    keepat!(m.blocks, live)
+    if !all(live)
+        newid = cumsum(live)
+        keepat!(m.blocks, live)
+        for b in m.blocks
+            t = b.term
+            for e in _term_edges(t)
+                e.target = newid[e.target]
+            end
+            t isa MEnter && t.catch_dest != 0 && (t.catch_dest = newid[t.catch_dest])
+        end
+        m.entry = newid[m.entry]
+    end
+    upsilons = Set{Int}(s.id for b in m.blocks for s in b.body if s.stmt isa Core.UpsilonNode)
+    isgone(@nospecialize(v)) = v isa SSAValue && !(v.id in upsilons)
     for b in m.blocks
         for (i, s) in enumerate(b.body)
-            s.stmt isa Core.PhiCNode && any(isdead, s.stmt.values) || continue
-            b.body[i] = MStmt(s.id, Core.PhiCNode(filter(!isdead, s.stmt.values)), s.type,
+            s.stmt isa Core.PhiCNode && any(isgone, s.stmt.values) || continue
+            b.body[i] = MStmt(s.id, Core.PhiCNode(filter(!isgone, s.stmt.values)), s.type,
                               s.codeloc, s.flag)
         end
-        t = b.term
-        for e in _term_edges(t)
-            e.target = newid[e.target]
-        end
-        t isa MEnter && t.catch_dest != 0 && (t.catch_dest = newid[t.catch_dest])
     end
-    m.entry = newid[m.entry]
     return m
 end
 

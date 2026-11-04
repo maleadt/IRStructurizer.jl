@@ -1175,6 +1175,27 @@ end
     end
 end
 
+@testset "an upsilon after a statement that never returns leaves its PhiC" begin
+    # Ingest ends block 2 at the throw, cutting off the upsilon of 7 while its block
+    # stays live. The catch's PhiC keeps only the upsilon before the throw.
+    ir = build_ir([
+        (stmts=[(Core.EnterNode(3), Any)], succs=[2, 3]),
+        (stmts=[(Core.UpsilonNode(Argument(2)), Int),
+                (Expr(:call, Core.throw, ErrorException("a")), Union{}),
+                (Core.UpsilonNode(7), Int),
+                (ReturnNode(), Union{})], succs=Int[]),
+        (stmts=[(Core.PhiCNode(Any[SSAValue(2), SSAValue(4)]), Int),
+                (Expr(:pop_exception, SSAValue(1)), Nothing),
+                (ReturnNode(SSAValue(6)), Any)], succs=Int[]),
+    ], Any[Tuple{}, Int])
+    ir.stmts.flag .= UInt32(0)
+    CC.verify_ir(ir)
+    m = ingest(ir; exceptions=:structured)
+    @test only(s.stmt for b in m.blocks for s in b.body if s.stmt isa Core.PhiCNode).values ==
+          Any[SSAValue(2)]
+    @test execute(StructuredIRCode(ir; exceptions=:structured), 5) === 5
+end
+
 """What `eh_split_handler_branch_ir` computes."""
 eh_split_handler_branch(flag::Bool) = try throw(nothing) catch; flag ? 1 : 2 end
 
