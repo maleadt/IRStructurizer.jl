@@ -316,6 +316,44 @@ end
     @test execute(sci, 0.75) === (0.75, 7)
 end
 
+@testset "merge values an IfOp's arms do not define" begin
+    # An IfOp nested on the way to a merge carries only the merge values one of its
+    # arms defines; for the others, its block yields `Undef` directly. A merge
+    # argument every edge leaves undefined is a result only if something refers to
+    # it (see "block argument with no incoming value").
+    add = GlobalRef(Core.Intrinsics, :add_int)
+    mul = GlobalRef(Core.Intrinsics, :mul_int)
+    ifelse = GlobalRef(Core, :ifelse)
+    #  1: goto 5 if not a      2: goto 4 if not b
+    #  3: %3 = x + 1  goto 6   4: %5 = x + 2  goto 6
+    #  5: %7 = x + 3; %8 = x * 3  goto 6
+    #  6: %10 = φ(5 => %8); %11 = φ(); %12 = φ(3 => %3, 4 => %5, 5 => %7)
+    #     return %12 + ifelse(a, 0, %10)
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 5), Any)],                            succs=[5, 2]),
+        (stmts=[(GotoIfNot(Argument(3), 4), Any)],                            succs=[4, 3]),
+        (stmts=[(Expr(:call, add, Argument(4), 1), Int), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(Expr(:call, add, Argument(4), 2), Int), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(Expr(:call, add, Argument(4), 3), Int),
+                (Expr(:call, mul, Argument(4), 3), Int), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(PhiNode(Int32[5], Any[SSAValue(8)]), Int),
+                (PhiNode(Int32[], Any[]), Int),
+                (PhiNode(Int32[3, 4, 5], Any[SSAValue(3), SSAValue(5), SSAValue(7)]), Int),
+                (Expr(:call, ifelse, Argument(2), 0, SSAValue(10)), Int),
+                (Expr(:call, add, SSAValue(12), SSAValue(13)), Int),
+                (ReturnNode(SSAValue(14)), Any)],                             succs=Int[]),
+    ], Any[Any, Bool, Bool, Int])
+    sci = StructuredIRCode(ir)
+    ifop(blk::Block) = only((e.stmt, e.type) for (_, e) in blk.body if e.stmt isa IfOp)
+    outer, outer_type = ifop(sci.entry)
+    @test outer_type == Tuple{Int, Int}  # %10 and %12, not the unread %11
+    _, inner_type = ifop(outer.then_region)
+    @test inner_type == Tuple{Int}      # %12 only: neither arm defines %10 or %11
+    for a in (true, false), b in (true, false)
+        @test execute(sci, a, b, 5) === (a ? 5 + (b ? 1 : 2) : 5 + 3 + 15)
+    end
+end
+
 @testset "calls that never return" begin
     # The phi of the calls is dead code; it must not become an `IfOp` result.
     sci, _ = code_structured(NeverReturns.split_throw, Tuple{Bool, Union{Int, Float64}}) |> only

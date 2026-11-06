@@ -521,7 +521,35 @@ function normalize_cf!(m::MCFG)
         (rounds += 1) > limit && error("normalize_cf! failed to converge (likely a mux bug)")
     end
     has_enter(m) && verify_try_structure(m)
+    drop_undef_args!(m)
     return rounds > 0
+end
+
+"""Drop the block arguments that every incoming edge leaves `Undef` and nothing refers
+to, with their operands on those edges. A multiplexer creates these: its arguments
+for one entry's values are `Undef` on the edges into the other entries, and where no
+edge carries a value, its dispatch forwards `Undef` instead of the argument. Each
+would otherwise become an `IfOp` result or a loop carry that is never defined or read.
+An argument something refers to stays, like an empty `φ()` that a later use names."""
+function drop_undef_args!(m::MCFG)
+    used = Set{Int}()
+    for b in m.blocks
+        union!(used, _mblock_use_ids(b))
+    end
+    incoming = [MEdge[] for _ in m.blocks]
+    for b in m.blocks, e in _term_edges(b.term)
+        push!(incoming[e.target], e)
+    end
+    for (bid, b) in enumerate(m.blocks)
+        keep = [k for (k, a) in enumerate(b.args)
+                if a in used || any(e -> !(e.args[k] isa Undef), incoming[bid])]
+        length(keep) == length(b.args) && continue
+        b.args = b.args[keep]
+        for e in incoming[bid]
+            e.args = e.args[keep]
+        end
+    end
+    return m
 end
 
 """
