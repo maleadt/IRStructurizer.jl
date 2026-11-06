@@ -396,11 +396,27 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
             if_ssa = alloc_ssa!(ctx)
             anchor_line!(ctx, if_ssa, branch_anchor)
             if then_blk.terminator isa YieldOp || else_blk.terminator isa YieldOp
-                push!(block, if_ssa, if_op, Tuple{phi_types...})
+                # The IfOp carries only the outer-merge values some arm defines. One
+                # that both arms leave `Undef` is `Undef` on this path, so this block
+                # yields `Undef` for it directly; otherwise every IfOp on the way to a
+                # merge would carry all of the merge's values.
+                arms = (then_blk, else_blk)
+                live = [any(b -> b.terminator isa YieldOp && !(b.terminator.values[i] isa Undef), arms)
+                        for i in eachindex(phi_types)]
+                for b in arms
+                    b.terminator isa YieldOp && (b.terminator = YieldOp(b.terminator.values[live]))
+                end
+                push!(block, if_ssa, if_op, Tuple{phi_types[live]...})
                 yield_values = IRValue[]
+                k = 0
                 for (i, phi_type) in enumerate(phi_types)
+                    if !live[i]
+                        push!(yield_values, Undef(phi_type))
+                        continue
+                    end
+                    k += 1
                     fresh = alloc_ssa!(ctx)
-                    push!(block, fresh, Expr(:call, Core.getfield, SSAValue(if_ssa), i), phi_type)
+                    push!(block, fresh, Expr(:call, Core.getfield, SSAValue(if_ssa), k), phi_type)
                     anchor_line!(ctx, fresh, branch_anchor)
                     push!(yield_values, SSAValue(fresh))
                 end
