@@ -78,7 +78,7 @@ function normalize_unshared!(m)
           IRStructurizer.normalize_one_continuation!(m) || IRStructurizer.normalize_one_preheader!(m)
         (guard += 1) > limit && error("did not converge")
     end
-    return m
+    return IRStructurizer.drop_undef_args!(m)
 end
 
 @testset "multiplex (mutate-then-lift)" begin
@@ -146,6 +146,23 @@ end
             @test exec_ir(CCx.IRCode(sci), n, k) == f(n, k)
         end
     end
+end
+
+@testset "mux arguments that no edge defines" begin
+    # A mux's arguments for one entry's values are `Undef` on the edges into the
+    # others; where no edge defines one and nothing reads it, it is no IfOp result.
+    sci, _ = only(code_structured(norm_exits, Tuple{Int, Int}))
+    undefined = 0
+    walk(sci) do inst, _
+        op = inst[:stmt]
+        op isa IfOp && inst[:type] <: Tuple || return
+        arms = (op.then_region.terminator, op.else_region.terminator)
+        for i in 1:fieldcount(inst[:type])
+            all(t -> !(t isa YieldOp) || t.values[i] isa IRStructurizer.Undef, arms) &&
+                (undefined += 1)
+        end
+    end
+    @test undefined == 0
 end
 
 end  # multiplex

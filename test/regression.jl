@@ -318,7 +318,9 @@ end
 
 @testset "merge values an IfOp's arms do not define" begin
     # An IfOp nested on the way to a merge carries only the merge values one of its
-    # arms defines; for the others, its block yields `Undef` directly.
+    # arms defines; for the others, its block yields `Undef` directly. A merge
+    # argument every edge leaves undefined is a result only if something refers to
+    # it (see "block argument with no incoming value").
     add = GlobalRef(Core.Intrinsics, :add_int)
     mul = GlobalRef(Core.Intrinsics, :mul_int)
     ifelse = GlobalRef(Core, :ifelse)
@@ -343,7 +345,8 @@ end
     ], Any[Any, Bool, Bool, Int])
     sci = StructuredIRCode(ir)
     ifop(blk::Block) = only((e.stmt, e.type) for (_, e) in blk.body if e.stmt isa IfOp)
-    outer, _ = ifop(sci.entry)
+    outer, outer_type = ifop(sci.entry)
+    @test outer_type == Tuple{Int, Int}  # %10 and %12, not the unread %11
     _, inner_type = ifop(outer.then_region)
     @test inner_type == Tuple{Int}      # %12 only: neither arm defines %10 or %11
     for a in (true, false), b in (true, false)
