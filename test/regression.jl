@@ -1074,6 +1074,71 @@ end
         @test @roundtrip irr3(s, n)
     end
 
+    # Natural loops nested in the cycle are part of it: their headers are no entries,
+    # and `h`, defined at both entries and read after the nested loops, is never
+    # carried as `Undef` through a dispatch state that does not define it.
+    function irr_nested_loops(n::Int, raw::Bool)
+        acc = 0; h = n + 1
+        raw && @goto label
+        while acc < 10^6
+            h = acc + 3
+            @label label
+            k = 0
+            while k < n
+                j = 0
+                while j < k; j += 1; end
+                k += 1 + j
+            end
+            acc = 10acc + h + k
+        end
+        return acc
+    end
+    # an irreducible cycle nested in another, with a natural loop inside both
+    function irr_nested_irr(n::Int, a::Bool, b::Bool)
+        acc = 0; h = n
+        a && @goto L_outer
+        while acc < 10^7
+            h = acc + 1
+            @label L_outer
+            b && @goto L_inner
+            while acc < 10^6
+                acc += 2
+                @label L_inner
+                k = 0
+                while k < n; k += 1; end
+                acc = 10acc + h + k
+            end
+            acc += 1
+        end
+        return acc
+    end
+    # an irreducible cycle nested in a natural loop, which stays outside the cycle
+    function irr_in_loop(n::Int, raw::Bool)
+        total = 0
+        for i in 1:n
+            acc = i; h = i
+            raw && @goto label
+            while acc < 1000
+                h = acc + 3
+                @label label
+                k = 0
+                while k < i; k += 1; end
+                acc = 10acc + h + k
+            end
+            total += acc
+        end
+        return total
+    end
+    for n in (0, 1, 3), raw in (false, true)
+        @test @roundtrip irr_nested_loops(n, raw)
+        @test @roundtrip irr_in_loop(n, raw)
+    end
+    for n in (0, 2), a in (false, true), b in (false, true)
+        @test @roundtrip irr_nested_irr(n, a, b)
+    end
+    sci, _ = code_structured(irr_nested_loops, Tuple{Int, Bool}) |> only
+    @test count_stmts(sci.entry, s -> s isa Union{LoopOp, ForOp, WhileOp}) == 3
+
     # Structural: the SCC collapses to exactly one LoopOp (irreducible loops stay
     # LoopOp — no While/For promotion, there is no single counting condition), and
     # structurization succeeds + validates (no UnstructuredControlFlowError).

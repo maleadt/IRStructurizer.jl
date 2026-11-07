@@ -54,10 +54,9 @@ function normalize_one_irreducible!(m::MCFG, cfg::CFG=build_cfg(m),
     isempty(by_scc) && return false
 
     # Deterministic pick: smallest SCC id, entry blocks sorted.
-    S = by_scc[minimum(keys(by_scc))]
-    Sset = Set(S)
-    entry_blocks = sort!([b for b in S if any(p -> p ∉ Sset, cfg.blocks[b].preds)])
-    @assert length(entry_blocks) >= 1 "irreducible SCC with no entry block"
+    Sset = with_nested_loops(cfg, domtree, by_scc[minimum(keys(by_scc))])
+    entry_blocks = sort!([b for b in Sset if any(p -> p ∉ Sset, cfg.blocks[b].preds)])
+    @assert length(entry_blocks) >= 2 "irreducible cycle with a single entry"
 
     # Separate the edges into entry blocks: external (entry edges) and in-SCC
     # (back edges). Both route through the entry mux so every in-edge, back edges
@@ -78,6 +77,27 @@ function normalize_one_irreducible!(m::MCFG, cfg::CFG=build_cfg(m),
     # >=2-back-edge trigger, so there is no separate back-edge mux here.
     single_entry_mux!(m, vcat(entry_refs, back_refs); absorb=true)
     return true
+end
+
+"""The cycle around an irreducible component `S` of `CFGReachability`: `S` plus the
+natural loops whose headers are in `S`. Those components leave out every reducible back
+edge, which also cuts off the latch of a loop nested in the cycle; the loops enclosing
+the cycle have their headers outside `S` and stay out. The blocks with a predecessor
+outside the result are the cycle's entries."""
+function with_nested_loops(cfg::CFG, domtree::DomTree, S::Vector{Int})
+    region = Set(S)
+    work = Int[]
+    for h in S, p in cfg.blocks[h].preds
+        dominates(domtree, h, p) || continue
+        push!(work, p)                     # the loop: blocks reaching `p` without `h`
+        while !isempty(work)
+            b = pop!(work)
+            b in region && continue
+            push!(region, b)
+            append!(work, cfg.blocks[b].preds)
+        end
+    end
+    return region
 end
 
 # single-exiting latch ---------------------------------------------------------
