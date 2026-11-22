@@ -22,6 +22,7 @@ include("ir/carries.jl")
 include("ir/traversal.jl")
 include("ir/inspect.jl")
 include("ir/validation.jl")
+include("ir/expand.jl")
 
 # explicit-edge mutable CFG (MBlock/MCFG) and the phi-to-block-arg substitutions,
 # both named by the structurize pipeline below

@@ -346,18 +346,36 @@ function ifop_expected_yield_types(@nospecialize(result_type))
     return result_type.parameters
 end
 
+"""Whether control cannot reach the end of `block`: its last statement is an
+`IfOp` none of whose arms yields, each ending in a return, continue or break, or
+diverging itself. Such a block needs no terminator (a loop body ending in its
+exit dispatch, or a conditional continuation of an expanded `ForOp`)."""
+function diverges(block::Block)
+    isempty(block.body) && return false
+    last = block.body.stmts[end]
+    last isa IfOp || return false
+    return arm_diverges(last.then_region) && arm_diverges(last.else_region)
+end
+
+function arm_diverges(block::Block)
+    term = block.terminator
+    (term isa ReturnNode || term isa ContinueOp || term isa BreakOp) && return true
+    return term === nothing && diverges(block)
+end
+
 function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
                                    op::IfOp, idx::Int, @nospecialize(result_type),
                                    walk::TerminatorWalk=TerminatorWalk())
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
-    # Both regions must have an explicit terminator; `nothing` is always invalid.
+    # Both regions must have an explicit terminator; `nothing` is valid only when
+    # control cannot reach the end of the region (it ends in a diverging IfOp).
     # Valid terminators: YieldOp, ReturnNode, ContinueOp, BreakOp (for IfOps inside loops).
-    if then_term === nothing
+    if then_term === nothing && !diverges(op.then_region)
         push!(errors, "IfOp at %$idx: then region must have explicit terminator, got nothing")
     end
-    if else_term === nothing
+    if else_term === nothing && !diverges(op.else_region)
         push!(errors, "IfOp at %$idx: else region must have explicit terminator, got nothing")
     end
 
@@ -446,6 +464,47 @@ function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode
     term = op.body.terminator
     if !(term isa ContinueOp)
         push!(errors, "ForOp at %$idx: body must have ContinueOp, got $(typeof(term))")
+    end
+
+    # Structural part of the counted-range contract (see the ForOp docstring).
+    T = forop_iv_type(op.iv_arg.type)
+    if T === nothing
+        push!(errors, "ForOp at %$idx: induction variable type $(op.iv_arg.type) is not a concrete BitInteger")
+    end
+    n_init = length(op.init_values)
+    n_args = length(op.body.args)
+    if n_init != n_args
+        push!(errors, "ForOp at %$idx: init_values length ($n_init) != body.args length ($n_args)")
+    end
+    for t in reachable_terminators(op.body)
+        if t isa ContinueOp
+            nc = length(t.values)
+            nc == n_init || push!(errors, "ForOp at %$idx: ContinueOp has $nc values, expected $n_init (loop-carry length)")
+        elseif t isa BreakOp
+            push!(errors, "ForOp at %$idx: BreakOp in a counted loop body (a loop with a secondary exit must stay a LoopOp)")
+        end
+    end
+    if T !== nothing
+        for (name, operand) in ((:lower, op.lower), (:upper, op.upper), (:step, op.step))
+            ty = argextype(sci, operand)
+            if ty === nothing || widenconst(ty) !== T
+                push!(errors, "ForOp at %$idx: $name must have induction variable type $T")
+            end
+        end
+        constant(v) = (ty = argextype(sci, v); ty isa CC.Const ? ty.val : nothing)
+        st, lo, up = constant(op.step), constant(op.lower), constant(op.upper)
+        if st isa T && st <= zero(T)
+            push!(errors, "ForOp at %$idx: step $st is not positive")
+        elseif st isa T && lo isa T && up isa T
+            if op.inclusive && lo <= up && (big(up) - big(lo)) % big(st) != 0
+                push!(errors, "ForOp at %$idx: inclusive bound $up is not on the grid of $lo:$st")
+            elseif !op.inclusive && lo < up
+                last = big(lo) + div(big(up) - 1 - big(lo), big(st)) * big(st)
+                if last + big(st) > big(typemax(T))
+                    push!(errors, "ForOp at %$idx: exclusive final increment is not representable in $T")
+                end
+            end
+        end
     end
 
     validate_region_terminators!(errors, sci, op.body, walk, false)

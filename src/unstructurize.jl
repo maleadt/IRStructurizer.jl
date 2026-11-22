@@ -17,8 +17,7 @@ FlatBB() = FlatBB(Tuple{Int, Any, Any}[])
 struct LoopTarget
     header_bb::Int
     exit_bb_ref::Ref{Int}                   # set after body lowering (-1 = placeholder)
-    header_carry_phis::Vector{PhiNode}      # carry phis (excluding IV for ForOp)
-    iv_info::Union{Nothing, @NamedTuple{phi::PhiNode, ssa::Int, step::Any, typ::Any}}
+    header_carry_phis::Vector{PhiNode}      # carry phis
     exit_phis::Vector{PhiNode}              # for BreakOp (LoopOp only)
     break_gotos::Vector{Tuple{Int, Int}}    # (bb, stmt_pos) of GotoNode(-1) placeholders
 end
@@ -169,7 +168,7 @@ function lower_block_body!(ctx::UnstructurizeCtx, bb::Int, block::Block)
         if stmt isa IfOp
             bb = lower_ifop!(ctx, bb, idx, stmt, typ)
         elseif stmt isa ForOp
-            bb = lower_forop!(ctx, bb, idx, stmt, typ)
+            error("internal error: ForOp at %$idx reached lowering; expand_for_loops! runs first")
         elseif stmt isa WhileOp
             bb = lower_whileop!(ctx, bb, idx, stmt, typ)
         elseif stmt isa LoopOp
@@ -315,16 +314,6 @@ function handle_continue!(ctx::UnstructurizeCtx, bb::Int, term::ContinueOp)
     @assert !isempty(ctx.loop_stack) "ContinueOp outside loop"
     lt = ctx.loop_stack[end]
 
-    # ForOp: synthesize IV increment
-    if lt.iv_info !== nothing
-        iv = lt.iv_info
-        iv_next = emit!(ctx, bb,
-            Expr(:call, GlobalRef(Core.Intrinsics, :add_int),
-                 SSAValue(iv.ssa), iv.step),
-            iv.typ)
-        push_phi_value!(iv.phi, bb, SSAValue(iv_next))
-    end
-
     # add carry values to the header phis
     for (i, phi) in enumerate(lt.header_carry_phis)
         val = resolve_value(ctx, term.values[i])
@@ -444,72 +433,6 @@ function goto_try_merge!(ctx::UnstructurizeCtx, bb::Int, tt::TryTarget,
 end
 
 #=============================================================================
- ForOp Lowering
-=============================================================================#
-
-function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
-                      op::ForOp, @nospecialize(cfop_typ))
-    lower = resolve_value(ctx, op.lower)
-    upper = resolve_value(ctx, op.upper)
-    step  = resolve_value(ctx, op.step)
-
-    header_bb = new_bb!(ctx)
-    emit!(ctx, bb, GotoNode(header_bb), Any)
-
-    # header PhiNodes: induction variable plus carries
-    iv_phi = PhiNode(Int32[bb], Any[lower])
-    iv_phi_ssa = emit!(ctx, header_bb, iv_phi, op.iv_arg.type)
-    ctx.arg_rename[op.iv_arg.id] = iv_phi_ssa
-
-    carry_phis = PhiNode[]
-    carry_phi_ssas = Int[]
-    for (i, init_val) in enumerate(op.init_values)
-        phi = PhiNode(Int32[], Any[])
-        push_phi_value!(phi, bb, resolve_value(ctx, init_val))
-        carry_arg = op.body.args[i]
-        phi_ssa = emit!(ctx, header_bb, phi, carry_arg.type)
-        ctx.arg_rename[carry_arg.id] = phi_ssa
-        push!(carry_phis, phi)
-        push!(carry_phi_ssas, phi_ssa)
-    end
-
-    # loop condition: slt_int(iv, upper)
-    cond_ssa = emit!(ctx, header_bb,
-        Expr(:call, GlobalRef(Core.Intrinsics, :slt_int),
-             SSAValue(iv_phi_ssa), upper),
-        Bool)
-
-    # GotoIfNot with placeholder exit
-    emit!(ctx, header_bb, GotoIfNot(SSAValue(cond_ssa), -1), Any)
-    branch_pos = length(ctx.bbs[header_bb].stmts)
-
-    # body_bb is next in sequence, the fallthrough
-    body_bb = new_bb!(ctx)
-
-    iv_info = (; phi=iv_phi, ssa=iv_phi_ssa, step=step, typ=op.iv_arg.type)
-    lt = LoopTarget(header_bb, Ref(-1), carry_phis, iv_info, PhiNode[],
-                    Tuple{Int,Int}[])
-    push!(ctx.loop_stack, lt)
-
-    body_last = lower_block_body!(ctx, body_bb, op.body)
-
-    body_term = op.body.terminator
-    if body_term isa ContinueOp
-        handle_continue!(ctx, body_last, body_term)
-    else
-        lower_diverging_terminator!(ctx, body_last, body_term)
-    end
-
-    pop!(ctx.loop_stack)
-
-    exit_bb = new_bb!(ctx)
-    fix_branch_dest!(ctx, header_bb, branch_pos, SSAValue(cond_ssa), exit_bb)
-
-    ctx.cfop_results[cfop_idx] = carry_phi_ssas
-    return exit_bb
-end
-
-#=============================================================================
  WhileOp Lowering
 =============================================================================#
 
@@ -549,7 +472,12 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     # after_bb is next in sequence, the fallthrough taken when cond is true
     after_bb = new_bb!(ctx)
 
+    # A ContinueOp nested in an IfOp arm of the after region (an expanded
+    # exclusive ForOp with a conditional continuation) is a back edge of this loop.
+    lt = LoopTarget(header_bb, Ref(-1), carry_phis, PhiNode[], Tuple{Int,Int}[])
+    push!(ctx.loop_stack, lt)
     after_last = lower_block_body!(ctx, after_bb, op.after)
+    pop!(ctx.loop_stack)
 
     # YieldOp becomes the back-edge to the header
     yield_term = op.after.terminator::YieldOp
@@ -594,7 +522,7 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
         cfop_typ isa DataType && cfop_typ <: Tuple ? length(cfop_typ.parameters) : 0)
     exit_phis = PhiNode[PhiNode(Int32[], Any[]) for _ in result_types]
 
-    lt = LoopTarget(header_bb, Ref(-1), carry_phis, nothing, exit_phis,
+    lt = LoopTarget(header_bb, Ref(-1), carry_phis, exit_phis,
                     Tuple{Int,Int}[])
     push!(ctx.loop_stack, lt)
 
@@ -800,6 +728,9 @@ Convert a StructuredIRCode back to flat Julia IRCode with explicit control flow
 (GotoNode, GotoIfNot, PhiNode, ReturnNode).
 """
 function CC.IRCode(sci::StructuredIRCode)
+    if has_forop(sci)
+        sci = expand_for_loops!(copy(sci))
+    end
     ctx = UnstructurizeCtx(copy(sci.line_map))
     bb = new_bb!(ctx)
     bb = lower_block_body!(ctx, bb, sci.entry)
