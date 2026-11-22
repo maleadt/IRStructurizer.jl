@@ -63,6 +63,7 @@ end
     include("structurize.jl")
     include("multiplex.jl")
     include("ir.jl")
+    include("expand.jl")
     include("unstructurize.jl")
     include("tryop.jl")
     include("julialowering_cases.jl")
@@ -70,6 +71,7 @@ end
     include("julialowering_exceptions.jl")
     include("debuginfo.jl")
     include("regression.jl")
+    include("type_preservation.jl")
 
     # captured variables that get boxed (`Core.Box`) lose their type
     if isdefined(Test, :detect_closure_boxes)
