@@ -389,6 +389,51 @@ end
 end
 
 @testset "loop carry of a literal `nothing`" begin
+    # Issue #64: reproduction with @noinline nop() = nothing
+    @noinline nop_issue64() = nothing
+    function last_result_issue64(n)
+        s = 0
+        while n > 0
+            s = nop_issue64()
+            n -= 1
+        end
+        return s
+    end
+    sci_lr, _ = only(code_structured(last_result_issue64, Tuple{Int}))
+    @test execute(sci_lr, 0) == 0
+    @test execute(sci_lr, 3) === nothing
+
+    # Constructed IR with nothing on entry edge and 42 on back edge
+    ir_entry_nothing = build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 4], Any[nothing, 42]), Any),
+                (PhiNode(Int32[1, 4], Any[0, SSAValue(4)]), Int)], succs=[3]),
+        (stmts=[(Expr(:call, GlobalRef(Core.Intrinsics, :add_int), SSAValue(3), 1), Int),
+                (Expr(:call, GlobalRef(Core.Intrinsics, :slt_int), SSAValue(4), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(5), 5), Any)], succs=[4, 5]),
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(2)), Any)], succs=Int[]),
+    ], Any[Any, Int])
+    sci_en = StructuredIRCode(ir_entry_nothing)
+    @test execute(sci_en, 0) === nothing
+    @test execute(sci_en, 3) == 42
+
+    # Constructed IR with 42 on entry edge and nothing on back edge
+    ir_back_nothing = build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 4], Any[42, nothing]), Any),
+                (PhiNode(Int32[1, 4], Any[0, SSAValue(4)]), Int)], succs=[3]),
+        (stmts=[(Expr(:call, GlobalRef(Core.Intrinsics, :add_int), SSAValue(3), 1), Int),
+                (Expr(:call, GlobalRef(Core.Intrinsics, :slt_int), SSAValue(4), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(5), 5), Any)], succs=[4, 5]),
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(2)), Any)], succs=Int[]),
+    ], Any[Any, Int])
+    sci_bn = StructuredIRCode(ir_back_nothing)
+    @test execute(sci_bn, 0) == 42
+    @test execute(sci_bn, 3) === nothing
+
+    # Existing test: both edges carry nothing
     ir = build_ir([
         (stmts=[(GotoNode(2), Any)],                                    succs=[2]),
         (stmts=[(PhiNode(Int32[1, 4], Any[nothing, nothing]), Nothing),
@@ -867,13 +912,16 @@ end
     @test for_op.step == 1
 
     # Inclusive bound (`while x <= n`): empty when init > n (so n < 100 is empty).
+    # The dynamic bound keeps this a WhileOp (no proof that `n < typemax`), which
+    # reads the escaping IV back through the general loop.
     fixed_le(n::Int) = (x = 100; while x <= n; x += 1; end; x)
     for n in (0, 50, 99, 100, 101, 200)
         @test @roundtrip fixed_le(n)
     end
 
-    # Step > 1 with a separate accumulator carried alongside the escaping IV. Both
-    # the kept IV carry and the accumulator ride the ForOp correctly.
+    # Step > 1 with a separate accumulator carried alongside the escaping IV. With
+    # a dynamic bound the final update `x + 2` has no representability proof, so
+    # this too stays a WhileOp; both the IV and the accumulator read back correctly.
     fixed_step(n::Int) = (x = 100; s = 0; while x < n; s += x; x += 2; end; x + s)
     for n in (0, 50, 100, 150, 200)
         @test @roundtrip fixed_step(n)
@@ -891,31 +939,30 @@ end
     end
 end
 
-@testset "escaping IV ForOp: step>1 and inclusive <= bound" begin
-    # The kept-IV ForOp must be correct for a non-unit step and for an inclusive
-    # `<=` bound (which adjusts the range control by +1 but not the carried value).
+@testset "escaping IV: step>1 and inclusive <= bound over a dynamic bound" begin
+    # Neither shape has a counted-loop proof with a dynamic bound, so both stay
+    # WhileOps whose escaping IV is an ordinary loop result.
 
     # step 2: counted2(5) iterates i=0,2,4 then continues to 6 (the first value
     # failing i<5), so the escaping IV result is 6; empty (n≤0) returns init 0.
+    # (Missing proof: the final update `i + 2` fits, i.e. `n + 1 <= typemax`.)
     counted2(n::Int) = (i = 0; while i < n; i += 2; end; i)
     ir2, _ = only(code_ircode(counted2, Tuple{Int}))
     sci2 = StructuredIRCode(ir2; promote=true)
-    @test count_stmts(sci2.entry, s -> s isa ForOp) == 1
-    let for_op = only(filter(x -> x isa ForOp, collect(statements(sci2.entry.body))))
-        @test for_op.lower == 0
-        @test for_op.step == 2
-    end
+    @test count_stmts(sci2.entry, s -> s isa ForOp) == 0
+    @test count_stmts(sci2.entry, s -> s isa WhileOp) == 1
     for n in (-3, 0, 1, 2, 5, 6, 50, 200)
         @test execute(sci2, n) == counted2(n)
     end
     @test counted2(5) == 6 && execute(sci2, 5) == 6   # the step-2 exit value
 
-    # inclusive `<=` whose IV escapes: `while i<=n; i+=1; return i`. The exclusive
-    # range upper is n+1, but the carried IV value is unaffected by that adjustment.
+    # inclusive `<=` whose IV escapes: `while i<=n; i+=1; return i` reads back n+1.
+    # (Missing proof: `n < typemax(Int)`.)
     counted_le(n::Int) = (i = 0; while i <= n; i += 1; end; i)
     irle, _ = only(code_ircode(counted_le, Tuple{Int}))
     scile = StructuredIRCode(irle; promote=true)
-    @test count_stmts(scile.entry, s -> s isa ForOp) == 1
+    @test count_stmts(scile.entry, s -> s isa ForOp) == 0
+    @test count_stmts(scile.entry, s -> s isa WhileOp) == 1
     for n in (-3, -1, 0, 1, 2, 5, 50, 200)
         @test execute(scile, n) == counted_le(n)
     end
@@ -1176,7 +1223,8 @@ end
     sci, _ = code_structured(nested_gated, Tuple{Bool, Bool, Int}) |> only  # must not throw
     # The innermost guarded write `s += k` (a memoryref-free add into the carry)
     # is emitted once, not duplicated per guard arm.
-    @test count_stmts(sci.entry, s -> iscall_to(s, :add_int)) == 2   # `s += k` and the IV `k += 1`
+    # (The IV increment is implicit in the ForOp and its bound is used verbatim.)
+    @test count_stmts(sci.entry, s -> iscall_to(s, :add_int)) == 1   # `s += k`
     for a in (false, true), b in (false, true), n in (0, 1, 3, 5)
         @test execute(sci, a, b, n) == nested_gated(a, b, n)
     end
